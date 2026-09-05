@@ -7,17 +7,23 @@
 
     ボタンが押された
        ↓
-    同じツールが動いている?  → はい: ブラウザーを出すだけ (二重起動しない §9)
+    同じツールが動いている?  → はい: 画面を出すだけ (二重起動しない §9)
        ↓ いいえ
-    別のツールが動いている?  → はい: そちらを止めて、終了を確認する (§8)
+    別のツールが動いている?  → はい:
+           そのツールの画面を閉じる        (§8.3)
+           そのツールのバックエンドを止める (§8.1)
+           終了を確認する
        ↓
     start.bat を実行する
        ↓
     /api/health が応答するまで待つ  ← **ここを飛ばさない** (§7.2)
        ↓
-    ブラウザーを開く
+    ブラウザー画面を開く
        ↓
     現在：<ツール名>
+
+画面とバックエンドは別々に扱う (§11)。利用者が画面だけ手で閉じても
+バックエンドは動いたままで、ランチャーはその状態を把握する。
 
 画面 (tkinter) はこのモジュールを読み込むが、**このモジュールは画面を
 読み込まない**。起動・停止の判断だけを持つので、画面が無い環境でも
@@ -29,7 +35,6 @@ import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -40,7 +45,8 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 import process_manager  # noqa: E402
-from launcher import app_config, health, runtime_state, tool_registry  # noqa: E402
+from launcher import (app_config, browser, health, runtime_state,  # noqa: E402
+                      tool_registry)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
@@ -77,6 +83,13 @@ class Status:
     # バックエンドが応答しているか (基盤仕様書 2.9)。
     # ブラウザーを閉じたことと、ツールが落ちたことは別物
     responding: bool = False
+    # ランチャーが開いた画面がまだ出ているか (要件定義書 §8.3 / §11)。
+    # `responding` とは**別に持つ** ── 画面だけ閉じられた状態を
+    # 「ツールが落ちた」と取り違えないため
+    browser_open: bool = False
+    # その画面をランチャーが閉じられるか。既定ブラウザーへ渡しただけの
+    # ときは False で、切り替えのとき手で閉じてもらうことになる
+    browser_managed: bool = False
 
     @property
     def busy(self) -> bool:
@@ -137,7 +150,12 @@ class ToolManager:
 
     def _set(self, state: State, message: str, tool: Optional[Tool] = None,
              *, detail: str = "", elapsed: float = 0.0,
-             responding: bool = False) -> None:
+             responding: bool = False,
+             browser_open: Optional[bool] = None) -> None:
+        if browser_open is None:
+            browser_open = (self._current is not None
+                            and process_manager.is_browser_open(self._current))
+        managed = self._current is not None and self._current.browser_managed
         self._emit(Status(
             state=state,
             app_id=tool.app_id if tool else (self._current.app_id
@@ -146,7 +164,8 @@ class ToolManager:
                           else (self._current.display_name
                                 if self._current else "")),
             message=message, detail=detail, elapsed=elapsed,
-            responding=responding))
+            responding=responding, browser_open=browser_open,
+            browser_managed=managed))
 
     # --------------------------------------------------------------
     # 起動していたものを引き継ぐ
@@ -225,9 +244,16 @@ class ToolManager:
         current = self._current
         if current is not None and current.app_id == tool.app_id:
             if process_manager.is_running(current):
-                log.info("すでに動いています。ブラウザーを開きます: %s",
-                         tool.display_name)
-                self._open_browser(current.url or tool.home_url)
+                if process_manager.is_browser_open(current):
+                    # 画面はもう出ている。**もう1枚開かない** ──
+                    # 同じツールの窓が2つ並ぶほうが分かりにくい
+                    log.info("すでに動いていて画面も出ています: %s",
+                             tool.display_name)
+                else:
+                    # 利用者が画面だけ手で閉じていた。バックエンドは
+                    # 動いたままなので、起動し直さず画面だけ開く (§11)
+                    log.info("画面だけ開き直します: %s", tool.display_name)
+                    self._open_browser(current, current.url or tool.home_url)
                 self._set(State.RUNNING, f"現在：{tool.display_name}", tool,
                           responding=True)
                 return
@@ -266,18 +292,33 @@ class ToolManager:
             return True
 
         name = running.display_name or running.app_id
-        self._set(State.STOPPING, f"{name}を終了しています...")
+        # 画面を閉じることから始まるので、そう伝える (要件定義書 §8.2)
+        if running.browser_managed and process_manager.is_browser_open(running):
+            self._set(State.STOPPING, f"{name}の画面を閉じています...")
+        else:
+            self._set(State.STOPPING, f"{name}を終了しています...")
+
+        # `process_manager.stop` が中で画面を先に閉じてから
+        # バックエンドを止める (要件定義書 §8.3 の処理順序)
         result = process_manager.stop(
             running, force=force,
             timeout=float(app_config.ui_setting("stop_timeout_seconds")))
+        if result.browser_closed:
+            browser.forget(running.browser_pid)
+            self._set(State.STOPPING, f"{name}を終了しています...")
 
         if result.busy:
             # 実行中の処理がある。**止めずに知らせる** (基盤仕様書 2.8)。
             # 中断してよいかは利用者が決める
-            self._set(State.RUNNING, f"現在：{name}",
-                      detail=(f"{name}で実行中の処理があります: "
-                              + "、".join(result.busy_jobs)
-                              + "\n終了するときは「強制終了」を選んでください"),
+            detail = (f"{name}で実行中の処理があります: "
+                      + "、".join(result.busy_jobs)
+                      + "\n終了するときは「強制終了」を選んでください")
+            if result.browser_closed:
+                # 画面は先に閉じてある。バックエンドは動いたままなので、
+                # **黙っていると「消えた」ように見える**
+                detail += ("\n画面は閉じましたが、処理は続いています。"
+                           "同じボタンを押すと画面を開き直せます。")
+            self._set(State.RUNNING, f"現在：{name}", detail=detail,
                       responding=True)
             return False
 
@@ -386,13 +427,22 @@ class ToolManager:
 
         running = _running_from_health(tool, payload, launch_pid=proc.pid)
         self._current = running
-        runtime_state.write(running)
         log.info("起動完了: %s", running.summary())
 
-        # **ここで初めてブラウザーを開く** (要件定義書 §7.1 / §20)
-        self._open_browser(running.url or tool.home_url)
+        # **ここで初めて画面を開く** (要件定義書 §7.1 / §20)
+        self._open_browser(running, running.url or tool.home_url)
+        # 画面のPIDまで入った状態で記録する。`stop.bat` は別プロセス
+        # なので、書いておかないとそちらから画面を閉じられない
+        runtime_state.write(running)
+
+        detail = ""
+        if not running.browser_managed:
+            detail = ("画面は既定のブラウザーで開きました。\n"
+                      "切り替えのときに自動では閉じないので、"
+                      "不要になったタブは手で閉じてください。")
         self._set(State.RUNNING, f"現在：{tool.display_name}", tool,
-                  elapsed=time.monotonic() - started, responding=True)
+                  detail=detail, elapsed=time.monotonic() - started,
+                  responding=True)
 
     def _spawn(self, tool: Tool) -> Optional[subprocess.Popen]:
         """`start.bat` を実行する (要件定義書 §12.2)。
@@ -487,10 +537,22 @@ class ToolManager:
         if running is None or self._status.busy:
             return False
 
+        # 利用者が手で閉じた画面を片付ける
+        browser.reap()
+
         if process_manager.is_running(running):
-            if not self._status.responding:
+            # **画面の生死はバックエンドと別に見る** (要件定義書 §11)。
+            # 利用者が画面だけ手で閉じても、バックエンドは動いたまま。
+            # そのことを表に出す ── 出さないと「終わったつもり」で
+            # 残り続ける
+            browser_open = process_manager.is_browser_open(running)
+            if (not self._status.responding
+                    or self._status.browser_open != browser_open):
+                if running.browser_managed and not browser_open:
+                    log.info("画面が閉じられました（バックエンドは動作中）: %s",
+                             running.app_id)
                 self._set(State.RUNNING, f"現在：{running.display_name}",
-                          responding=True)
+                          responding=True, browser_open=browser_open)
             return True
 
         log.warning("応答が途切れました: %s", running.summary())
@@ -528,14 +590,24 @@ class ToolManager:
         """自分より新しい要求が来ているか。"""
         return generation != self._generation
 
-    def _open_browser(self, url: str) -> None:
+    def _open_browser(self, running: RunningTool, url: str) -> None:
+        """画面を開き、閉じるための手がかりを記録に残す。
+
+        専用プロファイルのアプリウィンドウとして開けたときだけ、PIDと
+        プロファイルの道が入る。既定ブラウザーへ渡しただけのときは
+        空のままで、切り替えのときに閉じられないことが記録に残る。
+        """
         if not url:
             return
         try:
-            webbrowser.open(url)
-            log.info("ブラウザーを開きました: %s", url)
+            session = browser.open_window(running.app_id, url)
         except Exception as exc:              # noqa: BLE001 - 開けなくても続ける
-            log.warning("ブラウザーを開けませんでした (%s): %s", url, exc)
+            log.warning("画面を開けませんでした (%s): %s", url, exc)
+            return
+        running.browser_pid = session.pid
+        running.browser_profile = session.profile_dir
+        if self._current is running:
+            runtime_state.write(running)
 
 
 def _running_from_health(tool: Tool, payload: Optional[dict],

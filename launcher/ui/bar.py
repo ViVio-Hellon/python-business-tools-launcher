@@ -265,6 +265,12 @@ class LauncherBar:
             # 経過を出す。「進んでいる」ことが分かればよいので秒だけ
             # (基盤仕様書 2.2)
             message = f"{message} ({status.elapsed:.0f}秒)"
+        elif (status.state.value == "running" and status.browser_managed
+                and not status.browser_open):
+            # 画面だけ閉じられている。バックエンドは動いたままなので、
+            # 「終わっている」と読めない書き方にする (要件定義書 §11)。
+            # もう一度ボタンを押せば画面が戻る
+            message = f"{message}（画面は閉じています）"
         self._set_status_text(status.state.value, message)
 
         self._last_detail = status.detail

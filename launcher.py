@@ -298,6 +298,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         print(app_config.describe())
         print()
+        # 画面の開き方は「切り替えのとき閉じられるか」を左右するので、
+        # 診断で必ず見せる (要件定義書 §8.3)
+        try:
+            from launcher import browser
+            print(browser.describe())
+        except Exception as exc:              # noqa: BLE001 - 診断で落ちない
+            print(f"ブラウザーの設定を読めませんでした: {exc}")
+        print()
         try:
             print(tool_registry.describe())
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない

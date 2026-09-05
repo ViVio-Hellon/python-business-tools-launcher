@@ -10,6 +10,15 @@
     "start_timeout_seconds": 90,
     "stop_timeout_seconds": 30
   },
+  "browser": {
+    "mode": "app_window",
+    "preferred": [
+      "edge",
+      "chrome",
+      "chromium"
+    ],
+    "extra_paths": []
+  },
   "tools": [
     {
       "app_id": "nlm.nippou-tool",

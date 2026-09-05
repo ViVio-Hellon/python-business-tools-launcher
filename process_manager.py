@@ -54,6 +54,8 @@ log = get_logger("process_manager")
 GRACEFUL_WAIT_SEC = 20.0
 # PIDで止めたあと、消えるのを待つ上限 (秒)
 TERMINATE_WAIT_SEC = 8.0
+# ブラウザー画面が閉じるのを待つ上限 (秒)。後始末があるので少し長め
+BROWSER_WAIT_SEC = 10.0
 # 外部コマンド (tasklist / taskkill / wmic) の待ち時間
 COMMAND_TIMEOUT_SEC = 8.0
 
@@ -74,6 +76,9 @@ class StopResult:
     message: str = ""
     # 実行中で止めなかったときの、その処理の名前 (基盤仕様書 2.8)
     busy_jobs: list[str] = field(default_factory=list)
+    # ブラウザー画面を閉じられたか (要件定義書 §8.3)。
+    # 閉じられない形で開いていたときは False のまま
+    browser_closed: bool = False
 
     @property
     def busy(self) -> bool:
@@ -124,6 +129,11 @@ def stop(running: RunningTool, *, force: bool = False,
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
     log.info("停止開始: %s (force=%s)", running.summary(), force)
+
+    # **先に画面を閉じる** (要件定義書 §8.3 の処理順序)。
+    # バックエンドを先に落とすと、閉じるまでのあいだ利用者の画面に
+    # 「接続できません」が出る
+    result.browser_closed = close_browser(running)
 
     if not is_running(running):
         # 応答しない。プロセスだけ残っていないか確かめてから片付ける
@@ -472,6 +482,66 @@ def _normalize_path(text: str) -> str:
 
 
 # ------------------------------------------------------------------
+# ブラウザー画面 (要件定義書 §8.3)
+# ------------------------------------------------------------------
+def close_browser(running: RunningTool) -> bool:
+    """ランチャーが開いた画面だけを閉じる。閉じたら True。
+
+    **利用者が別に開いている Google やメールには手が届かない。**
+    閉じにいくのは、ランチャーが専用プロファイルで起こしたプロセスだけ
+    ── そのプロファイルの道がコマンドラインに入っていることを確かめて
+    から落とす。確かめられなければ落とさない。
+
+    プロファイルは利用者のふだんのブラウザーとは別物なので、ここで
+    落としても通常のタブは1つも閉じない。照合はその上での二重の守り。
+    """
+    if not running.browser_managed:
+        # 既定ブラウザーへ渡しただけ。閉じる手がかりが無い
+        return False
+    if not _is_alive(running.browser_pid):
+        log.info("画面はすでに閉じられていました (pid=%s)", running.browser_pid)
+        return True
+
+    command = process_command_line(running.browser_pid)
+    if not command:
+        log.warning("画面 pid=%s の中身を確かめられないので閉じません",
+                    running.browser_pid)
+        return False
+
+    needle = _normalize_path(running.browser_profile)
+    if not _is_specific_enough(needle) or needle not in _normalize_path(command):
+        # 別のブラウザーのPIDを掴んでいる。落とすと利用者のタブを
+        # 巻き添えにするので、**触らない**
+        log.warning("画面 pid=%s は専用プロファイルではないので閉じません",
+                    running.browser_pid)
+        return False
+
+    log.info("画面を閉じます: pid=%s", running.browser_pid)
+    # まず穏やかに頼む。Windowsの `taskkill /T` は WM_CLOSE を送るので、
+    # ブラウザーは後始末をしてから終われる
+    if _terminate(running.browser_pid, force=False) and \
+            _wait_pid_gone(running.browser_pid, BROWSER_WAIT_SEC):
+        return True
+    if _terminate(running.browser_pid, force=True) and \
+            _wait_pid_gone(running.browser_pid, BROWSER_WAIT_SEC):
+        log.info("画面を強制的に閉じました: pid=%s", running.browser_pid)
+        return True
+    log.warning("画面を閉じられませんでした: pid=%s", running.browser_pid)
+    return False
+
+
+def is_browser_open(running: RunningTool) -> bool:
+    """ランチャーが開いた画面がまだ出ているか。
+
+    利用者が手で閉じたことに気づくために使う。**バックエンドの生死とは
+    別に見る** (要件定義書 §11)。
+    """
+    if not running.browser_managed:
+        return False
+    return _is_alive(running.browser_pid)
+
+
+# ------------------------------------------------------------------
 # プロセスの生死と中身
 # ------------------------------------------------------------------
 def _is_alive(pid: int) -> bool:
@@ -648,6 +718,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     result = stop(running, force=args.force)
+    if running.browser_managed:
+        print("[済] 画面を閉じました" if result.browser_closed
+              else "[--] 画面を閉じられませんでした")
+    elif running.browser_pid or running.url:
+        print("[--] 画面は既定のブラウザーで開いています。手で閉じてください")
     print(result)
     if result.busy:
         print("  中断して止めるには --force を付けてください。")

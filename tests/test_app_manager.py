@@ -9,10 +9,10 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -25,7 +25,9 @@ from _isolation import LocalAreaTestCase  # noqa: E402
 import app_manager  # noqa: E402
 import process_manager  # noqa: E402
 from app_manager import State, ToolManager  # noqa: E402
-from launcher import health, runtime_state, tool_registry  # noqa: E402
+from launcher import browser, health, runtime_state, tool_registry  # noqa: E402
+
+_FAKE_BROWSER = Path(__file__).resolve().parent / "_fake_browser.py"
 
 
 class ManagerTestCase(LocalAreaTestCase):
@@ -34,15 +36,28 @@ class ManagerTestCase(LocalAreaTestCase):
     def setUp(self) -> None:
         super().setUp()
         tool_registry.initialize()
-        self.opened: list[str] = []
         self.statuses: list = []
         self.manager = ToolManager(on_status=self.statuses.append)
-        # ブラウザーは開かない。開くべきURLだけ記録する
-        patcher = mock.patch.object(app_manager.webbrowser, "open",
-                                    side_effect=self.opened.append)
+
+        # 偽のブラウザーを使う。**本物と同じように起こして閉じる** ──
+        # 開いたことにするだけの差し替えでは、要件定義書 §8.3 の
+        # 「切り替えのとき画面を閉じる」が確かめられない
+        self.browser_log = self.work_root / "opened.txt"
+        os.environ["FAKE_BROWSER_LOG"] = str(self.browser_log)
+        self.addCleanup(os.environ.pop, "FAKE_BROWSER_LOG", None)
+        patcher = mock.patch.object(browser, "find_browser",
+                                    return_value=("fake", str(_FAKE_BROWSER)))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(self._stop_everything)
+
+    @property
+    def opened(self) -> list:
+        """これまでに開かれた画面のURL。"""
+        if not self.browser_log.exists():
+            return []
+        return [line for line in
+                self.browser_log.read_text(encoding="utf-8").splitlines() if line]
 
     def _stop_everything(self) -> None:
         running = self.manager.current or runtime_state.read()
@@ -51,6 +66,12 @@ class ManagerTestCase(LocalAreaTestCase):
         # `start.bat` の受け皿も引き取る。残すと、試験のたびに
         # 引き取られないプロセスが増えていく
         self.manager._reap_process()
+        # 残った画面も片付ける。**本番では残ってよい** ── ツールを
+        # 動かしたままランチャーだけ閉じたときは、画面も残るのが正しい
+        # (要件定義書 §11)。片付けるのは試験の都合
+        for pid in browser.managed_pids():
+            process_manager._terminate(pid, force=True)
+            browser.forget(pid)
 
     def register(self, app_id: str, display_name: str, **kwargs) -> object:
         """偽ツールを1つ作って設定DBへ登録する。"""
@@ -67,7 +88,18 @@ class ManagerTestCase(LocalAreaTestCase):
 
     def start(self, tool) -> None:
         """起動を待ち合わせる (試験では別スレッドにしない)。"""
+        before = len(self.opened)
         self.manager._select_blocking(tool, self.manager._generation)
+        running = self.manager.current
+        if running is not None and running.browser_pid:
+            # 画面を起こしたところまでは同期で確かめられるが、
+            # **記録を書くのは向こうのプロセス**なので、そこは待つ
+            self.wait_opened(before + 1)
+
+    def wait_opened(self, count: int, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while len(self.opened) < count and time.monotonic() < deadline:
+            time.sleep(0.05)
 
 
 class StartTests(ManagerTestCase):
@@ -150,8 +182,10 @@ class SameToolTests(ManagerTestCase):
         second = runtime_state.read()
 
         self.assertEqual(first.pid, second.pid, "二重に起動しています")
-        self.assertEqual(self.opened, [tool.home_url, tool.home_url],
-                         "既存の画面を出し直していません (要件定義書 §9)")
+        # 画面が出ているのにもう1枚開かない。同じツールの窓が2つ並ぶ
+        # ほうが分かりにくい (要件定義書 §8.3.1)
+        self.assertEqual(self.opened, [tool.home_url],
+                         "画面を二重に開いています")
 
 
 class SwitchTests(ManagerTestCase):
@@ -246,6 +280,162 @@ class StopTests(ManagerTestCase):
         result = process_manager.stop(running, timeout=10)
         self.assertTrue(result.stopped, result.message)
         self.assertEqual(result.method, "shutdown-api")
+
+
+class BrowserTests(ManagerTestCase):
+    """要件定義書 §8.3 ブラウザー画面の管理。"""
+
+    def test_専用ウィンドウとして開く(self) -> None:
+        """§8.3.1 ランチャーが管理できる形で開く。"""
+        tool = self.register("fake.win", "日報")
+        self.start(tool)
+
+        running = runtime_state.read()
+        self.assertTrue(running.browser_managed,
+                        "閉じられない形で開いています")
+        self.assertGreater(running.browser_pid, 0)
+        # 専用プロファイルはツールごとに分かれている
+        self.assertEqual(Path(running.browser_profile),
+                         browser.profile_dir("fake.win"))
+        self.assertTrue(process_manager.is_browser_open(running))
+
+    def test_切り替えで前の画面が閉じる(self) -> None:
+        """§8.3.2 切り替え時に現在のツールの画面を閉じる。"""
+        a = self.register("fake.w1", "日報")
+        b = self.register("fake.w2", "看板")
+
+        self.start(a)
+        a_running = runtime_state.read()
+        a_browser_pid = a_running.browser_pid
+        self.assertTrue(process_manager.is_browser_open(a_running))
+
+        self.start(b)
+
+        self.assertFalse(process_manager._is_alive(a_browser_pid),
+                         "切り替え後も日報の画面が残っています")
+        b_running = runtime_state.read()
+        self.assertEqual(b_running.app_id, "fake.w2")
+        self.assertTrue(process_manager.is_browser_open(b_running))
+        self.assertEqual(self.opened, [a.home_url, b.home_url])
+
+    def test_画面を閉じてからバックエンドを止める(self) -> None:
+        """§8.3.2 の処理順序。逆だと利用者に接続エラーが見える。"""
+        a = self.register("fake.order1", "日報")
+        b = self.register("fake.order2", "看板")
+        self.start(a)
+        running = runtime_state.read()
+
+        order: list[str] = []
+        real_close = process_manager.close_browser
+        real_stop_api = process_manager._stop_by_api
+        real_stop_bat = process_manager._stop_by_bat
+
+        def spy_close(r):
+            order.append("画面を閉じる")
+            return real_close(r)
+
+        def spy_api(r, **kw):
+            order.append("バックエンドを止める")
+            return real_stop_api(r, **kw)
+
+        def spy_bat(r, **kw):
+            order.append("バックエンドを止める")
+            return real_stop_bat(r, **kw)
+
+        with mock.patch.object(process_manager, "close_browser", spy_close), \
+             mock.patch.object(process_manager, "_stop_by_api", spy_api), \
+             mock.patch.object(process_manager, "_stop_by_bat", spy_bat):
+            self.start(b)
+
+        self.assertEqual(order[:2], ["画面を閉じる", "バックエンドを止める"],
+                         f"順序が違います: {order}")
+        self.assertFalse(process_manager._is_alive(running.browser_pid))
+
+    def test_無関係なブラウザーは閉じない(self) -> None:
+        """§8.3.3 利用者が別に開いているブラウザーには触らない。
+
+        **この試験がいちばん大事。** 専用プロファイルの道を持たない
+        プロセスは、PIDが記録に入っていても閉じない。
+        """
+        import subprocess as sp
+
+        tool = self.register("fake.other", "日報")
+        self.start(tool)
+        running = runtime_state.read()
+
+        # 利用者がふだん使っているブラウザーのつもり
+        other = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                          "--user-data-dir=/home/利用者/AppData/Google/Chrome"],
+                         stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(self._kill_quietly, other)
+        for _ in range(50):
+            if process_manager.process_command_line(other.pid):
+                break
+            time.sleep(0.02)
+
+        # そのPIDを掴んでいる状態を作る
+        running.browser_pid = other.pid
+        closed = process_manager.close_browser(running)
+
+        self.assertFalse(closed, "無関係なブラウザーを閉じたと報告しています")
+        self.assertIsNone(other.poll(), "無関係なブラウザーを閉じました")
+
+    @staticmethod
+    def _kill_quietly(proc) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+    def test_画面だけ手で閉じてもバックエンドは動く(self) -> None:
+        """§8.3.4 画面とバックエンドを別々に把握する。"""
+        tool = self.register("fake.manual", "日報")
+        self.start(tool)
+        running = runtime_state.read()
+
+        # 利用者が画面だけ手で閉じた
+        process_manager._terminate(running.browser_pid, force=True)
+        process_manager._wait_pid_gone(running.browser_pid, 5)
+
+        # バックエンドは動いている。ランチャーはその状態を把握する
+        self.assertTrue(self.manager.poll_health())
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING)
+        self.assertTrue(status.responding, "バックエンドを落ちた扱いにしています")
+        self.assertFalse(status.browser_open)
+        self.assertTrue(status.browser_managed)
+
+    def test_同じボタンで画面だけ開き直せる(self) -> None:
+        tool = self.register("fake.reopen", "日報")
+        self.start(tool)
+        first = runtime_state.read()
+
+        process_manager._terminate(first.browser_pid, force=True)
+        process_manager._wait_pid_gone(first.browser_pid, 5)
+        self.manager.poll_health()
+
+        self.start(tool)
+        second = runtime_state.read()
+
+        # バックエンドは起動し直していない
+        self.assertEqual(first.pid, second.pid, "バックエンドを起動し直しました")
+        # 画面は開き直されている
+        self.assertNotEqual(first.browser_pid, second.browser_pid)
+        self.assertTrue(process_manager.is_browser_open(second))
+        self.assertEqual(self.opened, [tool.home_url, tool.home_url])
+
+    def test_閉じられない形なら記録に残る(self) -> None:
+        """Chromium系が無い端末。**黙って閉じたことにしない。**"""
+        tool = self.register("fake.default", "日報")
+        with mock.patch.object(browser, "find_browser", return_value=("", "")), \
+             mock.patch.object(browser.webbrowser, "open") as opened:
+            self.start(tool)
+
+        opened.assert_called_once_with(tool.home_url)
+        running = runtime_state.read()
+        self.assertFalse(running.browser_managed)
+        self.assertEqual(running.browser_pid, 0)
+        # 手で閉じてもらう必要があることを画面に出す
+        self.assertIn("手で閉じて", self.manager.status.detail)
 
 
 class ShutdownTests(ManagerTestCase):

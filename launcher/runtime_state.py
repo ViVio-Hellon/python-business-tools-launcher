@@ -48,6 +48,14 @@ class RunningTool:
     work_dir: str = ""
     stop_command: str = ""
     stop_method: str = "auto"
+    # --- ランチャーが開いたブラウザー画面 (要件定義書 §8.3) ---
+    # 専用プロファイルのアプリウィンドウとして開けたときだけ入る。
+    # 既定ブラウザーへ渡しただけのときは 0 / 空 のまま
+    browser_pid: int = 0
+    # 停止前の照合の印。**この道がコマンドラインに入っている
+    # プロセスだけを閉じてよい** (要件定義書 §8.3「利用者が別途開いて
+    # いるブラウザーまで終了させてはいけない」)
+    browser_profile: str = ""
     started_at: float = field(default_factory=time.time)
     # この記録を書いたランチャーのPID。判断には使わず、調査用に残す ──
     # 「いつのランチャーが起動したものか」が分かると、記録だけ残って
@@ -58,9 +66,15 @@ class RunningTool:
     def started_text(self) -> str:
         return time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(self.started_at))
 
+    @property
+    def browser_managed(self) -> bool:
+        """ランチャーが閉じられる画面か。"""
+        return bool(self.browser_pid and self.browser_profile)
+
     def summary(self) -> str:
+        window = f" / 画面 PID {self.browser_pid}" if self.browser_pid else ""
         return (f"{self.display_name or self.app_id} "
-                f"(PID {self.pid or '?'} / ポート {self.port or '?'} / "
+                f"(PID {self.pid or '?'} / ポート {self.port or '?'}{window} / "
                 f"{self.started_text})")
 
 

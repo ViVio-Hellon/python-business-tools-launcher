@@ -16,6 +16,8 @@
       work\\     … 一時ファイル
       backup\\   … 設定DBの控え
       data\\     … 設定DB本体 (消すと設定が消える)
+      browser\\  … 業務ツールの画面を開くための専用プロファイル。
+                  利用者のふだんのブラウザーとは完全に別 (要件定義書 §8.3)
 """
 from __future__ import annotations
 
@@ -143,7 +145,8 @@ def local_root() -> Path:
     return Path.home() / ".local" / "share" / name
 
 
-LOCAL_SUBDIRS = ("runtime", "logs", "pycache", "cache", "work", "backup", "data")
+LOCAL_SUBDIRS = ("runtime", "logs", "pycache", "cache", "work", "backup",
+                 "data", "browser")
 
 
 def local_dir(name: str) -> Path:
