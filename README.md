@@ -1,0 +1,143 @@
+# 業務ツール統合ランチャー (business-tools-launcher)
+
+4つの独立した業務Webツールを、1つの常駐ランチャーから選択・起動・切り替えできるようにします。
+
+**4つのツールを1つへ統合するものではありません。** 独立したまま置いておき、起動と切り替えだけを引き受けます。
+
+| 表示名 | リポジトリ | アプリID | 既定ポート |
+|---|---|---|---|
+| 日報 | `ViVio-Hellon/vba-daily-report-python-migration` | `nlm.nippou-tool` | 8733 |
+| カレンダー | `ViVio-Hellon/vba-calendar-python-migration` | `nlm.line-calendar` | 8730 |
+| 看板 | `ViVio-Hellon/vba-production-board-python-migration` | `nlm.kanban-system` | 8741 |
+| 総合ツール | `ViVio-Hellon/python-web-tools` | `nlm.packaging-tool` | 8713 |
+
+---
+
+## 使い方
+
+### 起動する
+
+`Start.vbs` をダブルクリックします。画面下に細長いランチャーバーが出ます。
+
+```
+[日報] [カレンダー] [看板] [総合ツール]   ● 現在：日報      [設定] [終了]
+```
+
+使いたいツールのボタンを押すと、そのツールが起動してブラウザーが開きます。
+別のボタンを押すと、いま動いているツールを終了してから次のツールを起動します。
+**ランチャーは切り替えても終了しません。**
+
+### 最初にすること — start.bat の場所を教える
+
+インストール直後は、どのツールも「未設定」(ボタンが茶色)です。
+**[設定]** を押し、各ツールの `start.bat` を **[参照]** から選んでください。
+
+```
+日報
+[ C:\業務ツール\日報\start.bat            ] [参照]
+ポート [8733]  起動引数 [--no-browser]  停止方法 [auto]
+```
+
+PCによって置き場所が違っていても、ここを変えるだけで動きます。コードを書き換える必要はありません。
+
+- 4つ全部を入れる必要はありません。使うものだけ設定すれば、残りは「未設定」のままで構いません。
+- `起動引数` の `--no-browser` は、**ツール側にブラウザーを開かせない**ための指定です。ランチャーが起動完了を確認してから自分で開くので、付けておかないとタブが2枚出ます。この引数を受け付けないBATを登録したときは空にしてください。
+
+### 止める
+
+ランチャーの **[終了]** を押すと、業務ツールも止めるかどうかを聞かれます。
+
+- **はい** … ツールも終了してランチャーを閉じる
+- **いいえ** … ツールは動かしたままランチャーだけ閉じる
+- **キャンセル** … 閉じない
+
+ランチャーを使わずに止めるときは `stop.bat` を実行してください。
+
+```
+stop.bat            正常終了を要求して止める
+stop.bat --status   いま何が動いているか見るだけ
+stop.bat --force    実行中の処理を中断してでも止める
+```
+
+### 起動しないとき
+
+`start_debug.bat` を実行してください。コンソールを開いたまま、環境と設定の確認結果を表示します。
+
+```
+start_debug.bat            確認してから起動する
+start_debug.bat --check    確認だけして終わる
+```
+
+ログは `%LOCALAPPDATA%\BusinessToolsLauncher\logs` にあります。
+
+| ファイル | 中身 |
+|---|---|
+| `launcher_YYYYMMDD.log` | ランチャーの起動・停止・切り替え・エラー |
+| `tool_<アプリID>.out.log` | 各ツールの `start.bat` が出力した内容 |
+
+---
+
+## 必要なもの
+
+- Windows
+- Python 3.9 以上(`Add python.exe to PATH` にチェックを入れてインストール)
+- tkinter(Pythonインストーラの「tcl/tk and IDLE」。既定で入ります)
+
+**追加パッケージはありません。** 標準ライブラリだけで動きます(`requirements.txt` を参照)。
+各業務ツールが必要とする Flask などは、それぞれのリポジトリ側の話です。
+
+---
+
+## ファイル構成
+
+```
+python-business-tools-launcher
+├─ Start.vbs             通常起動(利用者はこれだけ)     CP932/CRLF
+├─ start_debug.bat       診断起動(コンソールあり)       CP932/CRLF
+├─ stop.bat              業務ツールの停止                CP932/CRLF
+├─ launcher.py           Python側の起動開始点
+├─ launch_guard.py       ランチャー自身の多重起動防止
+├─ app_manager.py        起動・切り替え・停止の順序
+├─ process_manager.py    対象ツールの確認と安全な停止
+├─ requirements.txt
+├─ launcher/
+│  ├─ app_config.py      設定とローカル領域
+│  ├─ logging_utils.py   ログ初期化
+│  ├─ health.py          起動確認 (GET /api/health)
+│  ├─ tool_registry.py   ツール設定 (SQLite)
+│  ├─ runtime_state.py   起動中のツールの記録
+│  └─ ui/                tkinter。**ここだけが画面を知る**
+│     ├─ bar.py          常駐ランチャーバー
+│     ├─ settings_dialog.py  設定画面
+│     └─ theme.py
+├─ config/launcher.json  アプリID・表示名・既定のツール定義
+├─ docs/設計.md          設計の考え方と、要件との対応
+└─ tests/                起動・切替・停止の通し試験
+```
+
+実行時に増えるものは、アプリ本体ではなく `%LOCALAPPDATA%\BusinessToolsLauncher` に置きます。
+共有フォルダーにランチャーを置いて複数人で使っても、利用者ごとの状態が衝突しません。
+
+```
+%LOCALAPPDATA%\BusinessToolsLauncher\
+├─ runtime\   起動中のツールの記録・ランチャーのロック
+├─ logs\      起動・停止・エラーの記録
+├─ pycache\   Pythonのバイトコード
+├─ cache\     再取得できる高速化用データ
+├─ work\      一時ファイル
+├─ backup\    設定DBの控え
+└─ data\      設定DB本体(消すと設定が消えます)
+```
+
+---
+
+## 開発
+
+```
+python -m unittest discover -s tests -t .
+```
+
+tkinter が無い環境でも全て通ります。画面より下の層は tkinter を読み込まない決まりで、
+`tests/test_no_tkinter.py` がそれを固定しています。
+
+設計の詳細と、要件定義書・基盤仕様書との対応は [`docs/設計.md`](docs/設計.md) を参照してください。

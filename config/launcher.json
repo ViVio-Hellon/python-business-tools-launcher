@@ -1,0 +1,51 @@
+{
+  "app_id": "nlm.business-tools-launcher",
+  "display_name": "業務ツール統合ランチャー",
+  "version": "1.0.0",
+  "local_dir_name": "BusinessToolsLauncher",
+  "ui": {
+    "bar_height": 56,
+    "bottom_margin": 48,
+    "health_poll_seconds": 5,
+    "start_timeout_seconds": 90,
+    "stop_timeout_seconds": 30
+  },
+  "tools": [
+    {
+      "app_id": "nlm.nippou-tool",
+      "display_name": "日報",
+      "order_no": 10,
+      "repository": "ViVio-Hellon/vba-daily-report-python-migration",
+      "port": 8733,
+      "health_path": "/api/health",
+      "start_args": "--no-browser"
+    },
+    {
+      "app_id": "nlm.line-calendar",
+      "display_name": "カレンダー",
+      "order_no": 20,
+      "repository": "ViVio-Hellon/vba-calendar-python-migration",
+      "port": 8730,
+      "health_path": "/api/health",
+      "start_args": "--no-browser"
+    },
+    {
+      "app_id": "nlm.kanban-system",
+      "display_name": "看板",
+      "order_no": 30,
+      "repository": "ViVio-Hellon/vba-production-board-python-migration",
+      "port": 8741,
+      "health_path": "/api/health",
+      "start_args": "--no-browser"
+    },
+    {
+      "app_id": "nlm.packaging-tool",
+      "display_name": "総合ツール",
+      "order_no": 40,
+      "repository": "ViVio-Hellon/python-web-tools",
+      "port": 8713,
+      "health_path": "/api/health",
+      "start_args": "--no-browser"
+    }
+  ]
+}
