@@ -60,14 +60,16 @@ class SettingsDialog:
             bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD, anchor="w")
         header.pack(fill="x", padx=16, pady=(14, 2))
         tk.Label(self.top,
-                 text="PCごとに置き場所が違っていても、ここを変えるだけで動きます。",
+                 text="PCごとに置き場所が違っていても、ここを変えるだけで動きます。"
+                      "ツールの追加・削除もここで行えます。",
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(fill="x", padx=16, pady=(0, 10))
 
-        body = self._scrollable_body()
+        self.body = self._scrollable_body()
         for tool in tool_registry.all_tools(include_disabled=True):
-            self.rows.append(_ToolRow(body, tool))
+            self.rows.append(_ToolRow(self.body, tool))
 
+        self._build_add_button()
         self._build_pc_mode()
         self._build_bar_position()
         self._build_buttons()
@@ -99,6 +101,50 @@ class SettingsDialog:
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         return inner
+
+    def _build_add_button(self) -> None:
+        """5個目以降のツールを足す (要件定義書 §14)。"""
+        frame = tk.Frame(self.top, bg=theme.BG)
+        frame.pack(fill="x", padx=16, pady=(6, 0))
+        tk.Button(frame, text="＋ ツールを追加", command=self.add_tool,
+                  bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
+                  padx=14, pady=5, font=theme.FONT_SMALL,
+                  cursor="hand2").pack(side="left")
+        tk.Label(frame, text="start.bat を選ぶと、アプリIDと表示名を読み取ります",
+                 bg=theme.BG, fg=theme.MUTED,
+                 font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
+
+    def add_tool(self) -> None:
+        """`start.bat` を選んでもらい、その素性から新しい行を作る。
+
+        **アプリIDは手で写させない。** 相手の `config/app.json` から
+        読み取る ── 1文字違うだけで起動確認が永久に通らず、画面には
+        「応答がありません」としか出ないので原因にたどり着きにくい。
+        読めなければ空のまま出すので、手で入れてもらう。
+        """
+        chosen = filedialog.askopenfilename(
+            title="追加するツールの start.bat を選んでください",
+            filetypes=[("バッチファイル", "*.bat"), ("すべてのファイル", "*.*")],
+            parent=self.top)
+        if not chosen:
+            return
+
+        found = tool_registry.probe_tool_folder(chosen)
+        tool = Tool(app_id=found.get("app_id", ""),
+                    display_name=found.get("display_name", ""),
+                    port=int(found.get("port", 0)),
+                    order_no=tool_registry.next_order_no(),
+                    start_command=chosen,
+                    start_args="--no-browser")
+        self.rows.append(_ToolRow(self.body, tool, is_new=True))
+        if not found:
+            messagebox.showinfo(
+                "設定",
+                "そのフォルダーから設定を読み取れませんでした。\n"
+                "アプリIDと表示名を入力してください。\n\n"
+                "アプリIDは、そのツールの config/app.json の app_id と"
+                "同じ値にしてください。",
+                parent=self.top)
 
     def _build_pc_mode(self) -> None:
         """このPCのモード (要件定義書 §15)。
@@ -181,25 +227,46 @@ class SettingsDialog:
         """
         problems: list[str] = []
         updated: list[Tool] = []
+        removed: list[str] = []
+        seen: set[str] = set()
+
         for row in self.rows:
+            label = row.label()
+            if row.marked_for_delete():
+                if not row.is_new:
+                    removed.append(row.tool.app_id)
+                continue
+
             tool, problem = row.collect()
             if problem:
-                problems.append(f"{row.tool.display_name}: {problem}")
-            else:
-                updated.append(tool)
+                problems.append(f"{label}: {problem}")
+                continue
+            if tool.app_id in seen:
+                problems.append(f"{label}: アプリID {tool.app_id} が重複しています")
+                continue
+            seen.add(tool.app_id)
+            updated.append(tool)
 
         if problems:
             messagebox.showerror("設定を保存できません",
                                  "\n".join(problems), parent=self.top)
             return
 
+        if removed and not messagebox.askyesno(
+                "設定", f"{len(removed)}件のツールの登録を消します。よろしいですか?\n"
+                        "(ツール本体は消えません。登録だけです)",
+                parent=self.top):
+            return
+
         # 書き換える前に控えを取る。4つ分のパスを入れ直すのは手間なので
         tool_registry.backup()
+        for app_id in removed:
+            tool_registry.delete_tool(app_id)
         tool_registry.save_all(updated)
         tool_registry.set_pc_mode(self.mode_var.get().strip())
         if self.reset_position.get():
             tool_registry.clear_pc_setting(self._position_key)
-        log.info("設定を保存しました (%d件)", len(updated))
+        log.info("設定を保存しました (%d件 / 削除 %d件)", len(updated), len(removed))
         self.saved = True
         self.top.destroy()
 
@@ -210,24 +277,46 @@ class SettingsDialog:
 class _ToolRow:
     """1つのツールぶんの入力欄。"""
 
-    def __init__(self, parent: tk.Widget, tool: Tool) -> None:
+    def __init__(self, parent: tk.Widget, tool: Tool, *,
+                 is_new: bool = False) -> None:
         self.tool = tool
+        self.is_new = is_new
 
         box = tk.Frame(parent, bg=theme.BG)
         box.pack(fill="x", pady=(0, 12), padx=6)
 
         title = tk.Frame(box, bg=theme.BG)
         title.pack(fill="x")
-        tk.Label(title, text=tool.display_name, bg=theme.BG, fg=theme.FG,
+
+        self.name_var = tk.StringVar(value=tool.display_name)
+        tk.Entry(title, textvariable=self.name_var, width=14,
                  font=theme.FONT_BOLD).pack(side="left")
-        tk.Label(title, text=f"  {tool.app_id}", bg=theme.BG, fg=theme.MUTED,
-                 font=theme.FONT_SMALL).pack(side="left")
+
+        # **アプリIDは既存の行では変えられない。** `/api/health` の照合と
+        # 実行中の記録がこの値で結びついているので、途中で変えると
+        # 動いているツールを見失う。新しい行だけ入力できる
+        self.app_id_var = tk.StringVar(value=tool.app_id)
+        if is_new:
+            tk.Label(title, text=" アプリID", bg=theme.BG, fg=theme.MUTED,
+                     font=theme.FONT_SMALL).pack(side="left")
+            tk.Entry(title, textvariable=self.app_id_var, width=22,
+                     font=theme.FONT_SMALL).pack(side="left", padx=(4, 0))
+        else:
+            tk.Label(title, text=f"  {tool.app_id}", bg=theme.BG,
+                     fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left")
+
+        self.delete_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(title, text="削除", variable=self.delete_var,
+                       bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
+                       activebackground=theme.BG, activeforeground=theme.FG,
+                       font=theme.FONT_SMALL, bd=0,
+                       highlightthickness=0).pack(side="right")
         self.enabled_var = tk.BooleanVar(value=tool.enabled)
         tk.Checkbutton(title, text="使う", variable=self.enabled_var,
                        bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
                        activebackground=theme.BG, activeforeground=theme.FG,
                        font=theme.FONT_SMALL, bd=0,
-                       highlightthickness=0).pack(side="right")
+                       highlightthickness=0).pack(side="right", padx=(0, 10))
 
         # --- start.bat のパス (要件定義書 §13.1) ---
         path_row = tk.Frame(box, bg=theme.BG)
@@ -269,8 +358,27 @@ class _ToolRow:
         if chosen:
             self.path_var.set(chosen)
 
+    def label(self) -> str:
+        """問題を知らせるときの呼び名。"""
+        return (self.name_var.get().strip() or self.app_id_var.get().strip()
+                or "(名前のない行)")
+
+    def marked_for_delete(self) -> bool:
+        return bool(self.delete_var.get())
+
     def collect(self) -> tuple[Tool, str]:
         """入力を確かめて、新しい設定を組み立てる。"""
+        app_id = self.app_id_var.get().strip()
+        problem = tool_registry.validate_app_id(app_id)
+        if problem:
+            return self.tool, problem
+        if self.is_new and tool_registry.get(app_id) is not None:
+            return self.tool, f"アプリID {app_id} はすでに登録されています"
+
+        name = self.name_var.get().strip()
+        if not name:
+            return self.tool, "表示名を入力してください"
+
         path = self.path_var.get().strip().strip('"')
         problem = tool_registry.validate_start_command(path)
         if problem:
@@ -286,6 +394,8 @@ class _ToolRow:
             return self.tool, problem
 
         return replace(self.tool,
+                       app_id=app_id,
+                       display_name=name,
                        start_command=path,
                        start_args=self.args_var.get().strip(),
                        port=port,

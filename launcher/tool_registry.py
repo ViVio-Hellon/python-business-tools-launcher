@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import sqlite3
 import time
@@ -29,7 +30,7 @@ from .logging_utils import get_logger
 
 log = get_logger("tool_registry")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 相手ツールの起動確認URLの既定。4リポジトリとも `/api/health` で
 # 揃っている (要件定義書 §7.2 の例は `/health`。**どちらでも良いよう
@@ -66,6 +67,17 @@ CREATE TABLE IF NOT EXISTS pc_settings (
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- 同梱の既定値から投入したことのあるアプリID。
+--
+-- **「まだ投入していないものだけ入れる」ための記録。** 全体で1つの
+-- 「投入済み」印にすると、あとから `config/launcher.json` へ5個目を
+-- 書き足しても、すでに使っている端末には永久に入らない。逆に印が
+-- 無いと、利用者が消したツールが次の起動で復活する。
+CREATE TABLE IF NOT EXISTS seeded_tools (
+    app_id    TEXT PRIMARY KEY,
+    seeded_at TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -198,31 +210,60 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def initialize() -> None:
-    """設定DBを用意し、初回だけ既定値を入れる。冪等。"""
+    """設定DBを用意し、まだ入れていない既定値を入れる。冪等。"""
     with _connect() as conn:
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES(?, ?)",
                      ("schema_version", str(SCHEMA_VERSION)))
-        seeded = conn.execute(
-            "SELECT value FROM schema_meta WHERE key = 'seeded'").fetchone()
-        if seeded is None:
-            _seed(conn)
-            conn.execute("INSERT INTO schema_meta(key, value) VALUES(?, ?)",
-                         ("seeded", time.strftime("%Y-%m-%d %H:%M:%S")))
-            log.info("既定のツール定義を投入しました")
+        _migrate(conn)
+        _seed_missing(conn)
 
 
-def _seed(conn: sqlite3.Connection) -> None:
-    """`config/launcher.json` の既定値を入れる。
+def _migrate(conn: sqlite3.Connection) -> None:
+    """古い形の設定DBを新しい形へ。
+
+    以前は「投入済み」を全体で1つの印にしていた。その印がある設定DBは、
+    そのときの既定値を投入し終えている。**いま入っているぶんを
+    投入済みとして記録し直す**ことで、利用者が消したツールが復活せず、
+    かつ新しく足された既定値は入るようにする。
+    """
+    legacy = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'seeded'").fetchone()
+    if legacy is None:
+        return
+    already = conn.execute("SELECT COUNT(*) FROM seeded_tools").fetchone()[0]
+    if already:
+        return
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    known = {row["app_id"] for row in conn.execute("SELECT app_id FROM tools")}
+    known.update(str(item.get("app_id", "")).strip()
+                 for item in app_config.default_tools())
+    for app_id in sorted(a for a in known if a):
+        conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
+                     "VALUES(?, ?)", (app_id, now))
+    log.info("投入済みの記録を作り直しました (%d件)", len(known))
+
+
+def _seed_missing(conn: sqlite3.Connection) -> None:
+    """`config/launcher.json` のうち、**まだ入れていないものだけ**入れる。
+
+    これで、配布物の `config/launcher.json` に5個目を書き足せば、すでに
+    使っている端末にも次の起動で入る。**すでにある行には触らない** ──
+    利用者が設定した `start.bat` のパスを上書きしない。
 
     **`start.bat` のパスは入れない。** 端末ごとに違うので、既定値として
     もっともらしいパスを入れると「設定したつもりで別の場所を指している」
     状態を作る。空にしておけば、設定画面が「未設定」と出す。
     """
     now = time.strftime("%Y-%m-%d %H:%M:%S")
+    seeded = {row["app_id"] for row in conn.execute(
+        "SELECT app_id FROM seeded_tools")}
+
+    added = []
     for item in app_config.default_tools():
         app_id = str(item.get("app_id", "")).strip()
-        if not app_id:
+        if not app_id or app_id in seeded:
             continue
         conn.execute(
             """INSERT OR IGNORE INTO tools
@@ -237,6 +278,12 @@ def _seed(conn: sqlite3.Connection) -> None:
              int(item.get("port", 0)),
              str(item.get("health_path", DEFAULT_HEALTH_PATH)),
              now))
+        conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
+                     "VALUES(?, ?)", (app_id, now))
+        added.append(app_id)
+
+    if added:
+        log.info("既定のツール定義を投入しました: %s", "、".join(added))
 
 
 def _row_to_tool(row: sqlite3.Row) -> Tool:
@@ -314,6 +361,112 @@ def save(tool: Tool) -> None:
 def save_all(tools: Iterable[Tool]) -> None:
     for tool in tools:
         save(tool)
+
+
+# ------------------------------------------------------------------
+# ツールを増やす / 減らす (要件定義書 §14)
+# ------------------------------------------------------------------
+def add_tool(tool: Tool) -> None:
+    """新しいツールを登録する。**同じアプリIDがあれば断る。**
+
+    アプリIDは `/api/health` の照合に使う鍵なので、重複させると
+    どちらのツールを見ているのか分からなくなる。
+    """
+    problem = validate_app_id(tool.app_id, existing=True)
+    if problem:
+        raise ValueError(problem)
+    save(tool)
+    log.info("ツールを追加しました: %s (%s)", tool.display_name, tool.app_id)
+
+
+def delete_tool(app_id: str) -> None:
+    """ツールの登録を消す。
+
+    `seeded_tools` の記録は**残す**。消したのに次の起動で復活すると、
+    消したことにならない。
+    """
+    initialize()
+    with _connect() as conn:
+        conn.execute("DELETE FROM tools WHERE app_id = ?", (app_id,))
+    log.info("ツールを削除しました: %s", app_id)
+
+
+def validate_app_id(app_id: str, *, existing: bool = False) -> str:
+    """アプリIDを確かめる。問題があれば理由、無ければ空文字。
+
+    `existing=True` のときは、すでに登録されていないことまで見る。
+    """
+    text = (app_id or "").strip()
+    if not text:
+        return "アプリIDを入力してください"
+    if any(c.isspace() for c in text):
+        return "アプリIDに空白は使えません"
+    if existing and get(text) is not None:
+        return f"そのアプリIDはすでに登録されています: {text}"
+    return ""
+
+
+def next_order_no() -> int:
+    """並びの最後に置くための番号。"""
+    tools = all_tools(include_disabled=True)
+    return (max((t.order_no for t in tools), default=0) // 10 + 1) * 10
+
+
+def probe_tool_folder(start_command: str) -> dict:
+    """`start.bat` の隣の `config/app.json` から、そのツールの素性を読む。
+
+    4つの業務ツールは同じ起動基盤なので、アプリID・表示名・ポートが
+    そこに入っている。**利用者に手で写させない**ためにこれを読む ──
+    アプリIDが1文字違うだけで起動確認が永久に通らず、しかも画面には
+    「応答がありません」としか出ないので、原因にたどり着きにくい。
+
+    読めなければ空の辞書。手で入れてもらう。
+    """
+    path = (start_command or "").strip().strip('"')
+    if not path:
+        return {}
+    try:
+        raw = json.loads((Path(path).parent / "config" / "app.json")
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.debug("相手の設定を読めませんでした (%s): %s", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    found = {}
+    app_id = str(raw.get("app_id", "")).strip()
+    if app_id:
+        found["app_id"] = app_id
+    name = str(raw.get("display_name", "")).strip()
+    if name:
+        found["display_name"] = name
+    port = _first_port(raw.get("server"))
+    if port:
+        found["port"] = port
+    return found
+
+
+def _first_port(server) -> int:
+    """`server` からポートを1つ拾う。
+
+    役割 (現場 / 資材、看板 / 倉庫 / 閲覧) を持つツールは `roles` の下に
+    分かれている。**最初の1つを既定にする** ── どれを使うかは端末ごとに
+    違うので、あとから設定画面で直せるようにしてある。
+    """
+    if not isinstance(server, dict):
+        return 0
+    port = server.get("port")
+    if isinstance(port, int) and port > 0:
+        return port
+    roles = server.get("roles")
+    if isinstance(roles, dict):
+        for role in roles.values():
+            if isinstance(role, dict):
+                value = role.get("port")
+                if isinstance(value, int) and value > 0:
+                    return value
+    return 0
 
 
 def set_start_command(app_id: str, path: str) -> Tool:

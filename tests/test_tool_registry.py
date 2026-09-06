@@ -31,15 +31,25 @@ class SeedTests(LocalAreaTestCase):
                 self.assertEqual(tool.start_command, "")
                 self.assertFalse(tool.is_configured)
 
-    def test_初回投入は一度だけ(self) -> None:
-        """利用者が消したツールが、次の起動で復活しないこと。"""
+    def test_利用者の変更を上書きしない(self) -> None:
         tool_registry.initialize()
         first = tool_registry.get("nlm.nippou-tool")
-        tool_registry.save(replace(first, display_name="日報(改)"))
+        tool_registry.save(replace(first, display_name="日報(改)",
+                                   start_command="/tmp/x/start.bat"))
 
         tool_registry.initialize()
-        self.assertEqual(tool_registry.get("nlm.nippou-tool").display_name,
-                         "日報(改)")
+        again = tool_registry.get("nlm.nippou-tool")
+        self.assertEqual(again.display_name, "日報(改)")
+        self.assertEqual(again.start_command, "/tmp/x/start.bat")
+
+    def test_消したツールは復活しない(self) -> None:
+        """利用者が消したツールが、次の起動で戻ってこないこと。"""
+        tool_registry.initialize()
+        tool_registry.delete_tool("nlm.packaging-tool")
+
+        tool_registry.initialize()
+        self.assertIsNone(tool_registry.get("nlm.packaging-tool"))
+        self.assertEqual(len(tool_registry.all_tools()), 3)
 
     def test_起動確認URLがポートから決まる(self) -> None:
         tool_registry.initialize()
@@ -54,6 +64,122 @@ class SeedTests(LocalAreaTestCase):
         tool_registry.save(replace(tool, health_url_override="http://127.0.0.1:9/health"))
         self.assertEqual(tool_registry.get("nlm.nippou-tool").health_url,
                          "http://127.0.0.1:9/health")
+
+
+class GrowthTests(LocalAreaTestCase):
+    """要件定義書 §14「将来5個目、6個目のツールを追加しやすい構造」。
+
+    **ランチャー本体のコードを書き換えずに増やせること**を確かめる。
+    増やす道は2つある ── 配布物の `config/launcher.json` に書き足す道と、
+    端末の設定画面から足す道。
+    """
+
+    def test_配布物に書き足せば運用中の端末にも入る(self) -> None:
+        """すでに使っている端末に、あとから5個目を届けられること。"""
+        tool_registry.initialize()
+        self.assertEqual(len(tool_registry.all_tools()), 4)
+
+        # 配布物の config/launcher.json に5個目を足したことにする
+        self.add_default(app_id="nlm.inspect", display_name="検査",
+                         order_no=50, port=8750)
+
+        tool_registry.initialize()          # 次回起動
+        names = [t.display_name for t in tool_registry.all_tools()]
+        self.assertEqual(names, ["日報", "カレンダー", "看板", "総合ツール", "検査"])
+
+    def test_書き足しても既存の設定は残る(self) -> None:
+        """**利用者が入れた start.bat のパスを上書きしない。**"""
+        tool_registry.initialize()
+        path = self.work_root / "start.bat"
+        path.write_text("@echo off\n", encoding="utf-8")
+        tool_registry.set_start_command("nlm.nippou-tool", str(path))
+
+        self.add_default(app_id="nlm.inspect", display_name="検査", port=8750)
+        tool_registry.initialize()
+
+        self.assertEqual(tool_registry.get("nlm.nippou-tool").start_command,
+                         str(path))
+
+    def test_設定画面から足せる(self) -> None:
+        tool_registry.initialize()
+        tool_registry.add_tool(Tool(app_id="nlm.press", display_name="プレス",
+                                    order_no=tool_registry.next_order_no(),
+                                    port=8760))
+        names = [t.display_name for t in tool_registry.all_tools()]
+        self.assertEqual(names[-1], "プレス")
+        self.assertEqual(tool_registry.get("nlm.press").port, 8760)
+
+    def test_同じアプリIDは足せない(self) -> None:
+        """アプリIDは起動確認の鍵。重複すると取り違える。"""
+        tool_registry.initialize()
+        with self.assertRaises(ValueError) as caught:
+            tool_registry.add_tool(Tool(app_id="nlm.nippou-tool",
+                                        display_name="日報2"))
+        self.assertIn("すでに登録", str(caught.exception))
+
+    def test_アプリIDの確かめ方(self) -> None:
+        self.assertIn("入力", tool_registry.validate_app_id(""))
+        self.assertIn("空白", tool_registry.validate_app_id("nlm press"))
+        self.assertEqual(tool_registry.validate_app_id("nlm.press"), "")
+
+    def test_並びの最後の番号を出せる(self) -> None:
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.next_order_no(), 50)
+        tool_registry.add_tool(Tool(app_id="nlm.x", display_name="X",
+                                    order_no=tool_registry.next_order_no()))
+        self.assertEqual(tool_registry.next_order_no(), 60)
+
+    def add_default(self, **item) -> None:
+        """同梱の既定値に1件足したことにする。"""
+        defaults = app_config.load()["tools"]
+        defaults.append(dict(item))
+        self.addCleanup(defaults.remove, defaults[-1])
+
+
+class ProbeTests(LocalAreaTestCase):
+    """`start.bat` の隣から素性を読む。
+
+    アプリIDを手で写させると、1文字違うだけで起動確認が永久に通らない。
+    しかも画面には「応答がありません」としか出ないので、原因にたどり着き
+    にくい。だから読み取る。
+    """
+
+    def make_tool(self, name: str, config: str):
+        root = self.work_root / name
+        (root / "config").mkdir(parents=True, exist_ok=True)
+        (root / "start.bat").write_text("@echo off\n", encoding="utf-8")
+        (root / "config" / "app.json").write_text(config, encoding="utf-8")
+        return root / "start.bat"
+
+    def test_単一ポートのツール(self) -> None:
+        start = self.make_tool("nippou",
+            '{"app_id": "nlm.nippou-tool", "display_name": "日報管理ツール",'
+            ' "server": {"host": "127.0.0.1", "port": 8733}}')
+        self.assertEqual(tool_registry.probe_tool_folder(str(start)),
+                         {"app_id": "nlm.nippou-tool",
+                          "display_name": "日報管理ツール", "port": 8733})
+
+    def test_役割を持つツールは最初の役割のポート(self) -> None:
+        """看板や総合ツールのように、役割ごとにポートが分かれている場合。"""
+        start = self.make_tool("kanban",
+            '{"app_id": "nlm.kanban-system", "display_name": "資材発注看板",'
+            ' "server": {"roles": {"site": {"port": 8741},'
+            ' "warehouse": {"port": 8751}}}}')
+        found = tool_registry.probe_tool_folder(str(start))
+        self.assertEqual(found["port"], 8741)
+        self.assertEqual(found["app_id"], "nlm.kanban-system")
+
+    def test_読めなくても失敗しない(self) -> None:
+        """設定が無いツールでも、手で入れれば登録できる。"""
+        root = self.work_root / "unknown"
+        root.mkdir(parents=True)
+        (root / "start.bat").write_text("@echo off\n", encoding="utf-8")
+        self.assertEqual(tool_registry.probe_tool_folder(str(root / "start.bat")), {})
+        self.assertEqual(tool_registry.probe_tool_folder(""), {})
+
+    def test_壊れた設定でも失敗しない(self) -> None:
+        start = self.make_tool("broken", "{ これは JSON ではない")
+        self.assertEqual(tool_registry.probe_tool_folder(str(start)), {})
 
 
 class ValidationTests(LocalAreaTestCase):
