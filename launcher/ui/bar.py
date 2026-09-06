@@ -20,7 +20,7 @@ from typing import Optional
 
 from .. import app_config, tool_registry
 from ..logging_utils import get_logger
-from . import theme
+from . import geometry, theme
 from .settings_dialog import SettingsDialog
 
 log = get_logger("ui.bar")
@@ -28,6 +28,13 @@ log = get_logger("ui.bar")
 # 画面側のループが状態を取りに行く間隔 (ミリ秒)。
 # 起動中の経過表示がなめらかに見える程度でよい
 DRAIN_MS = 120
+
+# 動かしたあと、位置を書くまでの待ち (ミリ秒)。
+# ドラッグ中は `<Configure>` が何十回も飛ぶので、止まってから書く
+MOVE_SAVE_MS = 600
+
+# 動かした位置を覚えておく鍵 (要件定義書 §15 の PC別設定と同じ入れ物)
+POSITION_KEY = "bar_position"
 
 
 class LauncherBar:
@@ -49,9 +56,13 @@ class LauncherBar:
         self._configured: dict[str, bool] = {}
         self._last_detail = ""
         self._current_app_id = ""
+        self._save_handle = None
 
         self._build()
-        self._place_at_bottom()
+        self._place()
+        # 置いたあとで見張り始める。置いた瞬間の `<Configure>` を
+        # 「利用者が動かした」と取り違えない
+        self.root.bind("<Configure>", self._on_configure)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(DRAIN_MS, self._drain)
@@ -143,24 +154,83 @@ class LauncherBar:
                          relief="flat", bd=0, padx=10, pady=5,
                          font=theme.FONT_SMALL, cursor="hand2")
 
-    def _place_at_bottom(self) -> None:
+    def _content_width(self) -> int:
+        """**すべての操作が出ている状態**での必要幅。
+
+        「ツール停止」と「詳細」はふだん畳んでいるが、畳んだ幅で窓を
+        決めてはいけない。窓は `resizable(False, False)` で広がらないので、
+        あとで出てきたぶんが**右端で切れる**。ツールが動き出すたびに
+        起きるので、最初から場所を取っておく。
+        """
+        shown = [b for b in (self.stop_button, self.detail_button)
+                 if not b.winfo_ismapped()]
+        for button in shown:
+            button.pack(side="right", padx=(4, 0))
+        self.root.update_idletasks()
+        width = self.root.winfo_reqwidth()
+        for button in shown:
+            button.pack_forget()
+        self.root.update_idletasks()
+        return width
+
+    def _place(self) -> None:
         """画面下部に細長く置く (要件定義書 §5.1)。
 
         幅は画面いっぱいにしない。**業務画面を隠さない**ことが目的なので、
         必要なぶんだけ取り、下端から少し上げてタスクバーを避ける。
+        利用者が動かしてあれば、その位置を使う。
         """
-        self.root.update_idletasks()
-        height = int(app_config.ui_setting("bar_height"))
-        margin = int(app_config.ui_setting("bottom_margin"))
+        placement = geometry.compute(
+            content_width=self._content_width(),
+            screen_width=self.root.winfo_screenwidth(),
+            screen_height=self.root.winfo_screenheight(),
+            bar_height=int(app_config.ui_setting("bar_height")),
+            bottom_margin=int(app_config.ui_setting("bottom_margin")),
+            saved=self._saved_position())
+        self.root.geometry(placement.as_geometry())
+        log.info("バーを置きました: %s", placement.as_geometry())
 
-        width = max(self.root.winfo_reqwidth(), 520)
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        width = min(width, screen_w - 40)
+    def _resize_to_content(self) -> None:
+        """ボタンが増減したあと、幅だけ取り直す。
 
-        x = (screen_w - width) // 2
-        y = max(0, screen_h - height - margin)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        設定画面で5個目のツールを足したときに呼ぶ。**位置は動かさない** ──
+        利用者が置いた場所から勝手に飛ぶと、探し直すことになる。
+        """
+        placement = geometry.compute(
+            content_width=self._content_width(),
+            screen_width=self.root.winfo_screenwidth(),
+            screen_height=self.root.winfo_screenheight(),
+            bar_height=int(app_config.ui_setting("bar_height")),
+            bottom_margin=int(app_config.ui_setting("bottom_margin")),
+            saved=(self.root.winfo_x(), self.root.winfo_y()))
+        self.root.geometry(placement.as_geometry())
+
+    # --------------------------------------------------------------
+    # 動かした位置を覚える
+    # --------------------------------------------------------------
+    def _saved_position(self):
+        try:
+            return geometry.parse_saved(tool_registry.get_pc_setting(POSITION_KEY))
+        except Exception:                     # noqa: BLE001 - 位置で起動を止めない
+            log.warning("保存した位置を読めませんでした", exc_info=True)
+            return None
+
+    def _on_configure(self, event) -> None:
+        """動かされたら、少し待ってから覚える。"""
+        if event.widget is not self.root:
+            return                            # 中の部品の変化は関係ない
+        if self._save_handle is not None:
+            self.root.after_cancel(self._save_handle)
+        self._save_handle = self.root.after(MOVE_SAVE_MS, self._save_position)
+
+    def _save_position(self) -> None:
+        self._save_handle = None
+        try:
+            tool_registry.set_pc_setting(
+                POSITION_KEY,
+                geometry.format_saved(self.root.winfo_x(), self.root.winfo_y()))
+        except Exception:                     # noqa: BLE001 - 覚えられなくても続ける
+            log.warning("位置を保存できませんでした", exc_info=True)
 
     # --------------------------------------------------------------
     # 操作
@@ -190,6 +260,8 @@ class LauncherBar:
         dialog = SettingsDialog(self.root)
         if dialog.saved:
             self._build_tool_buttons()
+            # ツールが増えたぶん、窓を広げないとボタンが切れる
+            self._resize_to_content()
 
     def show_detail(self) -> None:
         if not self._last_detail:
