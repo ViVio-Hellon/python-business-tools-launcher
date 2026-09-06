@@ -21,6 +21,7 @@ from typing import Optional
 from .. import app_config, tool_registry
 from ..logging_utils import get_logger
 from . import geometry, theme
+from .geometry import POSITION_KEY
 from .settings_dialog import SettingsDialog
 
 log = get_logger("ui.bar")
@@ -33,8 +34,13 @@ DRAIN_MS = 120
 # ドラッグ中は `<Configure>` が何十回も飛ぶので、止まってから書く
 MOVE_SAVE_MS = 600
 
-# 動かした位置を覚えておく鍵 (要件定義書 §15 の PC別設定と同じ入れ物)
-POSITION_KEY = "bar_position"
+# 自分で動かしたあと、`<Configure>` を無視し続ける長さ (ミリ秒)。
+# `geometry()` の通知は少し遅れて届くので、余韻をもって戻す
+PROGRAMMATIC_TAIL_MS = 250
+
+# 移動の1こまの長さ (ミリ秒)。60fps 相当
+FRAME_MS = 16
+
 
 
 class LauncherBar:
@@ -57,6 +63,13 @@ class LauncherBar:
         self._last_detail = ""
         self._current_app_id = ""
         self._save_handle = None
+        # 自分で動かしている最中か。**利用者のドラッグと区別する印**
+        self._programmatic = False
+        self._programmatic_handle = None
+        # 利用者が手で置いたか。置いていれば自動の移動をやめる ──
+        # **利用者が決めた場所がいちばん強い**
+        self._manual = self._saved_position() is not None
+        self._anchor = ""
 
         self._build()
         self._place()
@@ -173,22 +186,44 @@ class LauncherBar:
         self.root.update_idletasks()
         return width
 
-    def _place(self) -> None:
-        """画面下部に細長く置く (要件定義書 §5.1)。
-
-        幅は画面いっぱいにしない。**業務画面を隠さない**ことが目的なので、
-        必要なぶんだけ取り、下端から少し上げてタスクバーを避ける。
-        利用者が動かしてあれば、その位置を使う。
-        """
-        placement = geometry.compute(
+    def _placement(self, *, anchor: str, saved=None):
+        return geometry.compute(
             content_width=self._content_width(),
             screen_width=self.root.winfo_screenwidth(),
             screen_height=self.root.winfo_screenheight(),
             bar_height=int(app_config.ui_setting("bar_height")),
             bottom_margin=int(app_config.ui_setting("bottom_margin")),
-            saved=self._saved_position())
-        self.root.geometry(placement.as_geometry())
-        log.info("バーを置きました: %s", placement.as_geometry())
+            edge_margin=int(app_config.ui_setting("edge_margin")),
+            anchor=anchor, saved=saved)
+
+    def _anchor_for(self, status) -> str:
+        """いまの状態に合う置き場所。
+
+        何も選んでいないあいだは**ランチャーが主役**なので画面中央 ──
+        起動直後に探さずに見つかる。ツールを選んだら**業務画面が主役**に
+        なるので隅へ寄る (要件定義書 §5.2「業務ツールの操作をできるだけ
+        邪魔しない」)。
+        """
+        active = (self.manager.current is not None
+                  or status.state.value in ("starting", "stopping"))
+        key = "position_active" if active else "position_idle"
+        return geometry.normalize_anchor(str(app_config.ui_setting(key)))
+
+    def _place(self) -> None:
+        """最初の置き場所を決める (要件定義書 §5.1)。
+
+        幅は画面いっぱいにしない。**業務画面を隠さない**ことが目的なので、
+        必要なぶんだけ取る。利用者が動かしてあれば、その位置を使う。
+
+        すでに動いているツールを引き継いだ状態で始まることがあるので、
+        中央と決め打ちにせず、いまの状態から決める。
+        """
+        self._anchor = self._anchor_for(self.manager.status)
+        placement = self._placement(anchor=self._anchor,
+                                    saved=self._saved_position())
+        self._apply_geometry(placement.as_geometry())
+        log.info("バーを置きました: %s (%s%s)", placement.as_geometry(),
+                 self._anchor, " / 手動" if self._manual else "")
 
     def _resize_to_content(self) -> None:
         """ボタンが増減したあと、幅だけ取り直す。
@@ -196,14 +231,72 @@ class LauncherBar:
         設定画面で5個目のツールを足したときに呼ぶ。**位置は動かさない** ──
         利用者が置いた場所から勝手に飛ぶと、探し直すことになる。
         """
-        placement = geometry.compute(
-            content_width=self._content_width(),
-            screen_width=self.root.winfo_screenwidth(),
-            screen_height=self.root.winfo_screenheight(),
-            bar_height=int(app_config.ui_setting("bar_height")),
-            bottom_margin=int(app_config.ui_setting("bottom_margin")),
+        placement = self._placement(
+            anchor=self._anchor or "bottom_center",
             saved=(self.root.winfo_x(), self.root.winfo_y()))
-        self.root.geometry(placement.as_geometry())
+        self._apply_geometry(placement.as_geometry())
+
+    # --------------------------------------------------------------
+    # 状態に合わせて寄る
+    # --------------------------------------------------------------
+    def _follow_state(self, status) -> None:
+        """状態が変わったら置き場所も合わせる。
+
+        **利用者が手で置いていたら動かさない。** 自動の移動が利用者の
+        置き場所を上書きすると、動かすたびに戻されることになる。
+        """
+        if self._manual:
+            return
+        anchor = self._anchor_for(status)
+        if anchor == self._anchor:
+            return
+        log.info("バーを %s へ移します", anchor)
+        self._anchor = anchor
+        self._move_to(self._placement(anchor=anchor))
+
+    def _move_to(self, placement) -> None:
+        """新しい置き場所へ移す。滑らせて、どこへ行ったか分かるようにする。"""
+        start = (self.root.winfo_x(), self.root.winfo_y())
+        target = (placement.x, placement.y)
+        # 幅は先に合わせる。動かしながら幅も変えると途中の形が崩れて見える
+        self._apply_geometry(
+            f"{placement.width}x{placement.height}+{start[0]}+{start[1]}")
+
+        duration = int(app_config.ui_setting("move_animation_ms"))
+        if duration <= 0 or start == target:
+            self._apply_geometry(placement.as_geometry())
+            return
+        self._slide(start, target, placement, max(1, duration // FRAME_MS))
+
+    def _slide(self, start, target, placement, steps: int, index: int = 1) -> None:
+        """1こまずつ動かす。"""
+        ratio = min(1.0, index / steps)
+        # 終わりに向かってゆるめる。等速だと機械的に見える
+        eased = 1 - (1 - ratio) ** 3
+        x = round(start[0] + (target[0] - start[0]) * eased)
+        y = round(start[1] + (target[1] - start[1]) * eased)
+        self._apply_geometry(f"{placement.width}x{placement.height}+{x}+{y}")
+        if index < steps:
+            self.root.after(FRAME_MS, self._slide, start, target, placement,
+                            steps, index + 1)
+
+    def _apply_geometry(self, text: str) -> None:
+        """窓の位置と大きさを変える。**自分で動かしたぶんは覚えない。**
+
+        `geometry()` を呼ぶと `<Configure>` が飛ぶ。区別しないと、自動で
+        寄せた位置を「利用者が動かした」と取り違え、以後の自動移動が
+        止まってしまう。
+        """
+        self._programmatic = True
+        if self._programmatic_handle is not None:
+            self.root.after_cancel(self._programmatic_handle)
+        self.root.geometry(text)
+        self._programmatic_handle = self.root.after(
+            PROGRAMMATIC_TAIL_MS, self._clear_programmatic)
+
+    def _clear_programmatic(self) -> None:
+        self._programmatic_handle = None
+        self._programmatic = False
 
     # --------------------------------------------------------------
     # 動かした位置を覚える
@@ -216,14 +309,17 @@ class LauncherBar:
             return None
 
     def _on_configure(self, event) -> None:
-        """動かされたら、少し待ってから覚える。"""
+        """利用者に動かされたら、少し待ってから覚える。"""
         if event.widget is not self.root:
             return                            # 中の部品の変化は関係ない
+        if self._programmatic:
+            return                            # 自分で動かしたぶんは覚えない
         if self._save_handle is not None:
             self.root.after_cancel(self._save_handle)
         self._save_handle = self.root.after(MOVE_SAVE_MS, self._save_position)
 
     def _save_position(self) -> None:
+        """手で置かれた場所を覚え、以後の自動移動をやめる。"""
         self._save_handle = None
         try:
             tool_registry.set_pc_setting(
@@ -231,6 +327,10 @@ class LauncherBar:
                 geometry.format_saved(self.root.winfo_x(), self.root.winfo_y()))
         except Exception:                     # noqa: BLE001 - 覚えられなくても続ける
             log.warning("位置を保存できませんでした", exc_info=True)
+            return
+        if not self._manual:
+            log.info("手で置かれたので、自動の移動をやめます")
+        self._manual = True
 
     # --------------------------------------------------------------
     # 操作
@@ -262,6 +362,11 @@ class LauncherBar:
             self._build_tool_buttons()
             # ツールが増えたぶん、窓を広げないとボタンが切れる
             self._resize_to_content()
+            # 設定画面で「位置を既定に戻す」が押されているかもしれない
+            self._manual = self._saved_position() is not None
+            if not self._manual:
+                self._anchor = ""             # 次の状態変化で寄せ直す
+                self._follow_state(self.manager.status)
 
     def show_detail(self) -> None:
         if not self._last_detail:
@@ -359,6 +464,8 @@ class LauncherBar:
             self.stop_button.pack(side="right", padx=(4, 0))
         else:
             self.stop_button.pack_forget()
+
+        self._follow_state(status)
 
     def _set_status_text(self, state: str, message: str) -> None:
         self.status_label.configure(text=message)

@@ -47,6 +47,10 @@ _FALLBACK: dict[str, Any] = {
     "ui": {
         "bar_height": 56,
         "bottom_margin": 48,
+        "edge_margin": 16,
+        "position_idle": "center",
+        "position_active": "bottom_left",
+        "move_animation_ms": 180,
         "health_poll_seconds": 5,
         "start_timeout_seconds": 90,
         "stop_timeout_seconds": 30,

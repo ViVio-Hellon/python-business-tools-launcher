@@ -355,6 +355,18 @@ def set_pc_setting(key: str, value: str) -> None:
     log.info("PC設定を保存しました: %s = %s", key, value)
 
 
+def clear_pc_setting(key: str) -> None:
+    """PC設定を1つ消す。**「既定に戻す」はこれで表す。**
+
+    空文字を入れるのとは別物。値が無いことと、空の値が入っていることを
+    区別したい場面がある (バーの位置は、無ければ自動、あれば手動)。
+    """
+    initialize()
+    with _connect() as conn:
+        conn.execute("DELETE FROM pc_settings WHERE key = ?", (key,))
+    log.info("PC設定を消しました: %s", key)
+
+
 def pc_mode() -> str:
     return get_pc_setting(PC_MODE_KEY)
 

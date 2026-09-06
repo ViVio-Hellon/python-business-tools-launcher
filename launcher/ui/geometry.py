@@ -13,6 +13,19 @@ MIN_WIDTH = 520
 # 画面の端にぴったり付けない。左右に残す余白
 SCREEN_MARGIN = 40
 
+# 置き場所の呼び名。
+#
+#   center        … 画面中央。**ランチャーが主役のとき** (まだ何も選んで
+#                   いない起動直後)。探さずに見つかる位置に出す
+#   bottom_left   … 左下。**業務画面が主役のとき**。隅へ寄って邪魔をしない
+#   bottom_center … 画面下部の中央
+#   bottom_right  … 右下
+ANCHORS = ("center", "bottom_left", "bottom_center", "bottom_right")
+
+# 手で動かした位置を覚えておく鍵 (PC別設定の入れ物を借りる)。
+# **値があること自体が「手動」の印**。無ければ状態に合わせて自動で寄る
+POSITION_KEY = "bar_position"
+
 
 class Placement(NamedTuple):
     """`geometry()` に渡す値。"""
@@ -26,8 +39,36 @@ class Placement(NamedTuple):
         return f"{self.width}x{self.height}+{self.x}+{self.y}"
 
 
+def anchor_position(anchor: str, *, width: int, height: int,
+                    screen_width: int, screen_height: int,
+                    bottom_margin: int, edge_margin: int) -> tuple[int, int]:
+    """呼び名から座標を出す。
+
+    下寄せは `bottom_margin` だけ上げてタスクバーを避ける。左右寄せは
+    `edge_margin` だけ内側に入れる ── 端にぴったり付けると、画面端の
+    自動表示 (タスクバーやサイドバー) と重なることがある。
+    """
+    bottom_y = max(0, screen_height - height - max(0, bottom_margin))
+    center_x = max(0, (screen_width - width) // 2)
+    right_x = max(0, screen_width - width - max(0, edge_margin))
+
+    if anchor == "center":
+        return center_x, max(0, (screen_height - height) // 2)
+    if anchor == "bottom_left":
+        return max(0, edge_margin), bottom_y
+    if anchor == "bottom_right":
+        return right_x, bottom_y
+    return center_x, bottom_y                 # bottom_center
+
+
+def normalize_anchor(value: str, fallback: str = "bottom_center") -> str:
+    """設定から来た呼び名を確かめる。知らない値なら既定に倒す。"""
+    return value if value in ANCHORS else fallback
+
+
 def compute(*, content_width: int, screen_width: int, screen_height: int,
-            bar_height: int, bottom_margin: int,
+            bar_height: int, bottom_margin: int, edge_margin: int = 16,
+            anchor: str = "bottom_center",
             saved: Optional[tuple[int, int]] = None) -> Placement:
     """バーの幅と座標を決める。
 
@@ -35,8 +76,13 @@ def compute(*, content_width: int, screen_width: int, screen_height: int,
     畳んだ状態で測ると、「ツール停止」や「詳細」が出たときに右端が切れる
     (窓の幅は変えられない)。
 
-    `saved` があればその座標を使う。ただし画面の外に出ているときは
-    捨てて既定の位置に戻す ── 画面構成が変わった端末 (二画面を外した、
+    `anchor` は状態に応じた置き場所 (起動直後は中央、ツールを選んだあとは
+    左下、など)。
+
+    `saved` があればそちらを優先する ── **利用者が手で置いた場所が
+    いちばん強い。** 自動の移動が利用者の置き場所を上書きすると、
+    動かすたびに戻されることになる。ただし画面の外に出ているときは
+    捨てて `anchor` に戻す ── 画面構成が変わった端末 (二画面を外した、
     解像度を変えた) で、**バーが見えない場所に出たまま戻せなくなる**のを
     避けるため。
     """
@@ -44,13 +90,17 @@ def compute(*, content_width: int, screen_width: int, screen_height: int,
     width = min(width, max(MIN_WIDTH, screen_width - SCREEN_MARGIN))
     height = max(1, bar_height)
 
-    default_x = max(0, (screen_width - width) // 2)
-    default_y = max(0, screen_height - height - max(0, bottom_margin))
-
     if saved is not None and is_on_screen(saved, width, height,
                                           screen_width, screen_height):
         return Placement(width, height, saved[0], saved[1])
-    return Placement(width, height, default_x, default_y)
+
+    x, y = anchor_position(normalize_anchor(anchor),
+                           width=width, height=height,
+                           screen_width=screen_width,
+                           screen_height=screen_height,
+                           bottom_margin=bottom_margin,
+                           edge_margin=edge_margin)
+    return Placement(width, height, x, y)
 
 
 # 画面内と認めるのに必要な、見えている量 (ピクセル)。

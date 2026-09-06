@@ -57,6 +57,60 @@ class DefaultPlacementTests(unittest.TestCase):
         self.assertEqual(p.y, 1080 - 56)
 
 
+class AnchorTests(unittest.TestCase):
+    """状態に合わせた置き場所 (要件定義書 §5.1 / §5.2)。"""
+
+    ARGS = dict(width=980, height=56, screen_width=1920, screen_height=1080,
+                bottom_margin=48, edge_margin=16)
+
+    def test_中央(self) -> None:
+        """何も選んでいないとき。ランチャーが主役なので真ん中に出す。"""
+        x, y = geometry.anchor_position("center", **self.ARGS)
+        self.assertEqual(x, (1920 - 980) // 2)
+        self.assertEqual(y, (1080 - 56) // 2)
+
+    def test_左下(self) -> None:
+        """ツールを選んだあと。業務画面が主役なので隅へ寄る。"""
+        x, y = geometry.anchor_position("bottom_left", **self.ARGS)
+        self.assertEqual(x, 16)
+        self.assertEqual(y, 1080 - 56 - 48)
+
+    def test_右下(self) -> None:
+        x, y = geometry.anchor_position("bottom_right", **self.ARGS)
+        self.assertEqual(x, 1920 - 980 - 16)
+        self.assertEqual(y, 1080 - 56 - 48)
+
+    def test_どの置き場所でも画面内に収まる(self) -> None:
+        for anchor in geometry.ANCHORS:
+            for screen in (FHD, NOTEBOOK):
+                with self.subTest(anchor=anchor, screen=screen):
+                    p = geometry.compute(content_width=980, **screen, **BAR,
+                                         anchor=anchor)
+                    self.assertGreaterEqual(p.x, 0)
+                    self.assertGreaterEqual(p.y, 0)
+                    self.assertLessEqual(p.x + p.width, screen["screen_width"])
+                    self.assertLessEqual(p.y + p.height, screen["screen_height"])
+
+    def test_知らない呼び名は既定に倒す(self) -> None:
+        """設定ファイルに打ち間違いがあっても起動する。"""
+        self.assertEqual(geometry.normalize_anchor("まんなか"), "bottom_center")
+        self.assertEqual(geometry.normalize_anchor(""), "bottom_center")
+        for anchor in geometry.ANCHORS:
+            self.assertEqual(geometry.normalize_anchor(anchor), anchor)
+
+    def test_起動時と選択後で位置が変わる(self) -> None:
+        """要件: 起動時は画面中央、ツール選択後は左下。"""
+        idle = geometry.compute(content_width=980, **FHD, **BAR,
+                                anchor="center")
+        active = geometry.compute(content_width=980, **FHD, **BAR,
+                                  anchor="bottom_left")
+        self.assertEqual((idle.x, idle.y), (470, 512))
+        self.assertEqual((active.x, active.y), (16, 976))
+        self.assertNotEqual((idle.x, idle.y), (active.x, active.y))
+        # 幅は変わらない。移動で大きさまで変わると落ち着かない
+        self.assertEqual(idle.width, active.width)
+
+
 class SavedPositionTests(unittest.TestCase):
     """利用者が動かした位置を覚える。"""
 
@@ -72,6 +126,14 @@ class SavedPositionTests(unittest.TestCase):
                                      saved=saved)
                 self.assertEqual((p.x, p.y), (470, 976),
                                  f"{saved} を使ってしまいました")
+
+    def test_手で置いた位置は自動の置き場所より強い(self) -> None:
+        """**動かすたびに戻される**ことがないように。"""
+        for anchor in geometry.ANCHORS:
+            with self.subTest(anchor):
+                p = geometry.compute(content_width=980, **FHD, **BAR,
+                                     anchor=anchor, saved=(300, 400))
+                self.assertEqual((p.x, p.y), (300, 400))
 
     def test_端に少し寄せた程度なら残す(self) -> None:
         """利用者が意図して寄せたものを、勝手に中央へ戻さない。"""

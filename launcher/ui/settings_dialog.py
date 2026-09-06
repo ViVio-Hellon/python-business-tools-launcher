@@ -69,6 +69,7 @@ class SettingsDialog:
             self.rows.append(_ToolRow(body, tool))
 
         self._build_pc_mode()
+        self._build_bar_position()
         self._build_buttons()
 
     def _scrollable_body(self) -> tk.Frame:
@@ -116,6 +117,41 @@ class SettingsDialog:
                  bg=theme.BG, fg=theme.MUTED,
                  font=theme.FONT_SMALL).pack(side="left", padx=(8, 0))
 
+    def _build_bar_position(self) -> None:
+        """バーの置き場所 (要件定義書 §5.1)。
+
+        ふだんは状態に合わせて自動で寄る (何も選んでいなければ中央、
+        ツールを選んだら左下)。**手で動かすとそちらが優先される**ので、
+        自動に戻す道をここに用意する。
+        """
+        # 鍵は tkinter に触らない `geometry` が持つ。`bar` から取ると、
+        # `bar` → `settings_dialog` → `bar` の輪ができる
+        from .geometry import POSITION_KEY, parse_saved
+
+        self._position_key = POSITION_KEY
+        saved = parse_saved(tool_registry.get_pc_setting(POSITION_KEY))
+        self.reset_position = tk.BooleanVar(value=False)
+
+        frame = tk.Frame(self.top, bg=theme.BG)
+        frame.pack(fill="x", padx=16, pady=(10, 0))
+        tk.Label(frame, text="バーの位置", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD).pack(side="left")
+        if saved is None:
+            tk.Label(frame,
+                     text="自動（何も選んでいなければ中央、選ぶと左下）",
+                     bg=theme.BG, fg=theme.MUTED,
+                     font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
+            return
+
+        tk.Label(frame, text=f"手動（{saved[0]}, {saved[1]}）",
+                 bg=theme.BG, fg=theme.MUTED,
+                 font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
+        tk.Checkbutton(frame, text="自動に戻す", variable=self.reset_position,
+                       bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
+                       activebackground=theme.BG, activeforeground=theme.FG,
+                       font=theme.FONT_SMALL, bd=0,
+                       highlightthickness=0).pack(side="left", padx=(10, 0))
+
     def _build_buttons(self) -> None:
         frame = tk.Frame(self.top, bg=theme.BG)
         frame.pack(fill="x", padx=16, pady=14)
@@ -161,6 +197,8 @@ class SettingsDialog:
         tool_registry.backup()
         tool_registry.save_all(updated)
         tool_registry.set_pc_mode(self.mode_var.get().strip())
+        if self.reset_position.get():
+            tool_registry.clear_pc_setting(self._position_key)
         log.info("設定を保存しました (%d件)", len(updated))
         self.saved = True
         self.top.destroy()
