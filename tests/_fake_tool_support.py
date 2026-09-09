@@ -26,11 +26,17 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
                   display_name: str = "偽ツール",
                   ready_after: float = 0.0, busy: bool = False,
                   exit_code: int | None = None,
-                  with_stop_bat: bool = True) -> Path:
+                  with_stop_bat: bool = True,
+                  version: str = "1.0.0",
+                  installed_version: str | None = None) -> Path:
     """1つの業務ツールらしいフォルダを作る。
 
     `exit_code` を渡すと、**起動せずにその戻り値で終わる** BATになる。
     起動に失敗したときの見え方を確かめるために使う。
+
+    `installed_version` を `version` と違う値にすると、「置いてある版と
+    動いている版が食い違う」状態を作れる ── 入れ替えたのに古いプロセスが
+    残っている場面。
     """
     root = base / app_id
     (root / "config").mkdir(parents=True, exist_ok=True)
@@ -43,6 +49,7 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
                 "--port", str(port), "--app-id", app_id,
                 "--display-name", display_name,
                 "--app-root", str(root),
+                "--version", version,
                 "--ready-after", str(ready_after)]
         if busy:
             args.append("--busy")
@@ -64,7 +71,10 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
     # 本物と同じ場所に `config/app.json` を置く。
     # `process_manager.find_shutdown_token` がここを読む
     (root / "config" / "app.json").write_text(
-        f'{{"app_id": "{app_id}", "local_dir_name": "Fake_{app_id}"}}',
+        f'{{"app_id": "{app_id}", "display_name": "{display_name}",'
+        f' "version": "{installed_version or version}",'
+        f' "local_dir_name": "Fake_{app_id}",'
+        f' "server": {{"port": {port}}}}}',
         encoding="utf-8")
     return root
 

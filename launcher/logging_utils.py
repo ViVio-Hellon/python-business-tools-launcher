@@ -61,6 +61,11 @@ def configure_logging(*, console: bool | None = None) -> None:
     if console:
         stream = logging.StreamHandler()
         stream.setFormatter(formatter)
+        # **画面には INFO 以上だけ。** 細かい記録はファイルに残す。
+        # 診断起動 (`start_debug.bat --check`) は利用者が読むものなので、
+        # 起動確認の応答なし1件ずつのような DEBUG が混ざると、
+        # 肝心のバージョンや設定の行が埋もれる
+        stream.setLevel(logging.INFO)
         root.addHandler(stream)
 
     _configured = True

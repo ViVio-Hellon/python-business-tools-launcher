@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,31 @@ def version() -> str:
     return str(load()["version"])
 
 
+# 版のバッジに付ける頭。画面で「数字の羅列」に見えないようにする
+VERSION_PREFIX = "v"
+_VERSION_FORM = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def version_label() -> str:
+    """画面のバッジに出す形。例 `v1.0.0`。"""
+    return f"{VERSION_PREFIX}{version()}"
+
+
+def version_problem() -> str:
+    """版の書き方がおかしければ理由。正しければ空文字。
+
+    番号が読めない形だと「どれが新しいのか」を並べて比べられなくなる。
+    起動は止めない (版が読めなくてもランチャーは使える) が、
+    診断とバージョン情報には出す。
+    """
+    text = version()
+    if _VERSION_FORM.match(text):
+        return ""
+    return (f"版の書き方が違います: {text!r}。"
+            "config/launcher.json の version は「1.0.0」のように"
+            "数字3つで書いてください。")
+
+
 def ui_setting(name: str) -> Any:
     return load()["ui"][name]
 
@@ -181,7 +207,7 @@ def describe() -> str:
     lines = [
         f"アプリID      : {app_id()}",
         f"表示名        : {display_name()}",
-        f"バージョン    : {version()}",
+        f"バージョン    : {version_label()}",
         f"アプリ本体    : {APP_ROOT}",
         f"設定ファイル  : {CONFIG_PATH}",
         f"ローカル領域  : {local_root()}",
@@ -191,4 +217,7 @@ def describe() -> str:
     ]
     if _load_error:
         lines.append(f"設定の問題    : {_load_error}")
+    problem = version_problem()
+    if problem:
+        lines.append(f"版の問題      : {problem}")
     return "\n".join(lines)

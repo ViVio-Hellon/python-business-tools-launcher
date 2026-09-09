@@ -415,7 +415,7 @@ def next_order_no() -> int:
 def probe_tool_folder(start_command: str) -> dict:
     """`start.bat` の隣の `config/app.json` から、そのツールの素性を読む。
 
-    4つの業務ツールは同じ起動基盤なので、アプリID・表示名・ポートが
+    4つの業務ツールは同じ起動基盤なので、アプリID・表示名・版・ポートが
     そこに入っている。**利用者に手で写させない**ためにこれを読む ──
     アプリIDが1文字違うだけで起動確認が永久に通らず、しかも画面には
     「応答がありません」としか出ないので、原因にたどり着きにくい。
@@ -441,6 +441,9 @@ def probe_tool_folder(start_command: str) -> dict:
     name = str(raw.get("display_name", "")).strip()
     if name:
         found["display_name"] = name
+    version = str(raw.get("version", "")).strip()
+    if version:
+        found["version"] = version
     port = _first_port(raw.get("server"))
     if port:
         found["port"] = port

@@ -40,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "app_id": opt.app_id,
                 "display_name": opt.display_name,
-                "version": "1.0.0",
+                "version": opt.version,
                 "app_root": opt.app_root,
                 "port": opt.port,
                 "pid": os.getpid(),
@@ -82,6 +82,7 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--app-id", required=True)
     parser.add_argument("--display-name", default="偽ツール")
+    parser.add_argument("--version", default="1.0.0")
     parser.add_argument("--app-root", default=os.getcwd())
     parser.add_argument("--ready-after", type=float, default=0.0)
     parser.add_argument("--busy", action="store_true")

@@ -23,6 +23,7 @@ from ..logging_utils import get_logger
 from . import geometry, theme
 from .geometry import POSITION_KEY
 from .settings_dialog import SettingsDialog
+from .version_dialog import VersionDialog
 
 log = get_logger("ui.bar")
 
@@ -104,6 +105,15 @@ class LauncherBar:
         right.pack(side="right")
         self._small_button(right, "終了", self.on_close).pack(side="right",
                                                               padx=(4, 0))
+        # 版のバッジ。**押すとバージョン情報が出る** ── 「どれが入って
+        # いるか」を調べたい人がいちばん最初に見る場所に置く。
+        # ボタンを1つ増やさずに済むよう、バッジ自体を入口にする
+        version = tk.Button(
+            right, text=app_config.version_label(), command=self.show_version,
+            bg=theme.BG, fg=theme.MUTED, activebackground=theme.BUTTON_BG,
+            activeforeground=theme.FG, relief="flat", bd=0,
+            padx=8, pady=5, font=theme.FONT_SMALL, cursor="hand2")
+        version.pack(side="right", padx=(4, 0))
         self._small_button(right, "設定", self.open_settings).pack(side="right",
                                                                    padx=(4, 0))
         # ツールだけ止めてランチャーは残す (要件定義書 §4「ツール停止」)。
@@ -354,6 +364,10 @@ class LauncherBar:
                 parent=self.root):
             return
         self.manager.stop_current()
+
+    def show_version(self) -> None:
+        """バージョン情報 (どの版が入っていて、どの版が動いているか)。"""
+        VersionDialog(self.root)
 
     def open_settings(self) -> None:
         """設定画面 (要件定義書 §13)。"""

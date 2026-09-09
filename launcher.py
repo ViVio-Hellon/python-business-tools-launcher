@@ -143,7 +143,7 @@ def log_environment() -> None:
     log.info("Python: %s (%s)", sys.version.split()[0], sys.executable)
     log.info("アプリ本体: %s", app_config.APP_ROOT)
     log.info("ローカル領域: %s", app_config.local_root())
-    log.info("版: %s", app_config.version())
+    log.info("版: %s", app_config.version_label())
 
 
 def start() -> int:
@@ -295,6 +295,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             except StartupError as exc:
                 problems.append(exc)
         check_config()
+
+        # どの版が入っていて、どの版が動いているか。**現場の調査は
+        # ここから始まる**ので先頭に出す
+        try:
+            from launcher import version_info
+            print(version_info.describe())
+            print()
+        except Exception as exc:              # noqa: BLE001 - 診断で落ちない
+            print(f"バージョン情報を集められませんでした: {exc}")
 
         print(app_config.describe())
         print()

@@ -90,6 +90,9 @@ class Status:
     # その画面をランチャーが閉じられるか。既定ブラウザーへ渡しただけの
     # ときは False で、切り替えのとき手で閉じてもらうことになる
     browser_managed: bool = False
+    # 動いているツールの版 (`/api/health` が返した値)。
+    # どの版が動いているかを、起動のたびにログへ残すために持つ
+    tool_version: str = ""
 
     @property
     def busy(self) -> bool:
@@ -427,7 +430,10 @@ class ToolManager:
 
         running = _running_from_health(tool, payload, launch_pid=proc.pid)
         self._current = running
-        log.info("起動完了: %s", running.summary())
+        # **どの版が動き出したかを残す。** 「入れ替えたのに直らない」を
+        # 調べるとき、ログにこの1行があるかどうかで手間が変わる
+        log.info("起動完了: %s (版 %s)", running.summary(),
+                 payload.get("version") or "不明")
 
         # **ここで初めて画面を開く** (要件定義書 §7.1 / §20)
         self._open_browser(running, running.url or tool.home_url)
