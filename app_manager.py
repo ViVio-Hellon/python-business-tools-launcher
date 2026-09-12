@@ -45,8 +45,8 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 import process_manager  # noqa: E402
-from launcher import (app_config, browser, health, runtime_state,  # noqa: E402
-                      tool_registry)
+from launcher import (app_config, browser, health, logging_utils,  # noqa: E402
+                      runtime_state, tool_registry)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
@@ -122,6 +122,10 @@ class ToolManager:
         self._generation = 0
         self._current: Optional[RunningTool] = runtime_state.read()
         self._process: Optional[subprocess.Popen] = None
+        # 応答が無かった回数。**1回で「終了した」と断じない** ──
+        # スリープ復帰直後や、重い処理でHTTP応答が遅れたときに
+        # 動いているツールを落ちた扱いにしてしまう
+        self._health_failures = 0
 
     # --------------------------------------------------------------
     # 状態
@@ -199,7 +203,14 @@ class ToolManager:
             runtime_state.write(running)
             log.info("ランチャー外で動いているツールを見つけました: %s",
                      running.summary())
-            self._set(State.RUNNING, f"現在：{tool.display_name}", responding=True)
+            # **この画面はランチャーが開いたものではない。** 閉じる
+            # 手がかりが無いので、切り替えのときに残る。黙っていると
+            # 「閉じたはずの画面が残っている」と見える
+            self._set(State.RUNNING, f"現在：{tool.display_name}",
+                      detail=("このツールはランチャーの外で起動されています。\n"
+                              "画面はランチャーからは閉じられないので、"
+                              "切り替えのときは手で閉じてください。"),
+                      responding=True)
             return running
 
         if recorded is not None:
@@ -333,6 +344,7 @@ class ToolManager:
 
         self._reap_process()
         self._current = None
+        self._health_failures = 0
         runtime_state.clear()
         log.info("停止完了: %s (%s)", name, result.method)
         if not self._superseded(generation):
@@ -430,6 +442,7 @@ class ToolManager:
 
         running = _running_from_health(tool, payload, launch_pid=proc.pid)
         self._current = running
+        self._health_failures = 0
         # **どの版が動き出したかを残す。** 「入れ替えたのに直らない」を
         # 調べるとき、ログにこの1行があるかどうかで手間が変わる
         log.info("起動完了: %s (版 %s)", running.summary(),
@@ -461,6 +474,13 @@ class ToolManager:
                     / f"tool_{_safe_name(tool.app_id)}.out.log")
         log.info("起動開始: %s — %s (cwd=%s)",
                  tool.display_name, " ".join(command), tool.resolved_work_dir)
+
+        # 大きくなっていれば退ける。**日付で分かれないので、開いたまま
+        # 長く使う端末では際限なく育つ**
+        logging_utils.rotate_if_large(
+            out_path,
+            max_bytes=int(app_config.log_setting("tool_log_max_mb")) * 1024 * 1024,
+            keep=int(app_config.log_setting("tool_log_keep")))
 
         try:
             # 出力はファイルへ逃がす。**パイプで受けてはいけない** ──
@@ -547,6 +567,7 @@ class ToolManager:
         browser.reap()
 
         if process_manager.is_running(running):
+            self._health_failures = 0
             # **画面の生死はバックエンドと別に見る** (要件定義書 §11)。
             # 利用者が画面だけ手で閉じても、バックエンドは動いたまま。
             # そのことを表に出す ── 出さないと「終わったつもり」で
@@ -554,14 +575,35 @@ class ToolManager:
             browser_open = process_manager.is_browser_open(running)
             if (not self._status.responding
                     or self._status.browser_open != browser_open):
+                detail = ""
                 if running.browser_managed and not browser_open:
-                    log.info("画面が閉じられました（バックエンドは動作中）: %s",
+                    # **画面を閉じると、ツールはまもなく自分から終わる。**
+                    # 各ツールは「誰も見ていなければ終了する」見張りを
+                    # 持っていて、画面の心拍が途切れると数秒で落ちる。
+                    # 「画面だけ閉じた」状態が続くかのように見せない
+                    log.info("画面が閉じられました。ツールはまもなく終了します: %s",
                              running.app_id)
+                    detail = (
+                        f"{running.display_name}のブラウザー画面を閉じました。\n"
+                        "ツール側は「誰も見ていない」と判断して、まもなく自動で"
+                        "終了します(実行中の処理があれば終わるまで待ちます)。\n\n"
+                        "続けて使うときは、もう一度ボタンを押してください。")
                 self._set(State.RUNNING, f"現在：{running.display_name}",
-                          responding=True, browser_open=browser_open)
+                          detail=detail, responding=True,
+                          browser_open=browser_open)
             return True
 
-        log.warning("応答が途切れました: %s", running.summary())
+        # --- 応答が無い ---
+        self._health_failures += 1
+        limit = max(1, int(app_config.ui_setting("health_failures_before_dead")))
+        if self._health_failures < limit:
+            log.info("応答がありません (%d/%d): %s",
+                     self._health_failures, limit, running.app_id)
+            return True                       # まだ判断しない
+
+        log.warning("応答が途切れました: %s (%d回連続)",
+                    running.summary(), self._health_failures)
+        self._health_failures = 0
         self._reap_process()
         self._current = None
         runtime_state.clear()

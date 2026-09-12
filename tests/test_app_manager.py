@@ -480,12 +480,21 @@ class MonitorTests(ManagerTestCase):
     """基盤仕様書 2.9 ブラウザーとバックエンドの状態監視。"""
 
     def test_ツールが落ちたら気づく(self) -> None:
+        from launcher import app_config
+
         tool = self.register("fake.die", "日報")
         self.start(tool)
         self.assertTrue(self.manager.poll_health())
 
         # ツールだけを落とす (ランチャーは知らない)
         process_manager.stop(runtime_state.read(), force=True, timeout=10)
+
+        # **1回では断じない。** スリープ復帰や重い処理中に、動いている
+        # ツールを落ちた扱いにしないため (tests/test_resilience.py)
+        limit = int(app_config.ui_setting("health_failures_before_dead"))
+        for _ in range(limit - 1):
+            self.assertTrue(self.manager.poll_health())
+            self.assertEqual(self.manager.status.state, State.RUNNING)
 
         self.assertFalse(self.manager.poll_health())
         self.assertEqual(self.manager.status.state, State.ERROR)

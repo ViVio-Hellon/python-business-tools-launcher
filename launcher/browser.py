@@ -281,6 +281,39 @@ def managed_pids() -> list[int]:
     return sorted(_spawned)
 
 
+def purge_unused(known_app_ids) -> list[str]:
+    """登録されていないツールのプロファイルを消す。
+
+    プロファイルはツールごとに作られ、中身は Chromium のキャッシュなので
+    **使い続けるだけ膨らむ**。設定からツールを消しても残り続けると、
+    誰も使わないキャッシュが端末に溜まる。
+
+    消すのは**登録が無くなったものだけ**。使っているツールのぶんは
+    残す ── 消すと次に開いたときに作り直しになり、体感が落ちる。
+
+    ランチャーの起動時に1度だけ呼ぶ。消した名前を返す (記録用)。
+    """
+    wanted = {profile_dir(app_id).name for app_id in known_app_ids}
+    removed: list[str] = []
+    try:
+        root = app_config.local_dir("browser")
+        if not root.exists():
+            return removed
+        for child in root.iterdir():
+            if not child.is_dir() or child.name in wanted:
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+            removed.append(child.name)
+    except OSError as exc:
+        log.warning("使われていないプロファイルを片付けられませんでした: %s", exc)
+        return removed
+
+    if removed:
+        log.info("使われていない画面のプロファイルを消しました: %s",
+                 "、".join(removed))
+    return removed
+
+
 def _open_default(app_id: str, url: str, *, reason: str) -> BrowserSession:
     """既定ブラウザーへ投げる。**この画面は閉じられない。**"""
     log.info("既定のブラウザーで開きます (%s): %s", reason, url)

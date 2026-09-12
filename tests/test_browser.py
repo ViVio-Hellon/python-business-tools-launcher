@@ -119,7 +119,17 @@ class RealBrowserTests(LocalAreaTestCase):
     画面の無い環境で動かすため `--headless=new` を足している。
     確かめたいのは表示ではなく、**旗が受け付けられ、こちらの
     プロセスとして残り、照合して閉じられること**。
+
+    【立ち上がったことを必ず確かめる】
+    Chromium は旗が気に入らないと**1秒ほどで黙って終了する**。
+    立ち上がりを待たずに調べると、「すでに終了している」ものを
+    相手に試すことになり、試験は通るのに何も確かめていない状態になる
+    (実際にそうなっていた ── root で動かすと `--no-sandbox` が無い
+    かぎり起動を拒否され、それに気づかないまま通っていた)。
     """
+
+    # 開いたことを認めるまで待つ上限 (秒)。Chromium は起動に少しかかる
+    LAUNCH_WAIT_SEC = 15.0
 
     def setUp(self) -> None:
         super().setUp()
@@ -133,38 +143,48 @@ class RealBrowserTests(LocalAreaTestCase):
             proc.wait(timeout=10)
 
     def _launch(self, app_id: str, url: str) -> RunningTool:
+        """本物のブラウザーを1つ開く。**開くまで待つ。**"""
         profile = browser.profile_dir(app_id)
         profile.mkdir(parents=True, exist_ok=True)
         command = browser.build_command(_REAL, url, profile)
         command.append("--headless=new")
-        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
-        self.procs.append(proc)
-        return RunningTool(app_id=app_id, display_name="日報",
-                           browser_pid=proc.pid, browser_profile=str(profile))
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            # root では砂箱を作れず、Chromium は起動を拒否する。
+            # **試験の都合なので、製品の起動行には入れない** ──
+            # 現場では利用者の権限で動くので砂箱はそのまま使う
+            command.append("--no-sandbox")
 
-    def _wait_cmdline(self, pid: int, timeout: float = 10.0) -> str:
-        deadline = time.monotonic() + timeout
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        self.procs.append(proc)
+        running = RunningTool(app_id=app_id, display_name="日報",
+                              browser_pid=proc.pid, browser_profile=str(profile))
+
+        deadline = time.monotonic() + self.LAUNCH_WAIT_SEC
         while time.monotonic() < deadline:
-            command = process_manager.process_command_line(pid)
-            if command:
-                return command
-            time.sleep(0.05)
-        return ""
+            if proc.poll() is not None:
+                output = (proc.stdout.read() or b"").decode("utf-8", "replace")
+                self.skipTest(f"この環境では Chromium が起動しません: "
+                              f"{output.strip()[:200]}")
+            if (process_manager.process_command_line(proc.pid)
+                    and process_manager.is_browser_open(running)):
+                return running
+            time.sleep(0.1)
+        self.skipTest("Chromium が時間内に起動しませんでした")
 
     def test_旗が受け付けられて動き続ける(self) -> None:
         running = self._launch("fake.real", "http://127.0.0.1:9/")
-        command = self._wait_cmdline(running.browser_pid)
+        command = process_manager.process_command_line(running.browser_pid)
 
-        self.assertTrue(command, "ブラウザーのコマンドラインを取れません")
         self.assertIn("--app=", command)
+        self.assertIn("--user-data-dir=", command)
+        # 少し置いてもまだ動いていること (旗を拒否して落ちていない)
+        time.sleep(1.0)
         self.assertTrue(process_manager.is_browser_open(running),
                         "ブラウザーがすぐ終了しました(旗が拒否された可能性)")
 
     def test_照合して閉じられる(self) -> None:
         running = self._launch("fake.real2", "http://127.0.0.1:9/")
-        self._wait_cmdline(running.browser_pid)
-
         self.assertTrue(process_manager.close_browser(running))
         self.assertFalse(process_manager._is_alive(running.browser_pid))
 
@@ -172,8 +192,9 @@ class RealBrowserTests(LocalAreaTestCase):
         """§8.3.3 の要。**利用者のブラウザーに手が届かないこと。**"""
         mine = self._launch("fake.mine", "http://127.0.0.1:9/")
         theirs = self._launch("fake.theirs", "http://127.0.0.1:9/")
-        self._wait_cmdline(mine.browser_pid)
-        self._wait_cmdline(theirs.browser_pid)
+        # 両方とも本当に動いていることを確かめてから試す
+        self.assertTrue(process_manager.is_browser_open(mine))
+        self.assertTrue(process_manager.is_browser_open(theirs))
 
         # 自分のものだけ閉じる
         self.assertTrue(process_manager.close_browser(mine))

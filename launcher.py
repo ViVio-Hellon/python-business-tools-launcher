@@ -166,6 +166,17 @@ def start() -> int:
     log.info("多重起動の判定: %s", guard.reason)
 
     tool_registry.initialize()
+
+    # 登録が無くなったツールの画面プロファイルを片付ける。
+    # 起動時に1度だけ ── 消し忘れたキャッシュが端末に溜まらないように
+    try:
+        from launcher import browser
+
+        browser.purge_unused(t.app_id for t in
+                             tool_registry.all_tools(include_disabled=True))
+    except Exception:                         # noqa: BLE001 - 片付けで起動を止めない
+        log.warning("画面プロファイルの片付けに失敗しました", exc_info=True)
+
     launch_guard.write_lock()
     try:
         manager = ToolManager()

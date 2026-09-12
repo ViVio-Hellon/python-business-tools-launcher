@@ -26,6 +26,10 @@ ROOT_NAME = "launcher"
 # 「先週から切り替わらない」の類は数日さかのぼれないと追えない
 KEEP_DAYS = 30
 
+# 片付けの対象。**業務ツールの出力も含める** ── こちらは日付で
+# 分かれておらず追記され続けるので、放っておくと無制限に増える
+LOG_PATTERNS = ("launcher_*.log", "tool_*.out.log")
+
 
 def configure_logging(*, console: bool | None = None) -> None:
     """起動時に一度だけ呼ぶ。二重呼び出しは無害 (冪等)。"""
@@ -84,10 +88,45 @@ def _purge_old_logs() -> None:
 
     limit = time.time() - KEEP_DAYS * 86400
     try:
-        for path in app_config.local_dir("logs").glob("launcher_*.log"):
-            if path.stat().st_mtime < limit:
-                path.unlink()
+        folder = app_config.local_dir("logs")
+        for pattern in LOG_PATTERNS:
+            for path in folder.glob(pattern):
+                if path.stat().st_mtime < limit:
+                    path.unlink()
     except OSError:
+        pass
+
+
+def rotate_if_large(path, *, max_bytes: int, keep: int = 2) -> None:
+    """大きくなったファイルを退避する。
+
+    業務ツールの出力 (`tool_<アプリID>.out.log`) は日付で分かれず、
+    動いているあいだ追記され続ける。**日数で消すだけでは、開いたまま
+    長く使う端末を守れない** ── 1つのファイルが際限なく育つ。
+
+    そこで上限を超えたら `.1`、`.2` と退けて、新しいファイルから書き直す。
+    `logging.handlers.RotatingFileHandler` を使わないのは、書いている
+    のが `logging` ではなく**子プロセス自身**だから (こちらは開くときに
+    退けるだけ)。
+    """
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return
+
+    try:
+        # 古いほうから押し出す。keep=2 なら .2 を捨てて .1 → .2、本体 → .1
+        oldest = path.with_suffix(path.suffix + f".{keep}")
+        if oldest.exists():
+            oldest.unlink()
+        for index in range(keep - 1, 0, -1):
+            source = path.with_suffix(path.suffix + f".{index}")
+            if source.exists():
+                source.rename(path.with_suffix(path.suffix + f".{index + 1}"))
+        path.rename(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        # 退けられなくても起動は続ける。**ログのために起動しないほうが困る**
         pass
 
 

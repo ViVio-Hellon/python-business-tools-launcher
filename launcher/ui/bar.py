@@ -458,10 +458,11 @@ class LauncherBar:
             message = f"{message} ({status.elapsed:.0f}秒)"
         elif (status.state.value == "running" and status.browser_managed
                 and not status.browser_open):
-            # 画面だけ閉じられている。バックエンドは動いたままなので、
-            # 「終わっている」と読めない書き方にする (要件定義書 §11)。
-            # もう一度ボタンを押せば画面が戻る
-            message = f"{message}（画面は閉じています）"
+            # **画面を閉じると、ツールはまもなく自分から終わる。**
+            # 各ツールは「誰も見ていなければ終了する」見張りを持っていて、
+            # 画面の心拍が途切れると数秒で落ちる。「画面だけ閉じた状態が
+            # 続く」かのように見せると、実態と食い違う
+            message = f"{message}（画面を閉じました・まもなく終了します）"
         self._set_status_text(status.state.value, message)
 
         self._last_detail = status.detail

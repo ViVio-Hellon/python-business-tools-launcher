@@ -53,10 +53,15 @@ _FALLBACK: dict[str, Any] = {
         "position_active": "bottom_left",
         "move_animation_ms": 180,
         "health_poll_seconds": 5,
+        "health_failures_before_dead": 3,
         "start_timeout_seconds": 90,
         "stop_timeout_seconds": 30,
     },
     "tools": [],
+    "logs": {
+        "tool_log_max_mb": 5,
+        "tool_log_keep": 2,
+    },
 }
 
 _cache: dict[str, Any] | None = None
@@ -87,6 +92,9 @@ def load(*, reload: bool = False) -> dict[str, Any]:
         merged_ui = dict(_FALLBACK["ui"])
         merged_ui.update(raw.get("ui") or {})
         data["ui"] = merged_ui
+        merged_logs = dict(_FALLBACK["logs"])
+        merged_logs.update(raw.get("logs") or {})
+        data["logs"] = merged_logs
     except FileNotFoundError:
         _load_error = f"設定ファイルがありません: {CONFIG_PATH}"
     except (OSError, ValueError) as exc:
@@ -142,6 +150,10 @@ def version_problem() -> str:
 
 def ui_setting(name: str) -> Any:
     return load()["ui"][name]
+
+
+def log_setting(name: str) -> Any:
+    return load()["logs"][name]
 
 
 def default_tools() -> list[dict[str, Any]]:

@@ -11,6 +11,7 @@
     "position_active": "bottom_left",
     "move_animation_ms": 180,
     "health_poll_seconds": 5,
+    "health_failures_before_dead": 3,
     "start_timeout_seconds": 90,
     "stop_timeout_seconds": 30
   },
@@ -60,5 +61,9 @@
       "health_path": "/api/health",
       "start_args": "--no-browser"
     }
-  ]
+  ],
+  "logs": {
+    "tool_log_max_mb": 5,
+    "tool_log_keep": 2
+  }
 }
