@@ -34,17 +34,57 @@ class LauncherVersionTests(LocalAreaTestCase):
 
     def test_版の書き方がおかしければ知らせる(self) -> None:
         """並べて比べられない書き方は、起動は止めずに知らせる。"""
-        raw = app_config.load()
-        original = raw["version"]
-        try:
-            for bad in ("", "1.0", "v1.0.0", "最新"):
-                with self.subTest(bad):
-                    raw["version"] = bad
+        import launcher
+
+        for bad in ("", "1.0", "v1.0.0", "最新"):
+            with self.subTest(bad):
+                with mock.patch.object(launcher, "__version__", bad):
                     self.assertNotEqual(app_config.version_problem(), "")
-            raw["version"] = "2.10.3"
+        with mock.patch.object(launcher, "__version__", "2.10.3"):
+            self.assertEqual(app_config.version_problem(), "")
+
+
+class VersionSourceTests(LocalAreaTestCase):
+    """版の出どころ。
+
+    **設定ファイルではなくソースに置く。** 設定は端末ごとに書き換わるし
+    壊れることもある。壊れたときに版まで分からなくなると、いちばん版を
+    知りたい場面で答えが出ない。
+    """
+
+    def test_ソースから読む(self) -> None:
+        import launcher
+
+        self.assertEqual(app_config.version(), launcher.__version__)
+        self.assertEqual(app_config.version_label(), f"v{launcher.__version__}")
+
+    def test_設定が壊れていても版は分かる(self) -> None:
+        original_path = app_config.CONFIG_PATH
+        try:
+            app_config.CONFIG_PATH = Path("/存在しない/launcher.json")
+            app_config.load(reload=True)
+            self.assertNotEqual(app_config.load_error(), "",
+                                "設定が読めた扱いになっています")
+            # 設定は既定に落ちても、版はソースから読めている
+            self.assertEqual(app_config.version_label(),
+                             version_info.launcher().version)
             self.assertEqual(app_config.version_problem(), "")
         finally:
-            raw["version"] = original
+            app_config.CONFIG_PATH = original_path
+            app_config.load(reload=True)
+
+    def test_設定では版を変えられない(self) -> None:
+        """設定から変えられると、表示された版が嘘になりうる。"""
+        raw = app_config.load()
+        raw["version"] = "9.9.9"
+        try:
+            self.assertNotEqual(app_config.version(), "9.9.9")
+        finally:
+            raw.pop("version", None)
+
+    def test_版の書き方が正しい(self) -> None:
+        """並べて比べられる形であること。"""
+        self.assertEqual(app_config.version_problem(), "")
 
 
 class InstalledVersionTests(LocalAreaTestCase):

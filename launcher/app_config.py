@@ -43,7 +43,6 @@ LOCAL_DIR_ENV = "BUSINESS_TOOLS_LAUNCHER_LOCAL_DIR"
 _FALLBACK: dict[str, Any] = {
     "app_id": "nlm.business-tools-launcher",
     "display_name": "業務ツール統合ランチャー",
-    "version": "0.0.0",
     "local_dir_name": "BusinessToolsLauncher",
     "ui": {
         "bar_height": 56,
@@ -120,7 +119,13 @@ def display_name() -> str:
 
 
 def version() -> str:
-    return str(load()["version"])
+    """ランチャーの版。**設定ファイルではなくソースから読む。**
+
+    設定が壊れていても版だけは必ず分かる (`launcher/__init__.py`)。
+    """
+    from . import __version__
+
+    return __version__
 
 
 # 版のバッジに付ける頭。画面で「数字の羅列」に見えないようにする
@@ -221,6 +226,7 @@ def describe() -> str:
         f"表示名        : {display_name()}",
         f"バージョン    : {version_label()}",
         f"アプリ本体    : {APP_ROOT}",
+        f"版の出どころ  : {Path(__file__).parent / '__init__.py'}",
         f"設定ファイル  : {CONFIG_PATH}",
         f"ローカル領域  : {local_root()}",
         f"設定DB        : {settings_db_path()}",

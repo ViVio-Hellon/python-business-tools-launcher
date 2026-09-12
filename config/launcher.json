@@ -1,7 +1,6 @@
 {
   "app_id": "nlm.business-tools-launcher",
   "display_name": "業務ツール統合ランチャー",
-  "version": "1.0.0",
   "local_dir_name": "BusinessToolsLauncher",
   "ui": {
     "bar_height": 56,

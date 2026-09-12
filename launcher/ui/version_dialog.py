@@ -28,7 +28,8 @@ class VersionDialog:
 
     def __init__(self, parent: tk.Misc) -> None:
         self.top = tk.Toplevel(parent)
-        self.top.title(f"{app_config.display_name()} - バージョン情報")
+        self.top.title(f"{app_config.display_name()} "
+                       f"{app_config.version_label()} - バージョン情報")
         self.top.configure(bg=theme.BG)
         self.top.transient(parent)
         self.top.resizable(False, False)

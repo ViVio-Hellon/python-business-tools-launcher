@@ -55,7 +55,11 @@ class LauncherBar:
         manager.set_status_callback(self.queue.put)
 
         self.root = tk.Tk()
-        self.root.title(app_config.display_name())
+        # **タスクバーと Alt+Tab に版を出す。** バーのバッジは画面を
+        # 見ている人にしか届かないが、タイトルは窓の一覧にも出るので、
+        # 「どれが動いているか」を離れた場所からも確かめられる
+        self.root.title(f"{app_config.display_name()} "
+                        f"{app_config.version_label()}")
         self.buttons: dict[str, tk.Button] = {}
         # 設定済みかどうかは、ボタンを作るときに控えておく。
         # 塗り直しは状態が届くたびに走るので、そのつど設定DBを

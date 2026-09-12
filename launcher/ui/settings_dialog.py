@@ -41,7 +41,8 @@ class SettingsDialog:
         self.rows: list[_ToolRow] = []
 
         self.top = tk.Toplevel(parent)
-        self.top.title(f"{app_config.display_name()} - 設定")
+        self.top.title(f"{app_config.display_name()} "
+                       f"{app_config.version_label()} - 設定")
         self.top.configure(bg=theme.BG)
         self.top.transient(parent)
         self.top.resizable(False, True)
