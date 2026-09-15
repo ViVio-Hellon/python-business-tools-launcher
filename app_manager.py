@@ -126,6 +126,10 @@ class ToolManager:
         # スリープ復帰直後や、重い処理でHTTP応答が遅れたときに
         # 動いているツールを落ちた扱いにしてしまう
         self._health_failures = 0
+        # いま起こしている最中のツール。**同じものを二重に起こさない印**。
+        # ボタンを素早く2回押すと、どちらの要求も「まだ何も動いていない」
+        # と見て、両方が `start.bat` を実行してしまう
+        self._starting: Optional[str] = None
 
     # --------------------------------------------------------------
     # 状態
@@ -396,6 +400,32 @@ class ToolManager:
                       detail=f"{problem}\n設定画面で指定し直してください。")
             return
 
+        # **ここから先は1つずつ。** 同じツールが起こされている最中なら、
+        # 2度目は何もしない ── 2つ目の `start.bat` はポートが空いて
+        # いないので失敗し、**起動できているのに「起動できませんでした」**
+        # と出ることになる
+        with self._lock:
+            if self._superseded(generation):
+                return
+            if self._starting is not None:
+                log.info("%s を起こしている最中です。%s は起動しません",
+                         self._starting, tool.app_id)
+                return
+            if (self._current is not None
+                    and self._current.app_id == tool.app_id):
+                log.info("%s はすでに動いています", tool.app_id)
+                return
+            self._starting = tool.app_id
+
+        try:
+            self._start_locked(tool, generation)
+        finally:
+            with self._lock:
+                if self._starting == tool.app_id:
+                    self._starting = None
+
+    def _start_locked(self, tool: Tool, generation: int) -> None:
+        """起動の本体。**同じツールでは1つしか走らない**ことが前提。"""
         self._set(State.STARTING, f"{tool.display_name}を起動しています...", tool)
         proc = self._spawn(tool)
         if proc is None:
@@ -432,7 +462,10 @@ class ToolManager:
             on_progress=on_progress, should_stop=should_stop)
 
         if self._superseded(generation):
+            # 待っているあいだに別のツールが選ばれた。**起こしかけた
+            # ものを置き去りにしない** ── 誰も知らないまま動き続ける
             log.info("起動待ちを打ち切りました: %s", tool.display_name)
+            self._abandon(tool, proc)
             return
 
         if payload is None:
@@ -513,6 +546,24 @@ class ToolManager:
                 out.close()                   # 子プロセス側は自分の複製を持つ
 
         return proc
+
+    def _abandon(self, tool: Tool, proc: subprocess.Popen) -> None:
+        """起こしかけたツールを片付ける。
+
+        切り替えで打ち切ったとき、こちらは記録を持たないまま去るので、
+        止める人が誰も居なくなる。**立ち上がっていれば止める**。
+        """
+        payload = health.probe(tool.health_url)
+        if health.is_tool(payload, tool.app_id):
+            running = _running_from_health(tool, payload, launch_pid=proc.pid)
+            log.info("打ち切ったツールを止めます: %s", running.summary())
+            process_manager.stop(running, force=True, timeout=10)
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
 
     def _report_start_failure(self, tool: Tool, proc: subprocess.Popen,
                               early_exit: dict, elapsed: float) -> None:

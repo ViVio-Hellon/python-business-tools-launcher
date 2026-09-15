@@ -156,15 +156,20 @@ def start() -> int:
     log_environment()
 
     # --- 多重起動の判定 (基盤仕様書 2.4) ---
-    guard = launch_guard.check_existing()
+    # **調べてから書くのではなく、取れたら起動する。** `Start.vbs` は
+    # 押しても数秒は何も出ないので、利用者はもう一度押す。調べる/書くを
+    # 分けていると、その2回が両方とも通ってしまう
+    guard = launch_guard.acquire()
     if not guard.should_start:
         log.info("多重起動のため終了します: %s", guard.reason)
         _show_message("すでに起動しています",
                       f"{guard.reason}\n\n"
-                      "画面下のランチャーバーを探してください。")
+                      "すでに動いているランチャーバーを探してください"
+                      "(画面の中央、またはツール使用中なら左下にあります)。")
         return 0
     log.info("多重起動の判定: %s", guard.reason)
 
+    # ここから先は**ロックを持っている**。失敗しても必ず外す
     tool_registry.initialize()
 
     # 登録が無くなったツールの画面プロファイルを片付ける。
@@ -177,7 +182,6 @@ def start() -> int:
     except Exception:                         # noqa: BLE001 - 片付けで起動を止めない
         log.warning("画面プロファイルの片付けに失敗しました", exc_info=True)
 
-    launch_guard.write_lock()
     try:
         manager = ToolManager()
         # すでに動いているツールがあれば引き継ぐ (要件定義書 §9)

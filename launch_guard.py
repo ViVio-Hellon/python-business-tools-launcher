@@ -112,8 +112,125 @@ def remove_lock() -> None:
         log.warning("ロックを消せませんでした: %s", exc)
 
 
+def acquire() -> GuardResult:
+    """ロックを**取れたら**起動してよい (基盤仕様書 2.4)。
+
+    【なぜ「調べてから書く」ではいけないか】
+    `check_existing()` で調べてから `write_lock()` で書くと、その隙間に
+    もう1つが割り込める。`Start.vbs` は pythonw で起動するので**押しても
+    数秒は何も出ない** ── 利用者はもう一度押す。実際にそうすると、
+    2つとも「ロックが無い」と判断して両方起動していた。
+
+    そこで**作成と占有を1回の操作で行う**。`O_CREAT | O_EXCL` は
+    「無ければ作る、あれば失敗する」を割り込みなしで行うので、
+    同時に来ても必ず片方だけが成功する。
+    """
+    path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    for attempt in (1, 2):
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            handle = None                     # 誰かが持っている。下で調べる
+        except OSError as exc:
+            # 書けない場所にある。**起動は止めない** ── ロックのために
+            # ランチャーが使えなくなるほうが困る
+            log.warning("ロックを作れませんでした (%s): %s", path, exc)
+            return GuardResult(True, f"ロックを作れませんでした: {exc}")
+
+        if handle is not None:
+            info = build_lock_info()
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(asdict(info), ensure_ascii=False,
+                                        indent=2))
+            log.info("ロックを取りました: %s (pid=%s)", path, info.pid)
+            return GuardResult(True, "ロックを取りました")
+
+        # すでに誰かが持っている。中身を見て、生きているかを判断する
+        verdict = _inspect_existing()
+        if not verdict.should_start:
+            return verdict
+        if attempt == 1:
+            # 死んだロックを片付けた。もう一度だけ取りにいく
+            # (その隙に別のランチャーが取っていれば、次で断られる)
+            log.info("%s。取り直します", verdict.reason)
+            continue
+        return GuardResult(False,
+                           "ロックを取れませんでした。"
+                           "ほかのランチャーが起動したようです")
+    return GuardResult(False, "ロックを取れませんでした")
+
+
+# 書き込み途中のロックを読み切るまで待つ上限 (秒)。
+# 作ってから書くまではごく短いので、これで十分すぎる
+WRITE_SETTLE_SEC = 1.0
+
+
+def _inspect_existing() -> GuardResult:
+    """すでにあるロックの持ち主を調べる。片付けたなら should_start=True。"""
+    info = _read_lock_settled()
+    if info is None:
+        # ここまで待っても読めない。**本当に壊れている**ので捨ててよい
+        log.warning("壊れたロックを片付けます: %s", lock_path())
+        remove_lock()
+        return GuardResult(True, "壊れたロックを片付けました")
+
+    if info.pid == os.getpid():
+        return GuardResult(True, "自分自身のロックです")
+
+    import process_manager
+
+    if not process_manager._is_alive(info.pid):
+        remove_lock()
+        return GuardResult(True, f"残っていたロックを片付けました (pid={info.pid})")
+
+    command = process_manager.process_command_line(info.pid)
+    if command and _looks_like_launcher(command, info):
+        return GuardResult(False,
+                           f"すでに起動しています (pid={info.pid} / "
+                           f"{info.started_text})", info)
+
+    if not command:
+        # 中身を確かめられない。**起動を止めるほうに倒す** ── 本当に
+        # 動いているランチャーを2つにするより、起動しないほうがよい
+        return GuardResult(False,
+                           f"pid={info.pid} が何かを確かめられませんでした。"
+                           f"動いていなければ {lock_path()} を削除してください",
+                           info)
+
+    remove_lock()
+    return GuardResult(True, f"pid={info.pid} は別のプロセスでした")
+
+
+def _read_lock_settled() -> Optional[LockInfo]:
+    """ロックが書き終わるのを待ってから読む。
+
+    **作った直後は中身が空。** `O_CREAT|O_EXCL` で場所を押さえてから
+    書き込むので、そのあいだに読むと「壊れている」ように見える。
+    そこで片付けてしまうと、**押さえたはずのロックが消えて、
+    もう1つが起動できてしまう** (実際にそうなっていた)。
+
+    書き手はすぐ終わるので、少し待って読み直せば足りる。
+    """
+    deadline = time.monotonic() + WRITE_SETTLE_SEC
+    while True:
+        info = read_lock()
+        if info is not None:
+            return info
+        if not lock_path().exists():
+            return None                       # 持ち主が自分で片付けた
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.02)
+
+
 def check_existing() -> GuardResult:
-    """すでにランチャーが動いていないか (基盤仕様書 2.4)。"""
+    """すでにランチャーが動いていないか**調べるだけ** (診断用)。
+
+    起動の判断には使わない ── 調べてから書くまでの隙間に割り込まれる。
+    起動するときは `acquire()` を使うこと。
+    """
     info = read_lock()
     if info is None:
         return GuardResult(True, "ロックがありません")
