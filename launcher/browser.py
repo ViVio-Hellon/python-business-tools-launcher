@@ -201,10 +201,44 @@ def build_command(executable: str, url: str, profile: Path) -> list[str]:
     ]
 
 
+def find_existing_window(app_id: str) -> Optional[BrowserSession]:
+    """すでに開いているこのツールの画面を探す。無ければ `None`。
+
+    **記録を失っても2枚目を開かないため。** 画面のPIDは
+    `runtime/current.json` に書いてあるが、それが失われることがある
+    (ランチャー外で起動していた、生存監視が誤って記録を消した など)。
+    そのままボタンを押すと「画面が無い」と判断して**もう1枚開いてしまい、
+    2つの画面が同じ作業状態を奪い合う**。
+
+    専用プロファイルの道はそのツールの画面だけが持つので、これを印に
+    探し直せる。
+    """
+    import process_manager
+
+    profile = profile_dir(app_id)
+    pid = process_manager.find_process_by_marker(str(profile))
+    if not pid:
+        return None
+    log.info("すでに開いている画面を見つけました: %s (pid=%s)", app_id, pid)
+    return BrowserSession(app_id=app_id, url="", pid=pid, closable=True,
+                          profile_dir=str(profile))
+
+
 def open_window(app_id: str, url: str) -> BrowserSession:
-    """業務ツールの画面を開く。閉じられる形を優先する。"""
+    """業務ツールの画面を開く。閉じられる形を優先する。
+
+    **すでに開いていれば開き直さない。** 同じツールの画面が2枚あると、
+    どちらにも入力できてしまい、ツール側の作業状態 (プロセスに1つ) を
+    奪い合う。
+    """
     if not url:
         return BrowserSession(app_id=app_id)
+
+    if mode() != "default":
+        existing = find_existing_window(app_id)
+        if existing is not None:
+            existing.url = url
+            return existing
 
     if mode() == "default":
         return _open_default(app_id, url, reason="設定で既定ブラウザーを使う指定です")

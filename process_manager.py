@@ -597,6 +597,65 @@ def _is_alive_windows(pid: int) -> bool:
     return f'"{pid}"' in out.stdout
 
 
+def find_process_by_marker(marker: str) -> int:
+    """コマンドラインにその印を含む生きたプロセスを1つ探す。無ければ 0。
+
+    記録を失ったあとに、**すでに開いている画面を見つけ直す**ために使う。
+    印は専用プロファイルの道のように、そのプロセスだけが持つ長い文字列
+    でなければならない (短い印はどれにでも当たる)。
+    """
+    needle = _normalize_path(marker)
+    if not _is_specific_enough(needle):
+        return 0
+    for pid, command in _running_processes():
+        if needle in _normalize_path(command):
+            return pid
+    return 0
+
+
+def _running_processes():
+    """(PID, コマンドライン) を順に返す。取れなければ何も返さない。"""
+    if os.name == "nt":
+        yield from _running_processes_windows()
+        return
+    try:
+        entries = sorted(Path("/proc").iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue                          # 消えた / 見られない
+        if raw:
+            yield int(entry.name), raw.replace(b"\0", b" ").decode(
+                "utf-8", "replace").strip()
+
+
+def _running_processes_windows():
+    """Windows のプロセス一覧。**1回の呼び出しでまとめて取る。**
+
+    1つずつ問い合わせると、プロセスの数だけ外部コマンドを起こすことに
+    なる。探すのは画面を開く前の1回だけなので、まとめて取って絞る。
+    """
+    script = ("Get-CimInstance Win32_Process | "
+              "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, errors="replace",
+            timeout=COMMAND_TIMEOUT_SEC * 2, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("プロセス一覧を取れませんでした: %s", exc)
+        return
+    for line in out.stdout.splitlines():
+        pid, _, command = line.partition("\t")
+        if pid.strip().isdigit() and command.strip():
+            yield int(pid.strip()), command.strip()
+
+
 def process_command_line(pid: int) -> str:
     """そのPIDが何を実行しているか。**停止前の照合に使う**。
 

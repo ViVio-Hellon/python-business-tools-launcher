@@ -211,5 +211,169 @@ class ToolInstanceTests(LocalAreaTestCase):
         self.assertEqual(len(self.spawns), 1)
 
 
+class ScreenTests(LocalAreaTestCase):
+    """同じツールの画面を2枚にしない (要件定義書 §9)。
+
+    プロセスが1つでも、**画面が2枚あればどちらにも入力できる**。
+    業務ツールの作業状態はプロセスに1つしか無い(総合ツールの
+    `selection_session` など)ので、2枚あると奪い合う。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        tool_registry.initialize()
+        self.browser_log = self.work_root / "opened.txt"
+        os.environ["FAKE_BROWSER_LOG"] = str(self.browser_log)
+        self.addCleanup(os.environ.pop, "FAKE_BROWSER_LOG", None)
+
+        fake = Path(__file__).resolve().parent / "_fake_browser.py"
+        patcher = mock.patch.object(browser, "find_browser",
+                                    return_value=("fake", str(fake)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._cleanup)
+        self.managers: list = []
+
+    def _cleanup(self) -> None:
+        for manager in self.managers:
+            running = manager.current
+            if running is not None:
+                process_manager.stop(running, force=True, timeout=5)
+            manager._reap_process()
+        if runtime_state.read() is not None:
+            process_manager.stop(runtime_state.read(), force=True, timeout=5)
+        for pid in browser.managed_pids():
+            process_manager._terminate(pid, force=True)
+            browser.forget(pid)
+
+    @property
+    def opened(self) -> list:
+        if not self.browser_log.exists():
+            return []
+        return [line for line in
+                self.browser_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def make_manager(self) -> ToolManager:
+        manager = ToolManager()
+        self.managers.append(manager)
+        return manager
+
+    def register(self, app_id: str, name: str):
+        port = free_port()
+        root = make_tool_dir(self.work_root, app_id=app_id, port=port,
+                             display_name=name)
+        tool_registry.save(tool_registry.Tool(
+            app_id=app_id, display_name=name, port=port,
+            start_command=str(root / "start.bat"), start_args="--no-browser"))
+        return tool_registry.get(app_id)
+
+    def wait_opened(self, count: int, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while len(self.opened) < count and time.time() < deadline:
+            time.sleep(0.05)
+
+    def test_手がかりを失っても2枚目を開かない(self) -> None:
+        """**記録が消えても、すでに開いている画面を探し直す。**
+
+        記録は消えることがある(ランチャー外で起動していた、生存監視が
+        誤って消した)。そのままだと「画面が無い」と判断してもう1枚開き、
+        2つの画面が同じ作業状態を奪い合う。
+        """
+        tool = self.register("fake.screen", "日報")
+        first = self.make_manager()
+        first._select_blocking(tool, first._generation)
+        self.wait_opened(1)
+        first_window = first.current.browser_pid
+        self.assertTrue(process_manager._is_alive(first_window))
+
+        # ランチャーを開き直し、記録を失った状況
+        runtime_state.clear()
+        second = self.make_manager()
+        second.adopt_running()
+        self.assertEqual(second.current.browser_pid, 0,
+                         "この試験は手がかりが無い状態を前提にしています")
+
+        # 利用者がもう一度ボタンを押す
+        second._select_blocking(tool, second._generation)
+        time.sleep(0.5)
+
+        self.assertEqual(len(self.opened), 1,
+                         f"画面が {len(self.opened)} 枚開きました")
+        self.assertTrue(process_manager._is_alive(first_window),
+                        "元の画面が閉じられています")
+
+    def test_見つけた画面は閉じられる(self) -> None:
+        """探し直した画面の手がかりを取り戻し、切り替えで閉じられること。"""
+        tool = self.register("fake.recover", "日報")
+        first = self.make_manager()
+        first._select_blocking(tool, first._generation)
+        self.wait_opened(1)
+        first_window = first.current.browser_pid
+
+        runtime_state.clear()
+        second = self.make_manager()
+        second.adopt_running()
+        second._select_blocking(tool, second._generation)
+
+        # 手がかりを取り戻している
+        self.assertEqual(second.current.browser_pid, first_window)
+        self.assertTrue(second.current.browser_managed)
+        self.assertTrue(process_manager.is_browser_open(second.current))
+
+        # だから閉じられる
+        self.assertTrue(process_manager.close_browser(second.current))
+        self.assertFalse(process_manager._is_alive(first_window))
+
+    def test_本当に画面が無ければ開く(self) -> None:
+        """探し直しが、必要な画面まで開かなくするのでは困る。"""
+        tool = self.register("fake.reopen2", "日報")
+        manager = self.make_manager()
+        manager._select_blocking(tool, manager._generation)
+        self.wait_opened(1)
+
+        window = manager.current.browser_pid
+        process_manager._terminate(window, force=True)
+        process_manager._wait_pid_gone(window, 5)
+        manager.poll_health()
+
+        manager._select_blocking(tool, manager._generation)
+        self.wait_opened(2)
+
+        self.assertEqual(len(self.opened), 2, "画面を開き直せていません")
+        self.assertNotEqual(manager.current.browser_pid, window)
+
+
+class MarkerSearchTests(LocalAreaTestCase):
+    """印からプロセスを探す。"""
+
+    def test_短い印では探さない(self) -> None:
+        """短い印はどのプロセスにも当たる。**探さないほうが安全。**"""
+        for marker in ("", "/", "C:\\", "/opt"):
+            with self.subTest(marker):
+                self.assertEqual(
+                    process_manager.find_process_by_marker(marker), 0)
+
+    def test_自分自身を見つけられる(self) -> None:
+        import subprocess as sp
+
+        marker = str(self.work_root / "目印になる長いフォルダー名")
+        proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                         f"--user-data-dir={marker}"],
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(timeout=5)))
+        for _ in range(50):
+            if process_manager.process_command_line(proc.pid):
+                break
+            time.sleep(0.02)
+
+        self.assertEqual(process_manager.find_process_by_marker(marker),
+                         proc.pid)
+
+    def test_無ければ0(self) -> None:
+        self.assertEqual(
+            process_manager.find_process_by_marker(
+                str(self.work_root / "どこにも無い長いフォルダー名")), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
