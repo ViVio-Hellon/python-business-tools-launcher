@@ -40,6 +40,19 @@ DEFAULT_HEALTH_PATH = "/api/health"
 # 停止のやり方。詳しくは `process_manager` を参照
 STOP_METHODS = ("auto", "stop_bat", "shutdown_api", "pid")
 
+# 起動に使える入口。
+#
+#   .bat … `%*` で引数をそのまま渡す。出力も戻り値も取れる (推奨)
+#   .vbs … 利用者がふだん押す入口。**引数を転送するとは限らない**ので、
+#          中身を見て確かめる (`forwards_args`)
+ENTRY_SUFFIXES = (".bat", ".vbs")
+
+# ツール側にブラウザーを開かせないための指定
+NO_BROWSER_ARG = "--no-browser"
+
+# VBS が引数を転送しているかを見分ける印
+_VBS_ARGS_MARK = "wscript.arguments"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tools (
     app_id              TEXT PRIMARY KEY,
@@ -146,9 +159,48 @@ class Tool:
 
     @property
     def is_configured(self) -> bool:
-        """起動できる状態か。`start.bat` が設定され、実在すること。"""
+        """起動できる状態か。起動入口が設定され、実在すること。"""
         path = self.start_command.strip()
         return bool(path) and Path(path).is_file()
+
+    @property
+    def entry_kind(self) -> str:
+        """起動入口の種類。`bat` / `vbs` / 空文字。"""
+        path = self.start_command.strip().strip('"')
+        if not path:
+            return ""
+        suffix = Path(path).suffix.lower()
+        return suffix[1:] if suffix in ENTRY_SUFFIXES else ""
+
+    @property
+    def forwards_args(self) -> bool:
+        """起動入口が、渡した引数をツールへ届けるか。
+
+        `.bat` は `%*` で渡す作りが前提 (4ツールともそうなっている)。
+        `.vbs` は**転送するとは限らない** ── 実際、4ツールの `Start.vbs`
+        は `pythonw "<script>"` を決め打ちで実行しており、引数を渡す
+        処理が無い。中身に `WScript.Arguments` があるかで見分ける。
+
+        届かないまま `--no-browser` を設定していると、ツールは自分で
+        ブラウザーを開く。そこへランチャーも画面を開くと**2枚**になる。
+        """
+        kind = self.entry_kind
+        if kind == "bat":
+            return True
+        if kind != "vbs":
+            return False
+        return _vbs_forwards_args(self.start_command.strip().strip('"'))
+
+    @property
+    def suppresses_browser(self) -> bool:
+        """ツール側にブラウザーを開かせない指定が、実際に効くか。
+
+        効かないなら、**ランチャーは自分の画面を開かない** ── ツールが
+        自分で開くので、両方開けば2枚になる。
+        """
+        if NO_BROWSER_ARG not in self.start_args:
+            return False
+        return self.forwards_args
 
 
 # ------------------------------------------------------------------
@@ -171,13 +223,32 @@ def validate_start_command(path: str) -> str:
         # ランチャーは共有フォルダーやショートカットから起動されるので、
         # 相対パスを許すと端末ごとに違う場所を指す
         return "絶対パスで指定してください (例: C:\\業務ツール\\日報\\start.bat)"
-    if candidate.suffix.lower() != ".bat":
-        return "拡張子が .bat のファイルを指定してください"
+    if candidate.suffix.lower() not in ENTRY_SUFFIXES:
+        return "拡張子が .bat または .vbs のファイルを指定してください"
     if not candidate.exists():
         return f"ファイルが見つかりません: {candidate}"
     if not candidate.is_file():
         return f"ファイルではありません: {candidate}"
     return ""
+
+
+def _vbs_forwards_args(path: str) -> bool:
+    """その VBS が `WScript.Arguments` を使っているか。
+
+    読めなければ「転送しない」に倒す。**届くと思い込んで2枚開くより、
+    届かない前提で1枚に寄せるほうが害が小さい。**
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return False
+    for encoding in ("cp932", "utf-8"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return _VBS_ARGS_MARK in text.lower()
+    return _VBS_ARGS_MARK in raw.decode("utf-8", "replace").lower()
 
 
 def validate_port(port: int) -> str:

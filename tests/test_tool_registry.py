@@ -291,3 +291,74 @@ class BackupTests(LocalAreaTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EntryKindTests(LocalAreaTestCase):
+    """起動ファイルは .bat と .vbs のどちらでもよい。
+
+    `.vbs` は**引数を転送するとは限らない**。4ツールの `Start.vbs` は
+    `pythonw "<script>"` を決め打ちで実行しており、転送する処理が無い。
+    届かないまま `--no-browser` を設定していると、ツールが自分で
+    ブラウザーを開き、ランチャーも開いて**画面が2枚**になる。
+    """
+
+    def make(self, name: str, body: str = "", *, args: str = "--no-browser"):
+        path = self.work_root / name
+        path.write_text(body, encoding="cp932")
+        return Tool(app_id="x", display_name="日報",
+                    start_command=str(path), start_args=args)
+
+    def test_batもvbsも登録できる(self) -> None:
+        for name in ("start.bat", "Start.vbs"):
+            with self.subTest(name):
+                path = self.work_root / name
+                path.write_text("", encoding="cp932")
+                self.assertEqual(
+                    tool_registry.validate_start_command(str(path)), "")
+
+    def test_それ以外は弾く(self) -> None:
+        path = self.work_root / "start.exe"
+        path.write_text("", encoding="cp932")
+        problem = tool_registry.validate_start_command(str(path))
+        self.assertIn(".bat", problem)
+        self.assertIn(".vbs", problem)
+
+    def test_batは引数を転送する扱い(self) -> None:
+        tool = self.make("start.bat", "@echo off\npython start_app.py %*\n")
+        self.assertEqual(tool.entry_kind, "bat")
+        self.assertTrue(tool.forwards_args)
+        self.assertTrue(tool.suppresses_browser)
+
+    def test_転送しないvbsを見分ける(self) -> None:
+        """4ツールの Start.vbs と同じ形。"""
+        tool = self.make("Start.vbs",
+                         'cmd = "pythonw " & Chr(34) & script & Chr(34)\n'
+                         'shell.Run cmd, 0, False\n')
+        self.assertEqual(tool.entry_kind, "vbs")
+        self.assertFalse(tool.forwards_args)
+        # **ランチャーは画面を開かない** (ツールが自分で開くため)
+        self.assertFalse(tool.suppresses_browser)
+
+    def test_転送するvbsなら届く(self) -> None:
+        tool = self.make("Start.vbs",
+                         'For i = 0 To WScript.Arguments.Count - 1\n'
+                         '    args = args & " " & WScript.Arguments(i)\n'
+                         'Next\n')
+        self.assertTrue(tool.forwards_args)
+        self.assertTrue(tool.suppresses_browser)
+
+    def test_引数が無ければツールが画面を開く(self) -> None:
+        tool = self.make("start.bat", "@echo off\n", args="")
+        self.assertTrue(tool.forwards_args)
+        self.assertFalse(tool.suppresses_browser,
+                         "--no-browser が無いのにランチャーも画面を開きます")
+
+    def test_読めないvbsは転送しない扱い(self) -> None:
+        """**届くと思い込んで2枚開くより、届かない前提で1枚に寄せる。**"""
+        tool = Tool(app_id="x", display_name="日報",
+                    start_command=str(self.work_root / "無い.vbs"),
+                    start_args="--no-browser")
+        self.assertFalse(tool.forwards_args)
+
+    def test_未設定なら種類は空(self) -> None:
+        self.assertEqual(Tool(app_id="x", display_name="日報").entry_kind, "")

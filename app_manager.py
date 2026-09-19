@@ -481,14 +481,23 @@ class ToolManager:
         log.info("起動完了: %s (版 %s)", running.summary(),
                  payload.get("version") or "不明")
 
-        # **ここで初めて画面を開く** (要件定義書 §7.1 / §20)
-        self._open_browser(running, running.url or tool.home_url)
+        # **ここで初めて画面を開く** (要件定義書 §7.1 / §20)。
+        #
+        # ただし `--no-browser` が届いていないときは開かない ──
+        # ツールが自分でブラウザーを開いているので、ここでも開けば
+        # **同じツールの画面が2枚**になり、作業状態を奪い合う
+        if tool.suppresses_browser:
+            self._open_browser(running, running.url or tool.home_url)
+        else:
+            log.info("画面はツール側が開きます: %s", tool.display_name)
         # 画面のPIDまで入った状態で記録する。`stop.bat` は別プロセス
         # なので、書いておかないとそちらから画面を閉じられない
         runtime_state.write(running)
 
         detail = ""
-        if not running.browser_managed:
+        if not tool.suppresses_browser:
+            detail = _tool_opens_browser_note(tool)
+        elif not running.browser_managed:
             detail = ("画面は既定のブラウザーで開きました。\n"
                       "切り替えのときに自動では閉じないので、"
                       "不要になったタブは手で閉じてください。")
@@ -497,16 +506,23 @@ class ToolManager:
                   responding=True)
 
     def _spawn(self, tool: Tool) -> Optional[subprocess.Popen]:
-        """`start.bat` を実行する (要件定義書 §12.2)。
+        """起動入口を実行する (要件定義書 §12.2)。
 
-        ランチャーはツールの起動方法を知らない。BATを呼ぶだけにして、
+        ランチャーはツールの起動方法を知らない。入口を呼ぶだけにして、
         Pythonの起こし方は各リポジトリ側に残す。
         """
-        command = [tool.start_command] + tool.start_args.split()
+        command = _entry_command(tool)
         out_path = (app_config.local_dir("logs")
                     / f"tool_{_safe_name(tool.app_id)}.out.log")
         log.info("起動開始: %s — %s (cwd=%s)",
                  tool.display_name, " ".join(command), tool.resolved_work_dir)
+        if tool.start_args.strip() and not tool.forwards_args:
+            # **届かない引数を、届いたつもりで扱わない。**
+            # `.vbs` は引数を転送するとは限らない (4ツールの Start.vbs は
+            # 転送しない)。気づかないと「--no-browser を付けたのに
+            # タブが開く」の原因が分からなくなる
+            log.warning("起動引数は届きません (%s は引数を転送しません): %s",
+                        Path(tool.start_command).name, tool.start_args)
 
         # 大きくなっていれば退ける。**日付で分かれないので、開いたまま
         # 長く使う端末では際限なく育つ**
@@ -734,6 +750,33 @@ def _running_from_health(tool: Tool, payload: Optional[dict],
         stop_command=tool.stop_command,
         stop_method=tool.stop_method,
     )
+
+
+def _entry_command(tool: Tool) -> list[str]:
+    """起動入口を実行するためのコマンド。
+
+    `.vbs` は `wscript.exe` 経由で呼ぶ。`Popen` が使う `CreateProcess` は
+    **ファイルの関連付けを解決しない**ので、`.vbs` を直接渡しても動かない
+    (エクスプローラのダブルクリックとは仕組みが違う)。
+    """
+    path = tool.start_command.strip().strip('"')
+    args = tool.start_args.split()
+    if tool.entry_kind == "vbs":
+        return ["wscript.exe", path] + args
+    return [path] + args
+
+
+def _tool_opens_browser_note(tool: Tool) -> str:
+    """ツール側が画面を開く場合の案内。"""
+    lines = [f"{tool.display_name}の画面はツール側が開きます"
+             "（ふだんのブラウザーに出ます）。"]
+    if tool.start_args.strip() and not tool.forwards_args:
+        lines.append(f"起動引数「{tool.start_args}」は "
+                     f"{Path(tool.start_command).name} が転送しないため"
+                     "届いていません。")
+    lines.append("切り替えのときランチャーからは閉じられないので、"
+                 "不要になった画面は手で閉じてください。")
+    return "\n".join(lines)
 
 
 def _safe_name(app_id: str) -> str:

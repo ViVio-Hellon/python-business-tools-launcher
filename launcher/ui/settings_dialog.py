@@ -1,7 +1,8 @@
 """ランチャー設定画面 (要件定義書 §13 / §14)
 
-**必須要件**。端末ごとにリポジトリの置き場所が違うので、`start.bat` の
-場所をここで変えられるようにする。コードを書き換えずに済ませることが
+**必須要件**。端末ごとにリポジトリの置き場所が違うので、起動ファイルの
+場所をここで変えられるようにする。`start.bat` と `Start.vbs` のどちらも
+指定できる。コードを書き換えずに済ませることが
 目的 (要件定義書 §13.3)。
 
     ┌──────────────────────────────────────────────┐
@@ -9,6 +10,7 @@
     ├──────────────────────────────────────────────┤
     │ 日報                                          │
     │ [ C:\\業務ツール\\日報\\start.bat     ] [参照] │
+    │   (Start.vbs も指定できます)                  │
     │ ポート [8733] 起動引数 [--no-browser]         │
     │                                              │
     │                    [保存] [キャンセル]        │
@@ -57,7 +59,8 @@ class SettingsDialog:
     # --------------------------------------------------------------
     def _build(self) -> None:
         header = tk.Label(
-            self.top, text="各ツールの start.bat の場所を指定してください",
+            self.top, text="各ツールの起動ファイル (start.bat / Start.vbs) "
+                            "の場所を指定してください",
             bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD, anchor="w")
         header.pack(fill="x", padx=16, pady=(14, 2))
         tk.Label(self.top,
@@ -111,12 +114,12 @@ class SettingsDialog:
                   bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
                   padx=14, pady=5, font=theme.FONT_SMALL,
                   cursor="hand2").pack(side="left")
-        tk.Label(frame, text="start.bat を選ぶと、アプリIDと表示名を読み取ります",
+        tk.Label(frame, text="起動ファイルを選ぶと、アプリIDと表示名を読み取ります",
                  bg=theme.BG, fg=theme.MUTED,
                  font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
 
     def add_tool(self) -> None:
-        """`start.bat` を選んでもらい、その素性から新しい行を作る。
+        """起動ファイルを選んでもらい、その素性から新しい行を作る。
 
         **アプリIDは手で写させない。** 相手の `config/app.json` から
         読み取る ── 1文字違うだけで起動確認が永久に通らず、画面には
@@ -124,8 +127,11 @@ class SettingsDialog:
         読めなければ空のまま出すので、手で入れてもらう。
         """
         chosen = filedialog.askopenfilename(
-            title="追加するツールの start.bat を選んでください",
-            filetypes=[("バッチファイル", "*.bat"), ("すべてのファイル", "*.*")],
+            title="追加するツールの起動ファイルを選んでください",
+            filetypes=[("起動ファイル", "*.bat *.vbs"),
+                       ("バッチファイル", "*.bat"),
+                       ("VBScript", "*.vbs"),
+                       ("すべてのファイル", "*.*")],
             parent=self.top)
         if not chosen:
             return
@@ -253,6 +259,14 @@ class SettingsDialog:
                                  "\n".join(problems), parent=self.top)
             return
 
+        warnings = [_delivery_warning(tool) for tool in updated]
+        warnings = [text for text in warnings if text]
+        if warnings and not messagebox.askyesno(
+                "設定",
+                "\n\n".join(warnings) + "\n\nこのまま保存しますか?",
+                parent=self.top):
+            return
+
         if removed and not messagebox.askyesno(
                 "設定", f"{len(removed)}件のツールの登録を消します。よろしいですか?\n"
                         "(ツール本体は消えません。登録だけです)",
@@ -319,7 +333,7 @@ class _ToolRow:
                        font=theme.FONT_SMALL, bd=0,
                        highlightthickness=0).pack(side="right", padx=(0, 10))
 
-        # --- start.bat のパス (要件定義書 §13.1) ---
+        # --- 起動ファイルのパス (要件定義書 §13.1) ---
         path_row = tk.Frame(box, bg=theme.BG)
         path_row.pack(fill="x", pady=(4, 0))
         self.path_var = tk.StringVar(value=tool.start_command)
@@ -353,9 +367,12 @@ class _ToolRow:
         current = self.path_var.get().strip()
         initial = str(Path(current).parent) if current else ""
         chosen = filedialog.askopenfilename(
-            title=f"{self.tool.display_name} の start.bat を選んでください",
+            title=f"{self.tool.display_name} の起動ファイルを選んでください",
             initialdir=initial or None,
-            filetypes=[("バッチファイル", "*.bat"), ("すべてのファイル", "*.*")])
+            filetypes=[("起動ファイル", "*.bat *.vbs"),
+                       ("バッチファイル", "*.bat"),
+                       ("VBScript", "*.vbs"),
+                       ("すべてのファイル", "*.*")])
         if chosen:
             self.path_var.set(chosen)
 
@@ -402,6 +419,22 @@ class _ToolRow:
                        port=port,
                        stop_method=self.stop_var.get().strip() or "auto",
                        enabled=bool(self.enabled_var.get())), ""
+
+
+def _delivery_warning(tool: Tool) -> str:
+    """起動引数が届かない組み合わせを知らせる文。問題なければ空文字。
+
+    `.vbs` は引数を転送するとは限らない (4ツールの `Start.vbs` は
+    転送しない)。黙って保存すると「`--no-browser` を付けたのにタブが
+    開く」ことになり、原因にたどり着きにくい。
+    """
+    if not tool.start_args.strip() or tool.forwards_args:
+        return ""
+    name = Path(tool.start_command).name
+    return (f"{tool.display_name}: 起動引数「{tool.start_args}」は "
+            f"{name} が転送しないため届きません。\n"
+            "  画面はツール側がふだんのブラウザーに開き、"
+            "切り替えのときランチャーからは閉じられません。")
 
 
 def _label(parent: tk.Widget, text: str) -> None:
