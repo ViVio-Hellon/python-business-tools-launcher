@@ -65,6 +65,10 @@ class LauncherBar:
         # 塗り直しは状態が届くたびに走るので、そのつど設定DBを
         # 読みに行かせない
         self._configured: dict[str, bool] = {}
+        # 表示名。あふれたぶんを［▼］のメニューへ出すときに要る
+        self._names: dict[str, str] = {}
+        # 並び順。あふれ判定は番号で行うので、対応を持っておく
+        self._order: list[str] = []
         self._last_detail = ""
         self._current_app_id = ""
         self._save_handle = None
@@ -102,6 +106,19 @@ class LauncherBar:
         # --- ツールのボタン (要件定義書 §6) ---
         self.tool_frame = tk.Frame(frame, bg=theme.BG)
         self.tool_frame.pack(side="left")
+        # 入りきらないツールの受け皿。バーは折り返さないので、
+        # あふれたぶんはここへ入れる (数が増えても細いままにする)
+        self.overflow_button = tk.Button(
+            self.tool_frame, text="▼", command=self.show_overflow,
+            bg=theme.BUTTON_BG, fg=theme.FG,
+            activebackground=theme.BUTTON_ACTIVE, activeforeground=theme.FG,
+            relief="flat", bd=0, padx=10, pady=6, font=theme.FONT,
+            cursor="hand2")
+        self.overflow_menu = tk.Menu(self.root, tearoff=0,
+                                     bg=theme.BUTTON_BG, fg=theme.FG,
+                                     activebackground=theme.BUTTON_ACTIVE,
+                                     activeforeground=theme.FG, bd=0)
+        self._hidden: list[str] = []
         self._build_tool_buttons()
 
         # --- 右側の操作 ---
@@ -147,9 +164,14 @@ class LauncherBar:
         設定画面で並びや表示名が変わったあとにも呼ぶ。
         """
         for child in self.tool_frame.winfo_children():
-            child.destroy()
+            if child is not self.overflow_button:
+                child.destroy()
         self.buttons.clear()
         self._configured.clear()
+        self._names.clear()
+        self._order.clear()
+        self._hidden.clear()
+        self.overflow_button.pack_forget()
 
         tools = tool_registry.all_tools()
         if not tools:
@@ -167,11 +189,87 @@ class LauncherBar:
                 cursor="hand2")
             button.pack(side="left", padx=(0, 4))
             self.buttons[tool.app_id] = button
+            self._names[tool.app_id] = tool.display_name
+            self._order.append(tool.app_id)
             self._configured[tool.app_id] = tool.is_configured
             if not tool.is_configured:
                 # 押しても起動しないことを、押す前に見せる
                 button.configure(bg=theme.BUTTON_UNSET)
+        self._apply_overflow()
         self._paint_buttons(self._current_app_id)
+
+    # --------------------------------------------------------------
+    # 入りきらないツール
+    # --------------------------------------------------------------
+    def _apply_overflow(self) -> None:
+        """入りきらないツールを［▼］へ回す。
+
+        バーは折り返さず、窓も広がらない。**黙って切れると、押せない
+        ツールがあることに気づけない。**
+        """
+        if not self._order:
+            return
+
+        # いったん全部出して、それぞれの幅を測る
+        for app_id in self._order:
+            self.buttons[app_id].pack(side="left", padx=(0, 4))
+        self.overflow_button.pack_forget()
+        self.root.update_idletasks()
+
+        budget = self._tool_budget()
+        widths = [self.buttons[app_id].winfo_reqwidth() + 4
+                  for app_id in self._order]
+        must_show = (self._order.index(self._current_app_id)
+                     if self._current_app_id in self._order else None)
+        visible, hidden = geometry.fit_buttons(
+            widths, budget=budget,
+            overflow_width=self.overflow_button.winfo_reqwidth() + 4,
+            must_show=must_show)
+
+        self._hidden = [self._order[index] for index in hidden]
+        for index, app_id in enumerate(self._order):
+            if index in visible:
+                self.buttons[app_id].pack(side="left", padx=(0, 4))
+            else:
+                self.buttons[app_id].pack_forget()
+        if self._hidden:
+            self.overflow_button.pack(side="left", padx=(0, 4))
+            log.info("%d 個のツールを［▼］へ回しました: %s",
+                     len(self._hidden),
+                     "、".join(self._names[a] for a in self._hidden))
+
+    def _tool_budget(self) -> int:
+        """ツールのボタンに使える幅。
+
+        窓全体の上限から、ツール以外(状態表示と右側の操作)が使うぶんを
+        引いた残り。
+        """
+        total = self.root.winfo_reqwidth()
+        tools = self.tool_frame.winfo_reqwidth()
+        limit = geometry.max_width(self.root.winfo_screenwidth())
+        return max(0, limit - max(0, total - tools))
+
+    def show_overflow(self) -> None:
+        """［▼］のメニューを出す。"""
+        if not self._hidden:
+            return
+        self.overflow_menu.delete(0, "end")
+        for app_id in self._hidden:
+            label = self._names.get(app_id, app_id)
+            if app_id == self._current_app_id:
+                label = f"● {label}"
+            elif not self._configured.get(app_id):
+                label = f"{label}（未設定）"
+            self.overflow_menu.add_command(
+                label=label,
+                command=lambda target=app_id: self.on_select(target))
+        try:
+            self.overflow_menu.tk_popup(
+                self.overflow_button.winfo_rootx(),
+                self.overflow_button.winfo_rooty()
+                + self.overflow_button.winfo_height())
+        finally:
+            self.overflow_menu.grab_release()
 
     def _small_button(self, parent: tk.Widget, text: str, command) -> tk.Button:
         return tk.Button(parent, text=text, command=command,
@@ -494,6 +592,10 @@ class LauncherBar:
 
     def _paint_buttons(self, current_app_id: str) -> None:
         """いま使っているツールのボタンを目立たせる (要件定義書 §5.2)。"""
+        if current_app_id and current_app_id in self._hidden:
+            # 使っているツールが［▼］の中に隠れている。**どれが動いて
+            # いるか見えなくなる**ので、出し直す
+            self._apply_overflow()
         for app_id, button in self.buttons.items():
             if app_id == current_app_id:
                 button.configure(bg=theme.BUTTON_CURRENT)

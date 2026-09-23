@@ -39,6 +39,54 @@ class Placement(NamedTuple):
         return f"{self.width}x{self.height}+{self.x}+{self.y}"
 
 
+def max_width(screen_width: int) -> int:
+    """バーが取れる幅の上限。"""
+    return max(MIN_WIDTH, screen_width - SCREEN_MARGIN)
+
+
+def fit_buttons(widths: list[int], *, budget: int, overflow_width: int,
+                must_show: Optional[int] = None) -> tuple[list[int], list[int]]:
+    """ツールのボタンを「出すぶん」と「あふれたぶん」に分ける。
+
+    バーは折り返さないし、窓も広がらない (`resizable(False, False)`)。
+    入りきらないボタンは**黙って切れて押せなくなる**ので、あふれたものは
+    ［▼］のメニューへ回す。
+
+    `must_show` は、必ず出しておきたいボタンの番号 (いま使っているツール)。
+    **使っているツールが隠れると、どれが動いているのか見えなくなる。**
+
+    戻り値はどちらも**元の並び順**の番号。並びは設定の `order_no` に
+    従うので、ここで入れ替えない。
+    """
+    if not widths:
+        return [], []
+    if sum(widths) <= budget:
+        return list(range(len(widths))), []
+
+    # あふれる。［▼］のぶんを取り置いてから詰める
+    room = budget - overflow_width
+    visible: list[int] = []
+    used = 0
+    for index, width in enumerate(widths):
+        if used + width > room:
+            break
+        visible.append(index)
+        used += width
+
+    if must_show is not None and 0 <= must_show < len(widths) \
+            and must_show not in visible:
+        # 使っているツールを入れるため、後ろから譲る
+        needed = widths[must_show]
+        while visible and used + needed > room:
+            used -= widths[visible.pop()]
+        if used + needed <= room:
+            visible.append(must_show)
+            visible.sort()
+
+    hidden = [index for index in range(len(widths)) if index not in visible]
+    return visible, hidden
+
+
 def anchor_position(anchor: str, *, width: int, height: int,
                     screen_width: int, screen_height: int,
                     bottom_margin: int, edge_margin: int) -> tuple[int, int]:
