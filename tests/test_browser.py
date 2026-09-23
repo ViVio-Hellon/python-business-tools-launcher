@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -131,16 +132,42 @@ class RealBrowserTests(LocalAreaTestCase):
     # 開いたことを認めるまで待つ上限 (秒)。Chromium は起動に少しかかる
     LAUNCH_WAIT_SEC = 15.0
 
+    # 止めたあと、子プロセスがいなくなるまで待つ上限 (秒)
+    GONE_WAIT_SEC = 10.0
+
     def setUp(self) -> None:
         super().setUp()
         self.procs: list[subprocess.Popen] = []
-        self.addCleanup(self._cleanup)
 
-    def _cleanup(self) -> None:
+    def tearDown(self) -> None:
+        # **ブラウザーを止めてから**一時フォルダーを消す。逆にすると、
+        # 動いている Chromium がプロファイルへ書き続けていて消し切れない
+        # (「Directory not empty」)。`addCleanup` は `tearDown` のあとに
+        # 回るので、ここで先に止める
+        self._stop_browsers()
+        super().tearDown()
+
+    def _stop_browsers(self) -> None:
         for proc in self.procs:
             if proc.poll() is None:
-                proc.kill()
+                # 描画などの子プロセスまでまとめて止める。親だけ止めると、
+                # 子がしばらくプロファイルへ書き続ける
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (AttributeError, OSError):
+                    proc.kill()
             proc.wait(timeout=10)
+            if proc.stdout is not None:
+                proc.stdout.close()
+        self.procs.clear()
+
+        marker = str(self.local_root)
+        deadline = time.monotonic() + self.GONE_WAIT_SEC
+        while time.monotonic() < deadline:
+            if not any(marker in command
+                       for _, command in process_manager._running_processes()):
+                return
+            time.sleep(0.1)
 
     def _launch(self, app_id: str, url: str) -> RunningTool:
         """本物のブラウザーを1つ開く。**開くまで待つ。**"""
@@ -154,8 +181,10 @@ class RealBrowserTests(LocalAreaTestCase):
             # 現場では利用者の権限で動くので砂箱はそのまま使う
             command.append("--no-sandbox")
 
+        # 自分の組 (プロセスグループ) で動かす。止めるとき子まで届くように
         proc = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
+                                stderr=subprocess.STDOUT,
+                                start_new_session=True)
         self.procs.append(proc)
         running = RunningTool(app_id=app_id, display_name="日報",
                               browser_pid=proc.pid, browser_profile=str(profile))
