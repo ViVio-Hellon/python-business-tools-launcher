@@ -11,12 +11,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from launcher import app_config  # noqa: E402
+from launcher import app_config, distribution  # noqa: E402
+
+# 本来の置き場所 (ランチャーのフォルダーの `config/`)。フォルダーごと
+# 運ぶ試験ではこちらに戻す
+REAL_DISTRIBUTION_PATH = distribution.path
 
 
 class LocalAreaTestCase(unittest.TestCase):
@@ -32,6 +37,15 @@ class LocalAreaTestCase(unittest.TestCase):
         self._orig = os.environ.get(app_config.LOCAL_DIR_ENV)
         os.environ[app_config.LOCAL_DIR_ENV] = str(self.local_root)
         app_config.ensure_local_dirs()
+
+        # 配布設定も一時フォルダーへ。開発機で書き出した配布設定
+        # (`config/distribution.json`) が試験に混ざらないように
+        self.distribution_path = (Path(self._tmp.name) / "app" / "config"
+                                  / distribution.FILE_NAME)
+        patcher = mock.patch.object(distribution, "path",
+                                    lambda: self.distribution_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         if self._orig is None:

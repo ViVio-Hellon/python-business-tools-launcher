@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # 画面が無くても動かなければならないもの
 HEADLESS_MODULES = ("process_manager", "launch_guard", "app_manager",
                     "launcher.tool_registry", "launcher.health",
-                    "launcher.app_config", "launcher.runtime_state")
+                    "launcher.app_config", "launcher.runtime_state",
+                    "launcher.distribution", "launcher.admin_lock")
 
 
 class HeadlessImportTests(unittest.TestCase):

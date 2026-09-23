@@ -20,7 +20,7 @@ from typing import Optional
 
 from .. import app_config, tool_registry
 from ..logging_utils import get_logger
-from . import geometry, theme
+from . import geometry, password, theme
 from .geometry import POSITION_KEY
 from .settings_dialog import SettingsDialog
 from .version_dialog import VersionDialog
@@ -472,7 +472,13 @@ class LauncherBar:
         VersionDialog(self.root)
 
     def open_settings(self) -> None:
-        """設定画面 (要件定義書 §13)。"""
+        """設定画面 (要件定義書 §13)。
+
+        **管理者パスワードを確かめてから開く。** ライン作業者が起動
+        ファイルをうっかり変えてしまうのを防ぐ。
+        """
+        if not password.unlock(self.root):
+            return
         dialog = SettingsDialog(self.root)
         if dialog.saved:
             self._build_tool_buttons()

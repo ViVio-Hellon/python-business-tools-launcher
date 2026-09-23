@@ -12,3 +12,7 @@ logs/
 *.db
 *.db-wal
 *.db-shm
+
+# 現場の配布設定 (管理者パスワードの指紋を含む)。製品のリポジトリには入れない
+config/distribution.json
+config/distribution.json.tmp

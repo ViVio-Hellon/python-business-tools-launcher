@@ -13,6 +13,7 @@
     │   (Start.vbs も指定できます)                  │
     │ ポート [8733] 起動引数 [--no-browser]         │
     │                                              │
+    │ 配布設定  [書き出す] [パスワードを変える]     │
     │                    [保存] [キャンセル]        │
     └──────────────────────────────────────────────┘
 """
@@ -23,10 +24,10 @@ from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .. import app_config, tool_registry
+from .. import app_config, distribution, tool_registry
 from ..logging_utils import get_logger
 from ..tool_registry import STOP_METHODS, Tool
-from . import theme
+from . import password, theme
 
 log = get_logger("ui.settings")
 
@@ -76,6 +77,7 @@ class SettingsDialog:
         self._build_add_button()
         self._build_pc_mode()
         self._build_bar_position()
+        self._build_distribution()
         self._build_buttons()
 
     def _scrollable_body(self) -> tk.Frame:
@@ -205,6 +207,91 @@ class SettingsDialog:
                        font=theme.FONT_SMALL, bd=0,
                        highlightthickness=0).pack(side="left", padx=(10, 0))
 
+    def _build_distribution(self) -> None:
+        """配布設定 (`config/distribution.json`)。
+
+        1台を整えてから書き出し、ランチャーのフォルダーごと配る。配った
+        先では次の起動で読み込まれる。**手で JSON を書かせない**ための入口。
+        """
+        frame = tk.Frame(self.top, bg=theme.BG)
+        frame.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(frame, text="配布設定", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD).pack(side="left")
+        tk.Label(frame, text=_distribution_state(), bg=theme.BG,
+                 fg=theme.MUTED, font=theme.FONT_SMALL,
+                 anchor="w").pack(side="left", padx=(10, 0))
+
+        actions = tk.Frame(self.top, bg=theme.BG)
+        actions.pack(fill="x", padx=16, pady=(4, 0))
+        tk.Button(actions, text="この端末の設定を配布設定として書き出す",
+                  command=self.export_distribution,
+                  bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
+                  padx=14, pady=5, font=theme.FONT_SMALL,
+                  cursor="hand2").pack(side="left")
+        tk.Button(actions, text="管理者パスワードを変える",
+                  command=self.change_password,
+                  bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
+                  padx=14, pady=5, font=theme.FONT_SMALL,
+                  cursor="hand2").pack(side="left", padx=(8, 0))
+
+        # 配った先でもツールがランチャーと同じ並びに置かれるなら、相対
+        # パスにしておくとドライブ名やフォルダー名が違っても動く
+        self.relative_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.top,
+                       text="起動ファイルはランチャーのフォルダーからの相対パスで"
+                            "書く (配る先でも同じ並びに置く場合)",
+                       variable=self.relative_var,
+                       bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
+                       activebackground=theme.BG, activeforeground=theme.FG,
+                       font=theme.FONT_SMALL, bd=0, highlightthickness=0,
+                       anchor="w").pack(fill="x", padx=16, pady=(4, 0))
+
+    def export_distribution(self) -> None:
+        """いまの画面を保存してから、配布設定として書き出す。
+
+        **画面の内容と書き出す内容をずらさない。** 保存していない変更が
+        あるまま書き出すと、「直したのに配った先に届かない」になる。
+        """
+        if not messagebox.askyesno(
+                "配布設定",
+                "いまの画面の内容を保存してから、配布設定として書き出します。\n\n"
+                f"書き出し先: {distribution.path()}\n\n"
+                "配った先では、次の起動でこの内容に置き換わります\n"
+                "(その端末で直した値より、配布設定が優先されます)。\n\n"
+                "よろしいですか?", parent=self.top):
+            return
+        if not self._commit():
+            return
+        self.saved = True
+        try:
+            target = tool_registry.export_distribution(
+                relative=bool(self.relative_var.get()))
+        except (OSError, ValueError) as exc:
+            log.warning("配布設定を書き出せません: %s", exc)
+            messagebox.showerror(
+                "配布設定",
+                f"設定は保存しましたが、配布設定を書き出せませんでした。\n{exc}\n\n"
+                "ランチャーのフォルダーに書き込めるか確かめてください。",
+                parent=self.top)
+            self.top.destroy()
+            return
+
+        message = (f"書き出しました。\n{target}\n\n"
+                   "ランチャーのフォルダーごと配ってください。\n"
+                   "配った先では、次の起動で読み込まれます。")
+        fixed = distribution.absolute_entries()
+        if self.relative_var.get() and fixed:
+            message += ("\n\n次のツールは別のドライブにあるため、"
+                        "場所をそのまま書きました。\n配る先でも同じ場所に"
+                        "置いてください:\n  " + "\n  ".join(fixed))
+        if not distribution.has_password():
+            message += "\n\n管理者パスワードが入っていません。"
+        messagebox.showinfo("配布設定", message, parent=self.top)
+        self.top.destroy()
+
+    def change_password(self) -> None:
+        password.change(self.top)
+
     def _build_buttons(self) -> None:
         frame = tk.Frame(self.top, bg=theme.BG)
         frame.pack(fill="x", padx=16, pady=14)
@@ -227,7 +314,12 @@ class SettingsDialog:
 
     # --------------------------------------------------------------
     def save(self) -> None:
-        """保存時チェック (要件定義書 §13.2)。
+        if self._commit():
+            self.saved = True
+            self.top.destroy()
+
+    def _commit(self) -> bool:
+        """保存時チェック (要件定義書 §13.2)。保存できたら真。
 
         **1つでも駄目なら何も保存しない。** 半分だけ書き換わった状態は、
         あとから見て何が起きたのか分からなくなる。
@@ -257,7 +349,7 @@ class SettingsDialog:
         if problems:
             messagebox.showerror("設定を保存できません",
                                  "\n".join(problems), parent=self.top)
-            return
+            return False
 
         warnings = [_delivery_warning(tool) for tool in updated]
         warnings = [text for text in warnings if text]
@@ -265,13 +357,13 @@ class SettingsDialog:
                 "設定",
                 "\n\n".join(warnings) + "\n\nこのまま保存しますか?",
                 parent=self.top):
-            return
+            return False
 
         if removed and not messagebox.askyesno(
                 "設定", f"{len(removed)}件のツールの登録を消します。よろしいですか?\n"
                         "(ツール本体は消えません。登録だけです)",
                 parent=self.top):
-            return
+            return False
 
         # 書き換える前に控えを取る。4つ分のパスを入れ直すのは手間なので
         tool_registry.backup()
@@ -282,8 +374,7 @@ class SettingsDialog:
         if self.reset_position.get():
             tool_registry.clear_pc_setting(self._position_key)
         log.info("設定を保存しました (%d件 / 削除 %d件)", len(updated), len(removed))
-        self.saved = True
-        self.top.destroy()
+        return True
 
     def cancel(self) -> None:
         self.top.destroy()
@@ -419,6 +510,21 @@ class _ToolRow:
                        port=port,
                        stop_method=self.stop_var.get().strip() or "auto",
                        enabled=bool(self.enabled_var.get())), ""
+
+
+def _distribution_state() -> str:
+    """配布設定の今の様子を1行で。"""
+    data, problem = distribution.load()
+    if problem:
+        return "読めません (起動時の案内を見てください)"
+    if data is None or not distribution.tools():
+        return "まだ書き出していません"
+    made = data.get("generated_at", "")
+    where = data.get("generated_on", "")
+    text = f"{len(distribution.tools())}件"
+    if made:
+        text += f" / {made}" + (f" に {where} で書き出し" if where else "")
+    return text
 
 
 def _delivery_warning(tool: Tool) -> str:

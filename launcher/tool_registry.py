@@ -4,8 +4,9 @@
 コードに埋め込まない。設定画面から変更でき、その値がSQLiteに残る
 (要件定義書 §13.3「コードを書き換えず、設定変更だけで対応できること」)。
 
-    config/launcher.json   同梱の既定値。初回の投入だけに使う
-            ↓ 初回起動
+    config/launcher.json      同梱の既定値。初回の投入だけに使う
+    config/distribution.json  配布設定。**中身が変わったときだけ**上書きする
+            ↓ 起動時
     %LOCALAPPDATA%\\BusinessToolsLauncher\\data\\launcher.db
             ↑ 設定画面
     ここが動作中の唯一の参照先
@@ -25,7 +26,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Optional
 
-from . import app_config
+from . import app_config, distribution
 from .logging_utils import get_logger
 
 log = get_logger("tool_registry")
@@ -317,8 +318,48 @@ def initialize() -> None:
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES(?, ?)",
                      ("schema_version", str(SCHEMA_VERSION)))
+        _add_missing_columns(conn)
         _migrate(conn)
         _seed_missing(conn)
+        _apply_distribution(conn)
+        _fill_blank_paths(conn)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """ランチャーを新しい版へ入れ替えたとき、**足りない列を足す。**
+
+    `CREATE TABLE IF NOT EXISTS` は、表がすでにあれば何もしない。
+    新しい版で列を増やすと、古い設定DBを持つ端末では読んだとたんに
+    落ちる。表の定義 (`_SCHEMA`) を正として、無い列だけ既定値つきで足す。
+    """
+    wanted = _schema_columns()
+    for table, columns in wanted.items():
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns:
+            if name not in have:
+                if "NOT NULL" in definition and "DEFAULT" not in definition:
+                    definition += " DEFAULT ''"   # 既存の行を埋める値が要る
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                log.info("設定DBに列を足しました: %s.%s", table, name)
+
+
+def _schema_columns() -> dict[str, list[tuple[str, str]]]:
+    """`_SCHEMA` から表ごとの列と定義を読み取る。"""
+    tables: dict[str, list[tuple[str, str]]] = {}
+    current = None
+    for line in _SCHEMA.splitlines():
+        text = line.strip()
+        if text.startswith("CREATE TABLE"):
+            current = text.split()[5]
+            tables[current] = []
+        elif current and text.startswith(")"):
+            current = None
+        elif current and text and not text.startswith("--"):
+            name, _, definition = text.rstrip(",").partition(" ")
+            # 足す列は主キーにできない (主キーは表を作ったときからある)
+            if "PRIMARY KEY" not in definition:
+                tables[current].append((name, definition.strip()))
+    return tables
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -340,7 +381,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     known = {row["app_id"] for row in conn.execute("SELECT app_id FROM tools")}
     known.update(str(item.get("app_id", "")).strip()
-                 for item in app_config.default_tools())
+                 for item in distribution.merged_tools())
     for app_id in sorted(a for a in known if a):
         conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
                      "VALUES(?, ?)", (app_id, now))
@@ -348,22 +389,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def _seed_missing(conn: sqlite3.Connection) -> None:
-    """`config/launcher.json` のうち、**まだ入れていないものだけ**入れる。
+    """既定値と配布設定のうち、**まだ入れていないものだけ**入れる。
 
-    これで、配布物の `config/launcher.json` に5個目を書き足せば、すでに
-    使っている端末にも次の起動で入る。**すでにある行には触らない** ──
-    利用者が設定した `start.bat` のパスを上書きしない。
+    これで、配布物に5個目を書き足せば、すでに使っている端末にも次の
+    起動で入る。**すでにある行には触らない** ── 利用者が設定した
+    `start.bat` のパスを上書きしない (配布設定の上書きは
+    `_apply_distribution` が中身の変わったときだけ行う)。
 
-    **`start.bat` のパスは入れない。** 端末ごとに違うので、既定値として
-    もっともらしいパスを入れると「設定したつもりで別の場所を指している」
-    状態を作る。空にしておけば、設定画面が「未設定」と出す。
+    **起動ファイルは、この端末に実在するときだけ入れる。** もっともらしい
+    パスを入れると「設定したつもりで別の場所を指している」状態を作る。
+    空にしておけば、設定画面が「未設定」と出す。
     """
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     seeded = {row["app_id"] for row in conn.execute(
         "SELECT app_id FROM seeded_tools")}
 
     added = []
-    for item in app_config.default_tools():
+    for item in distribution.merged_tools():
         app_id = str(item.get("app_id", "")).strip()
         if not app_id or app_id in seeded:
             continue
@@ -387,8 +429,6 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
 
     if added:
         log.info("既定のツール定義を投入しました: %s", "、".join(added))
-
-    _fill_blank_paths(conn)
 
 
 def _configured_start_command(item: dict) -> str:
@@ -414,7 +454,7 @@ def _fill_blank_paths(conn: sqlite3.Connection) -> None:
     """
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     filled = []
-    for item in app_config.default_tools():
+    for item in distribution.merged_tools():
         app_id = str(item.get("app_id", "")).strip()
         path = _configured_start_command(item)
         if not app_id or not path:
@@ -427,6 +467,110 @@ def _fill_blank_paths(conn: sqlite3.Connection) -> None:
             filled.append(app_id)
     if filled:
         log.info("配布設定から起動ファイルを埋めました: %s", "、".join(filled))
+
+
+# 最後に反映した配布設定の指紋。`schema_meta` に置く
+DISTRIBUTION_HASH_KEY = "distribution_hash"
+
+
+def _apply_distribution(conn: sqlite3.Connection) -> None:
+    """配布設定の**中身が変わっていたら**、書かれている項目で上書きする。
+
+    変わっていなければ何もしない。だから、
+
+      * 配布し直せば、全端末に次の起動で届く (その端末で直した値より勝つ)
+      * そのあと端末で直した値は、次に配布し直すまで残る
+
+    その端末で消したツールも、配布し直せば戻る ── 配った人が
+    「この一式で使う」と決め直した、と受け取る。配布設定に**無い**
+    ツールには触らない。止めたいツールは［使う］を外して書き出す。
+
+    **起動ファイルは、この端末に実在するときだけ**入れる。実在しない
+    パスでその端末の正しい値を潰さない。
+    """
+    current = distribution.tools_hash()
+    if not current or current == _applied_distribution_hash(conn):
+        return
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    applied = []
+    for app_id in distribution.rejected():
+        log.warning("配布設定のアプリIDが使えないので飛ばします: %s", app_id)
+    for item in distribution.tools():
+        app_id = item["app_id"]
+        values = _distribution_values(item)
+        conn.execute(
+            """INSERT OR IGNORE INTO tools (app_id, display_name, updated_at)
+               VALUES (?, ?, ?)""",
+            (app_id, str(values.get("display_name") or app_id), now))
+        if values:
+            columns = ", ".join(f"{name} = ?" for name in values)
+            conn.execute(
+                f"UPDATE tools SET {columns}, updated_at = ? WHERE app_id = ?",
+                (*values.values(), now, app_id))
+        conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
+                     "VALUES(?, ?)", (app_id, now))
+        applied.append(app_id)
+
+    _record_distribution_hash(conn, current)
+    log.info("配布設定を反映しました (%d件): %s", len(applied),
+             distribution.path())
+
+
+def _distribution_values(item: dict) -> dict:
+    """配布設定の1件から、上書きしてよい項目だけを取り出す。
+
+    **書かれていない項目には触らない。** 形の合わない値も飛ばす ──
+    1項目の誤りで、そのツールの設定がまるごと壊れないようにする。
+    """
+    values: dict = {}
+    for name in ("display_name", "repository", "start_args", "health_path"):
+        value = item.get(name)
+        if isinstance(value, str):
+            values[name] = value.strip()
+    if values.get("display_name") == "":
+        del values["display_name"]              # 空の表示名は入れない
+    if values.get("health_path") == "":
+        del values["health_path"]
+    for name in ("order_no", "port"):
+        value = item.get(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            values[name] = value
+    if "port" in values and validate_port(values["port"]):
+        del values["port"]
+    if item.get("stop_method") in STOP_METHODS:
+        values["stop_method"] = item["stop_method"]
+    if isinstance(item.get("enabled"), bool):
+        values["enabled"] = 1 if item["enabled"] else 0
+    start = _configured_start_command(item)
+    if start:
+        values["start_command"] = start
+    return values
+
+
+def _applied_distribution_hash(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT value FROM schema_meta WHERE key = ?",
+                       (DISTRIBUTION_HASH_KEY,)).fetchone()
+    return row["value"] if row else ""
+
+
+def _record_distribution_hash(conn: sqlite3.Connection, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES(?, ?)",
+                 (DISTRIBUTION_HASH_KEY, value))
+
+
+def export_distribution(*, relative: bool = True) -> Path:
+    """この端末の設定を配布設定として書き出す。
+
+    書き出した中身は**この端末ではもう反映済み**として記録する。
+    記録しないと、次の起動で自分の書き出した値を読み込み直すことになり、
+    ログに「反映しました」が出て紛らわしい。
+    """
+    target = distribution.export_tools(all_tools(include_disabled=True),
+                                       relative=relative)
+    with _connect() as conn:
+        _record_distribution_hash(conn, distribution.tools_hash())
+    return target
 
 
 def _row_to_tool(row: sqlite3.Row) -> Tool:
@@ -719,7 +863,7 @@ def describe() -> str:
     mode = pc_mode()
     lines.append(f"このPCのモード: {mode or '(未設定)'}")
     planned = {str(item.get("app_id", "")): str(item.get("start_command", ""))
-               for item in app_config.default_tools()}
+               for item in distribution.merged_tools()}
     for tool in all_tools(include_disabled=True):
         mark = "OK" if tool.is_configured else "未設定"
         lines.append(f"  [{mark:>4}] {tool.display_name} ({tool.app_id})")

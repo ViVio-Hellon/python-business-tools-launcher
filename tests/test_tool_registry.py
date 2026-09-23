@@ -367,12 +367,13 @@ class EntryKindTests(LocalAreaTestCase):
 
 
 class DistributionTests(LocalAreaTestCase):
-    """配布する前に起動ファイルを決めておく。
+    """製品の既定値 (`config/launcher.json`) に書いた起動ファイル。
 
     **設定はランチャーのフォルダーと一緒に移動しない。** 各PCの
     `%LOCALAPPDATA%` にあるので、設定済みのフォルダーをコピーしても
-    向こうでは全部「未設定」から始まる。配布設定 (`config/launcher.json`)
-    に書いておけば、配った先でも最初から埋まる。
+    向こうでは全部「未設定」から始まる。既定値に書いておけば、配った
+    先でも最初から埋まる (ふだんは画面から書き出す配布設定
+    `config/distribution.json` を使う。`test_distribution` を参照)。
     """
 
     def setUp(self) -> None:
@@ -488,3 +489,33 @@ class DistributionTests(LocalAreaTestCase):
         text = tool_registry.describe()
         self.assertIn("配布設定", text)
         self.assertIn("見つかりません", text)
+
+
+class OldDatabaseTests(LocalAreaTestCase):
+    """古い版のランチャーが作った設定DBを、新しい版で開く。"""
+
+    def test_足りない列を足して読める(self) -> None:
+        import sqlite3
+
+        path = app_config.settings_db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+        try:
+            with conn:
+                # 起動引数 (start_args) が無かったころの形
+                conn.execute("""CREATE TABLE tools (
+                    app_id TEXT PRIMARY KEY, display_name TEXT NOT NULL,
+                    start_command TEXT NOT NULL DEFAULT '')""")
+                conn.execute("INSERT INTO tools VALUES ('old.tool', '古いツール',"
+                             " 'C:/old/start.bat')")
+        finally:
+            conn.close()
+
+        tool_registry.initialize()
+        tool = tool_registry.get("old.tool")
+        self.assertEqual(tool.display_name, "古いツール")
+        self.assertEqual(tool.start_command, "C:/old/start.bat")
+        self.assertEqual(tool.start_args, "")
+        self.assertEqual(tool.health_path, tool_registry.DEFAULT_HEALTH_PATH)
+        self.assertTrue(tool.enabled)
+

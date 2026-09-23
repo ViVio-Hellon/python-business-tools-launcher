@@ -184,6 +184,22 @@ def start() -> int:
             "よくある原因: JSON にコメント (//) を書いた、"
             "カンマの過不足、メモ帳で別の文字コードで保存した")
 
+    # 配布設定が壊れていても起動は止めない (その端末の設定で動く)。
+    # ただ、**パスワードを確かめられないので［設定］は開けなくなる。**
+    # 黙っていると「設定が開かない」としか見えないので、ここで知らせる
+    from launcher import distribution
+
+    _, problem = distribution.load()
+    if problem:
+        log.warning("%s", problem)
+        _show_message(
+            "配布設定を読めません",
+            f"{problem}\n\n"
+            "この端末の設定のまま起動します。\n"
+            "配布設定を読めるまで［設定］は開けません。\n\n"
+            "配布元の config/distribution.json に戻すか、"
+            "消してから起動し直してください。")
+
     tool_registry.initialize()
 
     # 登録が無くなったツールの画面プロファイルを片付ける。
@@ -356,6 +372,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print("  PIDでの停止もできません (stop.bat と停止要求は使えます)。")
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない
             print(f"プロセスの照合を確かめられませんでした: {exc}")
+        print()
+        # 配布設定。**どの端末で作った設定が届いているか**を見せる
+        try:
+            from launcher import distribution
+            print(distribution.describe())
+            _, broken = distribution.load()
+            if broken:
+                problems.append(StartupError(
+                    broken, "配布元の config/distribution.json に戻すか、"
+                            "消してください (消すとパスワードも外れます)"))
+        except Exception as exc:              # noqa: BLE001 - 診断で落ちない
+            print(f"配布設定を読めませんでした: {exc}")
         print()
         try:
             print(tool_registry.describe())
