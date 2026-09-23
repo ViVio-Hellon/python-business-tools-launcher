@@ -502,6 +502,16 @@ def close_browser(running: RunningTool) -> bool:
         log.info("画面はすでに閉じられていました (pid=%s)", running.browser_pid)
         return True
 
+    from launcher import browser
+
+    if browser.is_spawned(running.browser_pid):
+        # **このランチャーが自分で起こした画面。** 手がかりを持っているので
+        # コマンドラインの照合は要らない。これで `wmic` も PowerShell も
+        # 使えない端末 (Windows 11 24H2 以降は wmic が既定で無い、工場の
+        # 端末では PowerShell を禁じていることがある) でも閉じられる
+        return _close_window(running.browser_pid)
+
+    # 手がかりが無い = 前のランチャーが開いた画面。外から照合するしかない
     command = process_command_line(running.browser_pid)
     if not command:
         log.warning("画面 pid=%s の中身を確かめられないので閉じません",
@@ -516,17 +526,20 @@ def close_browser(running: RunningTool) -> bool:
                     running.browser_pid)
         return False
 
-    log.info("画面を閉じます: pid=%s", running.browser_pid)
+    return _close_window(running.browser_pid)
+
+
+def _close_window(pid: int) -> bool:
+    """照合の済んだ画面を閉じる。"""
+    log.info("画面を閉じます: pid=%s", pid)
     # まず穏やかに頼む。Windowsの `taskkill /T` は WM_CLOSE を送るので、
     # ブラウザーは後始末をしてから終われる
-    if _terminate(running.browser_pid, force=False) and \
-            _wait_pid_gone(running.browser_pid, BROWSER_WAIT_SEC):
+    if _terminate(pid, force=False) and _wait_pid_gone(pid, BROWSER_WAIT_SEC):
         return True
-    if _terminate(running.browser_pid, force=True) and \
-            _wait_pid_gone(running.browser_pid, BROWSER_WAIT_SEC):
-        log.info("画面を強制的に閉じました: pid=%s", running.browser_pid)
+    if _terminate(pid, force=True) and _wait_pid_gone(pid, BROWSER_WAIT_SEC):
+        log.info("画面を強制的に閉じました: pid=%s", pid)
         return True
-    log.warning("画面を閉じられませんでした: pid=%s", running.browser_pid)
+    log.warning("画面を閉じられませんでした: pid=%s", pid)
     return False
 
 
@@ -654,6 +667,22 @@ def _running_processes_windows():
         pid, _, command = line.partition("\t")
         if pid.strip().isdigit() and command.strip():
             yield int(pid.strip()), command.strip()
+
+
+def inspection_status() -> tuple[bool, str]:
+    """この端末で、プロセスのコマンドラインを取れるか (診断用)。
+
+    取れない端末では、ランチャーが**前回開いた画面**を閉じられず、
+    記録を失ったときに**既に開いている画面を探し出せない**。止めるとき
+    も PID での停止ができない (stop.bat と停止要求は使える)。
+    配る前に分かるよう、`start_debug.bat --check` に出す。
+    """
+    command = process_command_line(os.getpid())
+    if command:
+        if os.name != "nt":
+            return True, "/proc から取得"
+        return True, "取得できます"
+    return False, ("取得できません (wmic も PowerShell も使えない端末です)")
 
 
 def process_command_line(pid: int) -> str:

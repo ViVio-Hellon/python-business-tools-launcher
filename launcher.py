@@ -343,6 +343,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(browser.describe())
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない
             print(f"ブラウザーの設定を読めませんでした: {exc}")
+
+        # **端末によって使えないことがある。** 使えないと画面の照合が
+        # できないので、配る前に分かるよう出しておく
+        try:
+            import process_manager
+            ok, how = process_manager.inspection_status()
+            print(f"プロセスの照合: {how}")
+            if not ok:
+                print("  ランチャーが今回開いた画面は閉じられますが、")
+                print("  前回のランチャーが開いた画面は閉じられません。")
+                print("  PIDでの停止もできません (stop.bat と停止要求は使えます)。")
+        except Exception as exc:              # noqa: BLE001 - 診断で落ちない
+            print(f"プロセスの照合を確かめられませんでした: {exc}")
         print()
         try:
             print(tool_registry.describe())

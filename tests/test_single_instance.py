@@ -343,6 +343,85 @@ class ScreenTests(LocalAreaTestCase):
         self.assertNotEqual(manager.current.browser_pid, window)
 
 
+class LockedDownPcTests(ScreenTests):
+    """`wmic` も PowerShell も使えない端末。
+
+    Windows 11 24H2 以降は `wmic` が既定で入っていない。工場の端末では
+    PowerShell を一般利用者に禁じていることがある。両方使えないと、
+    外からプロセスを調べる手段がすべて無くなる。
+
+    ここで確かめるのは**できること**と**できないこと**の両方。
+    できないことを「できる」と試験が言ってしまうと、現場で初めて気づく。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 外からプロセスを調べる手段を、どちらも塞ぐ
+        for name, value in (("process_command_line", ""),):
+            patcher = mock.patch.object(process_manager, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(process_manager, "_running_processes",
+                                    side_effect=lambda: iter(()))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # --- できること ------------------------------------------------
+    def test_自分で開いた画面は閉じられる(self) -> None:
+        """**いちばんよく通る道。** 開いたときの手がかりで閉じる。
+
+        閉じられないと、切り替えのたびに画面が2枚になる。
+        """
+        a = self.register("fake.lock1", "日報")
+        b = self.register("fake.lock2", "看板")
+        manager = self.make_manager()
+
+        manager._select_blocking(a, manager._generation)
+        self.wait_opened(1)
+        first = manager.current.browser_pid
+        self.assertTrue(process_manager._is_alive(first))
+
+        manager._select_blocking(b, manager._generation)
+
+        self.assertFalse(process_manager._is_alive(first),
+                         "照合できない端末で、切り替え時に画面を閉じられません")
+
+    def test_手がかりの無い画面は閉じない(self) -> None:
+        """**確かめられないものには触らない**、は変えない。"""
+        import subprocess as sp
+
+        other = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                         stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(lambda: (other.kill(), other.wait(timeout=5)))
+        running = runtime_state.RunningTool(
+            app_id="x", browser_pid=other.pid,
+            browser_profile=str(self.work_root / "プロファイル"))
+
+        self.assertFalse(process_manager.close_browser(running))
+        self.assertIsNone(other.poll(), "照合できないプロセスを閉じました")
+
+    def test_本当に画面が無ければ開く(self) -> None:
+        super().test_本当に画面が無ければ開く()
+
+    def test_診断で分かる(self) -> None:
+        ok, how = process_manager.inspection_status()
+        self.assertFalse(ok)
+        self.assertIn("wmic", how)
+
+    # --- できないこと (制限として固定する) ---------------------------
+    def test_手がかりを失っても2枚目を開かない(self) -> None:
+        """**この端末ではできない。** 前のランチャーが開いた画面は、
+        外から調べる手段が無いので探し出せない。
+
+        記録を失うこと自体がまれ (ランチャー外での起動、生存監視の誤判定)
+        なので制限として受け入れ、`start_debug.bat --check` で知らせる。
+        """
+        self.skipTest("制限: 照合できない端末では前回の画面を探し出せない")
+
+    def test_見つけた画面は閉じられる(self) -> None:
+        self.skipTest("制限: 照合できない端末では前回の画面を探し出せない")
+
+
 class MarkerSearchTests(LocalAreaTestCase):
     """印からプロセスを探す。"""
 

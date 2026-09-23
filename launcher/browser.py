@@ -310,6 +310,22 @@ def reap() -> None:
             _spawned.pop(pid, None)
 
 
+def is_spawned(pid: int) -> bool:
+    """そのPIDを**このランチャーが自分で起こし、まだ動いている**か。
+
+    手元にプロセスの手がかり (Popen) があるので、外部コマンドで
+    コマンドラインを照合するより**確かな証拠**になる。PIDの使い回しも
+    起きない ── 手がかりを持っているあいだ、OSはそのPIDを他へ回さない。
+    """
+    proc = _spawned.get(pid)
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except (OSError, ValueError):
+        return False
+
+
 def managed_pids() -> list[int]:
     """いまランチャーが持っている画面のPID (診断用)。"""
     return sorted(_spawned)
