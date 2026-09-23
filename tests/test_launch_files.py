@@ -93,3 +93,39 @@ class ContentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadmeJsonTests(unittest.TestCase):
+    """README の JSON 例がそのまま使えること。
+
+    **JSON はコメント (`//`) を許さない。** 例にコメントを書くと、
+    そのまま `config/launcher.json` へ写したときに設定が壊れ、新しい
+    端末ではツールのボタンが1つも出なくなる。実際にそうなっていた。
+    """
+
+    def test_READMEのJSONはすべて読める(self) -> None:
+        import json
+        import re
+
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        blocks = re.findall(r"```json\n(.*?)```", text, flags=re.S)
+        self.assertTrue(blocks, "README に JSON の例がありません")
+
+        for index, block in enumerate(blocks, 1):
+            with self.subTest(block=index):
+                self.assertNotIn("//", block,
+                                 f"{index}つめの例にコメントがあります")
+                # 断片 ("ui": {...}) も、外側を補えば読めること
+                for candidate in (block, "{" + block + "}"):
+                    try:
+                        json.loads(candidate)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                else:
+                    self.fail(f"{index}つめの例が JSON として読めません:\n{block}")
+
+    def test_同梱の設定ファイルが読める(self) -> None:
+        import json
+
+        json.loads((ROOT / "config" / "launcher.json").read_text(encoding="utf-8"))

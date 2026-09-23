@@ -123,38 +123,53 @@ PCによって置き場所が違っていても、ここを変えるだけで動
 画面構成が変わって（二画面を外した、解像度を変えた）バーが見えない場所に残った場合は、
 次の起動で自動的に既定の位置へ戻ります。
 
-位置と動きは `config/launcher.json` で変更できます。
+位置と動きは `config/launcher.json` の `ui` で変更できます。
 
 ```json
 "ui": {
   "bar_height": 56,
   "bottom_margin": 48,
   "edge_margin": 16,
-  "position_idle": "center",         // center / bottom_left / bottom_center / bottom_right
+  "position_idle": "center",
   "position_active": "bottom_left",
-  "move_animation_ms": 180           // 0 にすると瞬間移動
+  "move_animation_ms": 180
 }
 ```
+
+| 項目 | 意味 |
+|---|---|
+| `position_idle` / `position_active` | `center` / `bottom_left` / `bottom_center` / `bottom_right` |
+| `move_animation_ms` | 移動にかける時間。`0` で瞬間移動 |
 
 ### そのほかの設定 (`config/launcher.json`)
 
 ```json
 "ui": {
-  "health_poll_seconds": 5,          // ツールの生存確認の間隔
-  "health_failures_before_dead": 3,  // 何回続けて応答が無ければ「終了した」とするか
-  "start_timeout_seconds": 90,       // 起動を待つ上限
-  "stop_timeout_seconds": 30         // 停止を待つ上限
+  "health_poll_seconds": 5,
+  "health_failures_before_dead": 3,
+  "start_timeout_seconds": 90,
+  "stop_timeout_seconds": 30
 },
 "browser": {
-  "mode": "app_window",              // app_window(閉じられる) / default(既定ブラウザー)
+  "mode": "app_window",
   "preferred": ["edge", "chrome", "chromium"],
-  "extra_paths": []                  // 見つけられない置き方の端末で実行ファイルを直接指定
+  "extra_paths": []
 },
 "logs": {
-  "tool_log_max_mb": 5,              // ツールの出力ログを退避する大きさ
-  "tool_log_keep": 2                 // 退避を何世代残すか
+  "tool_log_max_mb": 5,
+  "tool_log_keep": 2
 }
 ```
+
+| 項目 | 意味 |
+|---|---|
+| `ui.health_poll_seconds` | ツールの生存確認の間隔（秒） |
+| `ui.health_failures_before_dead` | 何回続けて応答が無ければ「終了した」とするか |
+| `ui.start_timeout_seconds` / `stop_timeout_seconds` | 起動・停止を待つ上限（秒） |
+| `browser.mode` | `app_window`（閉じられる専用画面）/ `default`（既定ブラウザー） |
+| `browser.preferred` | 探すブラウザーの順 |
+| `browser.extra_paths` | 見つけられない置き方の端末で、実行ファイルを直接指定 |
+| `logs.tool_log_max_mb` / `tool_log_keep` | ツール出力ログを退避する大きさと、残す世代 |
 
 `health_failures_before_dead` を 1 にすると、スリープ復帰直後や重い処理中に
 動いているツールを「終了した」と誤判定します。既定の 3 を下げないでください。
@@ -303,6 +318,88 @@ start_debug.bat --check    確認だけして終わる
 
 `launcher_*.log` は30日で消えます。`tool_*.out.log` は日付で分かれないため、
 5MB を超えたら `.1` `.2` と退避します（`config/launcher.json` の `logs` で変更できます）。
+
+---
+
+## 配布する
+
+### 設定はフォルダーと一緒に移動しません
+
+［設定］で入れた値は、ランチャーのフォルダーではなく**各PCの利用者ごとの領域**に保存されます。
+
+```
+%LOCALAPPDATA%\BusinessToolsLauncher\data\launcher.db
+```
+
+あなたのPCで設定したフォルダーをコピーしても、配った先では**全ツールが「未設定」から始まります。**
+同じPCでも、Windows に別の利用者でログインすれば別の設定になります。
+
+**配った先でも最初から設定済みにするには、`config/launcher.json` に書いてください。**
+
+### 起動ファイルを事前に決めておく
+
+`tools` の各行に `start_command` を書きます。**ランチャーのフォルダーを起点にした相対パス**が使えます。
+
+```
+C:\業務ツール\                  ← この親フォルダーごと配る
+├─ ランチャー\                  ← 起点
+├─ 日報\start.bat               → "../日報/start.bat"
+├─ カレンダー\start.bat
+├─ 看板\start.bat
+└─ 総合ツール\start.bat
+```
+
+```json
+{
+  "app_id": "nlm.nippou-tool",
+  "display_name": "日報",
+  "order_no": 10,
+  "port": 8733,
+  "start_command": "../日報/start.bat",
+  "start_args": "--no-browser"
+}
+```
+
+相対パスにしておけば、配った先で `C:\業務ツール\` に置いても `D:\Tools\` に置いても同じ設定で動きます。
+絶対パスや `%USERPROFILE%` などの環境変数も使えます。
+
+> **区切りは `/` で書いてください。** JSON では `\` を2つ重ねる決まりがあり、
+> `"..\日報\start.bat"` と1つで書くと**設定ファイルが壊れます**。`/` なら重ねる必要がなく、
+> Windows でもそのまま通ります。
+
+| 状況 | 振る舞い |
+|---|---|
+| 配った先にファイルがある | 最初の起動で埋まる |
+| 配った先にファイルが無い | **埋めない**（未設定のまま）。あとで置けば次の起動で埋まる |
+| 利用者が［設定］で別の値を入れた | **上書きしない**。その端末の値が優先 |
+| すでに使っている端末 | 空欄だけ、次の起動で埋まる |
+
+> 実在しないパスは入れません。入れると空欄が「間違った値」に変わり、
+> あとでツールを置いても自動では埋め直せなくなるためです。
+
+### 配る前の確認
+
+1. **`config/launcher.json` が正しい JSON か** ── コメント（`//`）は書けません。パスの区切りは `/`（`\` 1つは不可）。カンマの過不足にも注意してください。
+   壊れていると、新しい端末では**ツールのボタンが1つも出ません**（起動時に警告は出ます）。
+2. **配った先で `start_debug.bat --check`** ── 各ツールが `[  OK]` になっているか確認します。
+   配布設定があるのに見つからないときは、想定していた場所も表示されます。
+
+```
+  [未設定] 日報 (nlm.nippou-tool)
+         起動: (未設定)
+         配布設定: ..\日報\start.bat
+                 → C:\業務ツール\日報\start.bat (見つかりません)
+```
+
+### 壊さないように
+
+| ファイル | 注意 |
+|---|---|
+| `Start.vbs` / `start_debug.bat` / `stop.bat` | **CP932（Shift-JIS）のまま**保存してください。UTF-8 で保存し直すと現場で文字化けし、起動しなくなります |
+| `config/launcher.json` | **UTF-8** の正しい JSON。コメント不可、パスの区切りは `/` |
+| `launcher/__init__.py` | 版を上げるときは `__version__` の1行だけ |
+
+配布物に入れなくてよいもの: `tests/`、`docs/`、`__pycache__/`（開発用）。
 
 ---
 

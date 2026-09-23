@@ -1,8 +1,10 @@
 """ツール設定の保存と保存時チェック (要件定義書 §13 / §14 / §15)"""
 from __future__ import annotations
 
+import os
 import sys
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -362,3 +364,127 @@ class EntryKindTests(LocalAreaTestCase):
 
     def test_未設定なら種類は空(self) -> None:
         self.assertEqual(Tool(app_id="x", display_name="日報").entry_kind, "")
+
+
+class DistributionTests(LocalAreaTestCase):
+    """配布する前に起動ファイルを決めておく。
+
+    **設定はランチャーのフォルダーと一緒に移動しない。** 各PCの
+    `%LOCALAPPDATA%` にあるので、設定済みのフォルダーをコピーしても
+    向こうでは全部「未設定」から始まる。配布設定 (`config/launcher.json`)
+    に書いておけば、配った先でも最初から埋まる。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 配布物の置き場所を作る。ランチャーの**隣**にツールを置く形
+        self.parent = self.work_root / "業務ツール"
+        self.launcher_root = self.parent / "ランチャー"
+        self.launcher_root.mkdir(parents=True)
+        tool_dir = self.parent / "日報"
+        tool_dir.mkdir()
+        self.start_bat = tool_dir / "start.bat"
+        self.start_bat.write_text("@echo off\n", encoding="cp932")
+
+        patcher = mock.patch.object(app_config, "APP_ROOT", self.launcher_root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def configure(self, app_id: str, path: str) -> None:
+        """配布設定の既存ツールに起動ファイルを書いたことにする。"""
+        for item in app_config.load()["tools"]:
+            if item["app_id"] == app_id:
+                original = item.get("start_command")
+                item["start_command"] = path
+                self.addCleanup(self._restore, item, original)
+                return
+        self.fail(f"{app_id} が配布設定にありません")
+
+    @staticmethod
+    def _restore(item, original) -> None:
+        if original is None:
+            item.pop("start_command", None)
+        else:
+            item["start_command"] = original
+
+    def test_ランチャー起点の相対パスで指せる(self) -> None:
+        """**どこに置いても同じ書き方で指せる**こと。"""
+        resolved = tool_registry.resolve_config_path(r"..\日報\start.bat".replace("\\", os.sep))
+        self.assertEqual(Path(resolved), self.start_bat.resolve())
+
+    def test_配布設定で最初から埋まる(self) -> None:
+        self.configure("nlm.nippou-tool", os.path.join("..", "日報", "start.bat"))
+        tool_registry.initialize()
+
+        tool = tool_registry.get("nlm.nippou-tool")
+        self.assertEqual(Path(tool.start_command), self.start_bat.resolve())
+        self.assertTrue(tool.is_configured, "配った先で未設定のままです")
+
+    def test_使っている端末でも空欄なら埋まる(self) -> None:
+        """配布設定をあとから更新しても届くこと。"""
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.get("nlm.nippou-tool").start_command, "")
+
+        self.configure("nlm.nippou-tool", os.path.join("..", "日報", "start.bat"))
+        tool_registry.initialize()          # 次の起動
+
+        self.assertTrue(tool_registry.get("nlm.nippou-tool").is_configured)
+
+    def test_利用者が入れた値は上書きしない(self) -> None:
+        """**空欄でなければ、それがその端末の正しい値。**"""
+        other = self.work_root / "別の場所" / "start.bat"
+        other.parent.mkdir()
+        other.write_text("@echo off\n", encoding="cp932")
+        tool_registry.initialize()
+        tool_registry.set_start_command("nlm.nippou-tool", str(other))
+
+        self.configure("nlm.nippou-tool", os.path.join("..", "日報", "start.bat"))
+        tool_registry.initialize()
+
+        self.assertEqual(tool_registry.get("nlm.nippou-tool").start_command,
+                         str(other))
+
+    def test_実在しないパスでは埋めない(self) -> None:
+        """**空欄を「間違った値」に変えない。**
+
+        入れてしまうと空欄ではなくなり、あとでツールを置いても
+        自動では埋め直せない。
+        """
+        self.configure("nlm.nippou-tool", os.path.join("..", "無い", "start.bat"))
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.get("nlm.nippou-tool").start_command, "")
+
+    def test_あとからツールを置けば次の起動で埋まる(self) -> None:
+        self.configure("nlm.line-calendar",
+                       os.path.join("..", "カレンダー", "start.bat"))
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.get("nlm.line-calendar").start_command, "")
+
+        # あとでツールを配置した
+        later = self.parent / "カレンダー" / "start.bat"
+        later.parent.mkdir()
+        later.write_text("@echo off\n", encoding="cp932")
+        tool_registry.initialize()
+
+        self.assertTrue(tool_registry.get("nlm.line-calendar").is_configured)
+
+    def test_絶対パスもそのまま使える(self) -> None:
+        self.configure("nlm.nippou-tool", str(self.start_bat))
+        tool_registry.initialize()
+        self.assertTrue(tool_registry.get("nlm.nippou-tool").is_configured)
+
+    def test_環境変数を展開する(self) -> None:
+        os.environ["BTL_TEST_ROOT"] = str(self.parent)
+        self.addCleanup(os.environ.pop, "BTL_TEST_ROOT", None)
+        text = os.path.join("%BTL_TEST_ROOT%" if os.name == "nt" else "$BTL_TEST_ROOT",
+                            "日報", "start.bat")
+        self.assertEqual(Path(tool_registry.resolve_config_path(text)),
+                         self.start_bat.resolve())
+
+    def test_見つからないときは診断に出す(self) -> None:
+        """配布設定があるのに入っていない = 配置が想定と違う。"""
+        self.configure("nlm.nippou-tool", os.path.join("..", "無い", "start.bat"))
+        tool_registry.initialize()
+        text = tool_registry.describe()
+        self.assertIn("配布設定", text)
+        self.assertIn("見つかりません", text)

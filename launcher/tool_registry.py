@@ -232,6 +232,37 @@ def validate_start_command(path: str) -> str:
     return ""
 
 
+def resolve_config_path(text: str) -> str:
+    """配布設定 (`config/launcher.json`) に書かれたパスを、この端末の絶対パスにする。
+
+    **ランチャーのフォルダーを起点にした相対パスを許す。** 配布では
+    ランチャーと業務ツールを1つのフォルダーにまとめてコピーすることが
+    多く、置き場所はPCごとに違う (`C:\\業務ツール\\` だったり
+    `D:\\Tools\\` だったり)。起点をランチャーに固定すれば、どこへ
+    置いても同じ書き方で指せる。
+
+        C:\\業務ツール\\
+        ├─ ランチャー\\     ← ここが起点
+        └─ 日報\\start.bat  ← `..\\日報\\start.bat` で指せる
+
+    設定画面で入力するパスは絶対パスのまま (相対パスは起動した場所で
+    指す先が変わるため)。**起点が決まっている配布設定だけ**の扱い。
+
+    `%USERPROFILE%` などの環境変数も展開する。
+    """
+    raw = (text or "").strip().strip('"')
+    if not raw:
+        return ""
+    expanded = os.path.expandvars(raw)
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = app_config.APP_ROOT / path
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
 def _vbs_forwards_args(path: str) -> bool:
     """その VBS が `WScript.Arguments` を使っているか。
 
@@ -338,13 +369,14 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
             continue
         conn.execute(
             """INSERT OR IGNORE INTO tools
-               (app_id, display_name, order_no, repository, start_args,
-                port, health_path, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (app_id, display_name, order_no, repository, start_command,
+                start_args, port, health_path, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (app_id,
              str(item.get("display_name", app_id)),
              int(item.get("order_no", 0)),
              str(item.get("repository", "")),
+             _configured_start_command(item),
              str(item.get("start_args", "")),
              int(item.get("port", 0)),
              str(item.get("health_path", DEFAULT_HEALTH_PATH)),
@@ -355,6 +387,46 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
 
     if added:
         log.info("既定のツール定義を投入しました: %s", "、".join(added))
+
+    _fill_blank_paths(conn)
+
+
+def _configured_start_command(item: dict) -> str:
+    """配布設定の起動ファイル。**この端末に実在するときだけ**返す。
+
+    実在しないパスを入れてしまうと、空欄が「間違った値」に変わる。
+    そうなると次の起動で埋め直せず (空欄ではないので)、手で直すしか
+    なくなる。実在しなければ空のままにしておけば、あとからツールを
+    置いたときに次の起動で自動的に埋まる。
+    """
+    resolved = resolve_config_path(str(item.get("start_command", "")))
+    if not resolved:
+        return ""
+    return resolved if Path(resolved).is_file() else ""
+
+
+def _fill_blank_paths(conn: sqlite3.Connection) -> None:
+    """配布設定に起動ファイルがあれば、**空欄だけ**埋める。
+
+    起動のたびに見る。すでに使っている端末でも、配布設定を更新すれば
+    次の起動で入る。**利用者が設定画面で入れた値には触らない** ──
+    空欄でなければ、それがその端末の正しい値。
+    """
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    filled = []
+    for item in app_config.default_tools():
+        app_id = str(item.get("app_id", "")).strip()
+        path = _configured_start_command(item)
+        if not app_id or not path:
+            continue
+        cursor = conn.execute(
+            """UPDATE tools SET start_command = ?, updated_at = ?
+               WHERE app_id = ? AND start_command = ''""",
+            (path, now, app_id))
+        if cursor.rowcount:
+            filled.append(app_id)
+    if filled:
+        log.info("配布設定から起動ファイルを埋めました: %s", "、".join(filled))
 
 
 def _row_to_tool(row: sqlite3.Row) -> Tool:
@@ -646,9 +718,17 @@ def describe() -> str:
     lines = [f"設定DB: {app_config.settings_db_path()}"]
     mode = pc_mode()
     lines.append(f"このPCのモード: {mode or '(未設定)'}")
+    planned = {str(item.get("app_id", "")): str(item.get("start_command", ""))
+               for item in app_config.default_tools()}
     for tool in all_tools(include_disabled=True):
         mark = "OK" if tool.is_configured else "未設定"
         lines.append(f"  [{mark:>4}] {tool.display_name} ({tool.app_id})")
         lines.append(f"         起動: {tool.start_command or '(未設定)'}")
+        want = planned.get(tool.app_id, "")
+        if want and not tool.is_configured:
+            # **配布設定はあるのに入っていない。** 配置が想定と違う
+            resolved = resolve_config_path(want)
+            lines.append(f"         配布設定: {want}")
+            lines.append(f"                 → {resolved} (見つかりません)")
         lines.append(f"         確認: {tool.health_url or '(ポート未設定)'}")
     return "\n".join(lines)
