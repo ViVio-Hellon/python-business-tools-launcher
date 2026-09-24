@@ -13,7 +13,7 @@
     │   (Start.vbs も指定できます)                  │
     │ ポート [8733] 起動引数 [--no-browser]         │
     │                                              │
-    │ 配布設定  [書き出す] [パスワードを変える]     │
+    │ 配布先フォルダ [作る] [置き換える] [パスワード] │
     │                    [保存] [キャンセル]        │
     └──────────────────────────────────────────────┘
 """
@@ -208,31 +208,31 @@ class SettingsDialog:
                        highlightthickness=0).pack(side="left", padx=(10, 0))
 
     def _build_distribution(self) -> None:
-        """配布設定 (`config/distribution.json`)。
+        """配布先フォルダ (`distribution/`)。
 
-        1台を整えてから書き出し、ランチャーのフォルダーごと配る。配った
-        先では次の起動で読み込まれる。**手で JSON を書かせない**ための入口。
+        1台を整えてから作り、ランチャーのフォルダーごと配る。配った先
+        では起動時に読み込まれる (**その端末にすでにある設定が優先**)。
+        **手で JSON を書かせない**ための入口。
         """
         frame = tk.Frame(self.top, bg=theme.BG)
         frame.pack(fill="x", padx=16, pady=(12, 0))
-        tk.Label(frame, text="配布設定", bg=theme.BG, fg=theme.FG,
+        tk.Label(frame, text="配布先フォルダ", bg=theme.BG, fg=theme.FG,
                  font=theme.FONT_BOLD).pack(side="left")
-        tk.Label(frame, text=_distribution_state(), bg=theme.BG,
+        tk.Label(frame, text=distribution.state_text(), bg=theme.BG,
                  fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(side="left", padx=(10, 0))
 
         actions = tk.Frame(self.top, bg=theme.BG)
         actions.pack(fill="x", padx=16, pady=(4, 0))
-        tk.Button(actions, text="この端末の設定を配布設定として書き出す",
-                  command=self.export_distribution,
-                  bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
-                  padx=14, pady=5, font=theme.FONT_SMALL,
-                  cursor="hand2").pack(side="left")
-        tk.Button(actions, text="管理者パスワードを変える",
-                  command=self.change_password,
-                  bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
-                  padx=14, pady=5, font=theme.FONT_SMALL,
-                  cursor="hand2").pack(side="left", padx=(8, 0))
+        self._action_button(actions, "配布先フォルダを作る",
+                            self.export_distribution).pack(side="left")
+        reload = self._action_button(actions, "配布先フォルダの内容で置き換える",
+                                     self.reload_distribution)
+        reload.pack(side="left", padx=(8, 0))
+        if not distribution.tools():
+            reload.configure(state="disabled")
+        self._action_button(actions, "管理者パスワードを変える",
+                            self.change_password).pack(side="left", padx=(8, 0))
 
         # 配った先でもツールがランチャーと同じ並びに置かれるなら、相対
         # パスにしておくとドライブ名やフォルダー名が違っても動く
@@ -246,39 +246,47 @@ class SettingsDialog:
                        font=theme.FONT_SMALL, bd=0, highlightthickness=0,
                        anchor="w").pack(fill="x", padx=16, pady=(4, 0))
 
+    @staticmethod
+    def _action_button(parent: tk.Widget, text: str, command) -> tk.Button:
+        return tk.Button(parent, text=text, command=command,
+                         bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
+                         padx=14, pady=5, font=theme.FONT_SMALL,
+                         disabledforeground=theme.MUTED, cursor="hand2")
+
     def export_distribution(self) -> None:
-        """いまの画面を保存してから、配布設定として書き出す。
+        """いまの画面を保存してから、配布先フォルダを作る。
 
         **画面の内容と書き出す内容をずらさない。** 保存していない変更が
-        あるまま書き出すと、「直したのに配った先に届かない」になる。
+        あるまま作ると、「直したのに配った先に入らない」になる。
         """
         if not messagebox.askyesno(
-                "配布設定",
-                "いまの画面の内容を保存してから、配布設定として書き出します。\n\n"
-                f"書き出し先: {distribution.path()}\n\n"
-                "配った先では、次の起動でこの内容に置き換わります\n"
-                "(その端末で直した値より、配布設定が優先されます)。\n\n"
+                "配布先フォルダ",
+                "いまの画面の内容を保存してから、配布先フォルダを作ります。\n\n"
+                f"作る場所: {distribution.folder()}\n\n"
+                "ランチャーのフォルダーごと配ると、配った先で起動したときに\n"
+                "読み込まれます。すでに使っている端末では、その端末の設定が\n"
+                "優先されます (まだ無いツールと、空欄の起動ファイルだけ入ります)。\n\n"
                 "よろしいですか?", parent=self.top):
             return
         if not self._commit():
             return
         self.saved = True
         try:
-            target = tool_registry.export_distribution(
+            tool_registry.export_distribution(
                 relative=bool(self.relative_var.get()))
-        except (OSError, ValueError) as exc:
-            log.warning("配布設定を書き出せません: %s", exc)
+        except OSError as exc:
+            log.warning("配布先フォルダを作れません: %s", exc)
             messagebox.showerror(
-                "配布設定",
-                f"設定は保存しましたが、配布設定を書き出せませんでした。\n{exc}\n\n"
+                "配布先フォルダ",
+                f"設定は保存しましたが、配布先フォルダを作れませんでした。\n{exc}\n\n"
                 "ランチャーのフォルダーに書き込めるか確かめてください。",
                 parent=self.top)
             self.top.destroy()
             return
 
-        message = (f"書き出しました。\n{target}\n\n"
+        message = (f"配布先フォルダを作りました。\n{distribution.folder()}\n\n"
                    "ランチャーのフォルダーごと配ってください。\n"
-                   "配った先では、次の起動で読み込まれます。")
+                   "配った先では、起動したときに読み込まれます。")
         fixed = distribution.absolute_entries()
         if self.relative_var.get() and fixed:
             message += ("\n\n次のツールは別のドライブにあるため、"
@@ -286,7 +294,35 @@ class SettingsDialog:
                         "置いてください:\n  " + "\n  ".join(fixed))
         if not distribution.has_password():
             message += "\n\n管理者パスワードが入っていません。"
-        messagebox.showinfo("配布設定", message, parent=self.top)
+        messagebox.showinfo("配布先フォルダ", message, parent=self.top)
+        self.top.destroy()
+
+    def reload_distribution(self) -> None:
+        """この端末の設定を、配布先フォルダの内容で置き換える。
+
+        ふだんはその端末の設定が優先なので、配布先フォルダを作り直しても
+        すでに使っている端末は変わらない。変えたい端末でだけ押す。
+        """
+        names = [item.get("display_name") or item["app_id"]
+                 for item in distribution.tools()]
+        if not messagebox.askyesno(
+                "配布先フォルダ",
+                "この端末の設定を、配布先フォルダの内容で置き換えます。\n\n"
+                "  " + "、".join(names) + "\n\n"
+                "この端末で直した値は上書きされます。この画面で直して\n"
+                "まだ保存していない内容も使いません。\n"
+                "(配布先フォルダに無いツールと、この端末に無い起動ファイルは\n"
+                " そのままにします)\n\n"
+                "よろしいですか?", parent=self.top):
+            return
+        # 置き換える前に控えを取る。戻したくなったときのため
+        tool_registry.backup()
+        replaced = tool_registry.reload_from_distribution()
+        self.saved = True
+        messagebox.showinfo(
+            "配布先フォルダ",
+            f"{len(replaced)}件のツールを、配布先フォルダの内容で置き換えました。",
+            parent=self.top)
         self.top.destroy()
 
     def change_password(self) -> None:
@@ -510,21 +546,6 @@ class _ToolRow:
                        port=port,
                        stop_method=self.stop_var.get().strip() or "auto",
                        enabled=bool(self.enabled_var.get())), ""
-
-
-def _distribution_state() -> str:
-    """配布設定の今の様子を1行で。"""
-    data, problem = distribution.load()
-    if problem:
-        return "読めません (起動時の案内を見てください)"
-    if data is None or not distribution.tools():
-        return "まだ書き出していません"
-    made = data.get("generated_at", "")
-    where = data.get("generated_on", "")
-    text = f"{len(distribution.tools())}件"
-    if made:
-        text += f" / {made}" + (f" に {where} で書き出し" if where else "")
-    return text
 
 
 def _delivery_warning(tool: Tool) -> str:

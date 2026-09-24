@@ -184,21 +184,29 @@ def start() -> int:
             "よくある原因: JSON にコメント (//) を書いた、"
             "カンマの過不足、メモ帳で別の文字コードで保存した")
 
-    # 配布設定が壊れていても起動は止めない (その端末の設定で動く)。
-    # ただ、**パスワードを確かめられないので［設定］は開けなくなる。**
-    # 黙っていると「設定が開かない」としか見えないので、ここで知らせる
+    # 配布先フォルダがあれば読む (`tool_registry.initialize`)。壊れていても
+    # 起動は止めない ── その端末の設定で動く。黙っていると「配ったのに
+    # 設定が入らない」「設定が開かない」としか見えないので、ここで知らせる
     from launcher import distribution
 
     _, problem = distribution.load()
     if problem:
         log.warning("%s", problem)
         _show_message(
-            "配布設定を読めません",
+            "配布先フォルダの設定を読めません",
             f"{problem}\n\n"
             "この端末の設定のまま起動します。\n"
-            "配布設定を読めるまで［設定］は開けません。\n\n"
-            "配布元の config/distribution.json に戻すか、"
-            "消してから起動し直してください。")
+            "配布元の端末で［設定］→「配布先フォルダを作る」から"
+            "作り直してください。")
+    _, problem = distribution.load_password()
+    if problem:
+        log.warning("%s", problem)
+        _show_message(
+            "管理者パスワードのファイルを読めません",
+            f"{problem}\n\n"
+            "パスワードを確かめられないため、［設定］は開けません。\n"
+            f"{distribution.PASSWORD_FILE} を消すと、次に［設定］を開くときに"
+            "決め直せます (ツールの設定は消えません)。")
 
     tool_registry.initialize()
 
@@ -373,17 +381,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない
             print(f"プロセスの照合を確かめられませんでした: {exc}")
         print()
-        # 配布設定。**どの端末で作った設定が届いているか**を見せる
+        # 配布先フォルダ。**どの端末で作った設定が届いているか**を見せる
         try:
             from launcher import distribution
             print(distribution.describe())
             _, broken = distribution.load()
             if broken:
                 problems.append(StartupError(
-                    broken, "配布元の config/distribution.json に戻すか、"
-                            "消してください (消すとパスワードも外れます)"))
+                    broken, "配布元の端末で［設定］→「配布先フォルダを作る」"
+                            "から作り直してください"))
+            _, broken = distribution.load_password()
+            if broken:
+                problems.append(StartupError(
+                    broken, f"{distribution.PASSWORD_FILE} を消すと決め直せます"
+                            " (ツールの設定は消えません)"))
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない
-            print(f"配布設定を読めませんでした: {exc}")
+            print(f"配布先フォルダを読めませんでした: {exc}")
         print()
         try:
             print(tool_registry.describe())

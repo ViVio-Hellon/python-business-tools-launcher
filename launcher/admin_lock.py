@@ -7,7 +7,7 @@
     ask(題名, 文言)        -> 入力された文字 / 取り消しなら None
     tell(種類, 題名, 文言)   種類は "info" か "error"
 
-パスワードそのものは配布設定 (`distribution`) に置く。
+パスワードそのものは配布先フォルダ (`distribution/password.json`) に置く。
 """
 from __future__ import annotations
 
@@ -32,22 +32,22 @@ def unlock(ask: Ask, tell: Tell) -> bool:
 
     * パスワードがまだ無い → **その場で決めてもらう** (決めなければ開かない)
     * ある → 合っていれば開く
-    * 配布設定が壊れている → 開かない (確かめようがない)
+    * パスワードのファイルが壊れている → 開かない (確かめようがない)
     """
-    _, problem = distribution.load()
+    _, problem = distribution.load_password()
     if problem:
         tell("error", TITLE,
              f"{problem}\n\n"
-             "配布設定を読めないため、パスワードを確かめられません。\n"
-             "配布元の config/distribution.json に戻すか、"
-             "消してから開き直してください。")
+             "パスワードを確かめられないため、設定画面は開きません。\n"
+             f"{distribution.PASSWORD_FILE} を消すと、次に開くときに"
+             "決め直せます (ツールの設定は消えません)。")
         return False
 
     if not distribution.has_password():
         tell("info", TITLE,
              "設定を開くには管理者パスワードが必要です。\n"
              "はじめに決めてください。\n\n"
-             "決めたパスワードは配布設定に入り、配布設定と一緒に配ると\n"
+             "決めたパスワードは配布先フォルダに入り、フォルダーごと配ると\n"
              "配った先の端末でも同じパスワードになります。")
         return choose(ask, tell)
 
@@ -94,7 +94,7 @@ def choose(ask: Ask, tell: Tell) -> bool:
         log.warning("管理者パスワードを保存できません: %s", exc)
         tell("error", TITLE,
              f"パスワードを保存できません。\n{exc}\n\n"
-             f"保存先: {distribution.path()}\n"
+             f"保存先: {distribution.password_path()}\n"
              "ランチャーのフォルダーに書き込めるか確かめてください。")
         return False
     tell("info", TITLE, f"管理者パスワードを保存しました。\n{target}")

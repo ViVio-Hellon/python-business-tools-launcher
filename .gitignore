@@ -13,6 +13,5 @@ logs/
 *.db-wal
 *.db-shm
 
-# 現場の配布設定 (管理者パスワードの指紋を含む)。製品のリポジトリには入れない
-config/distribution.json
-config/distribution.json.tmp
+# 現場の配布先フォルダ (管理者パスワードの照合値を含む)。製品のリポジトリには入れない
+distribution/

@@ -1,7 +1,9 @@
-"""配布設定 (`config/distribution.json`) と管理者パスワード
+"""配布先フォルダ (`distribution/`) と管理者パスワード
 
-1台を［設定］で整えて書き出し、ランチャーのフォルダーごと配る。
-配った先では次の起動で読み込まれる。［設定］はパスワードで守る。
+1台を［設定］で整えて配布先フォルダを作り、ランチャーのフォルダーごと
+配る。配った先では起動時に読み込む。**その端末にすでにあるデータが
+優先**で、配布先フォルダから入るのは、まだ無いツールと空欄の起動
+ファイルだけ。［設定］はパスワードで守る。
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import REAL_DISTRIBUTION_PATH, LocalAreaTestCase  # noqa: E402
+from _isolation import REAL_DISTRIBUTION_FOLDER, LocalAreaTestCase  # noqa: E402
 
 from launcher import admin_lock, app_config, distribution, tool_registry  # noqa: E402
 
@@ -57,14 +59,16 @@ class _Base(LocalAreaTestCase):
         path.write_text("@echo off\n", encoding="cp932")
         return path
 
-    def write_distribution(self, tools: list[dict], **extra) -> None:
+    def write_settings(self, tools: list, *, encoding: str = "utf-8",
+                       **extra) -> None:
+        """配布先フォルダの設定を置く (配布元で作ったものが届いた状態)。"""
         data = {"format": distribution.FORMAT, "tools": tools, **extra}
-        target = distribution.path()
+        target = distribution.settings_path()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        target.write_text(json.dumps(data, ensure_ascii=False), encoding=encoding)
 
-    def read_distribution(self) -> dict:
-        return json.loads(distribution.path().read_text(encoding="utf-8"))
+    def read_settings(self) -> dict:
+        return json.loads(distribution.settings_path().read_text(encoding="utf-8"))
 
     def set_local(self, app_id: str, **changes) -> None:
         """その端末の［設定］で直したことにする。"""
@@ -72,31 +76,55 @@ class _Base(LocalAreaTestCase):
         fields = {**tool.__dict__, **changes}
         tool_registry.save(tool_registry.Tool(**fields))
 
+    def nippou(self, **fields) -> dict:
+        return {"app_id": NIPPOU, **fields}
+
 
 # ------------------------------------------------------------------
-# ファイル
+# フォルダーとファイル
 # ------------------------------------------------------------------
-class FileTests(_Base):
+class FolderTests(_Base):
 
-    def test_本来の置き場所はランチャーのフォルダーのconfig(self) -> None:
+    def test_本来の置き場所はランチャーのフォルダーの中(self) -> None:
         """**フォルダーごと運ばれる場所**に置く。端末ごとの領域には置かない。"""
-        self.assertEqual(REAL_DISTRIBUTION_PATH(),
-                         self.launcher_root / "config" / "distribution.json")
+        self.assertEqual(REAL_DISTRIBUTION_FOLDER(),
+                         self.launcher_root / "distribution")
 
     def test_無くても普通に動く(self) -> None:
-        self.assertFalse(distribution.path().exists())
+        self.assertFalse(distribution.exists())
         self.assertEqual(distribution.load(), (None, ""))
         self.assertEqual(distribution.tools(), [])
-        self.assertEqual(distribution.tools_hash(), "")
         self.assertFalse(distribution.has_password())
         tool_registry.initialize()
         self.assertIsNotNone(tool_registry.get(NIPPOU))
         self.assertIn("なし", distribution.describe())
+        self.assertEqual(distribution.state_text(), "まだ作っていません")
 
-    def test_壊れていても起動は止めない(self) -> None:
-        distribution.path().parent.mkdir(parents=True, exist_ok=True)
-        distribution.path().write_text('{"tools": [ // コメント\n]}',
-                                        encoding="utf-8")
+    def test_作ると必要なものがそろう(self) -> None:
+        tool_registry.initialize()
+        distribution.set_password("abcd")
+        tool_registry.export_distribution()
+
+        names = sorted(p.name for p in distribution.folder().iterdir())
+        self.assertEqual(names, ["README.txt", "password.json", "settings.json"])
+        self.assertTrue(distribution.exists())
+        self.assertIn("ツール 4件", distribution.describe())
+        self.assertIn("パスワード: あり", distribution.describe())
+
+    def test_説明はメモ帳で読める形(self) -> None:
+        """BOM 付き UTF-8・CRLF。古いメモ帳でも文字化けしない。"""
+        tool_registry.export_distribution()
+        raw = (distribution.folder() / "README.txt").read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"\r\n", raw)
+        text = raw.decode("utf-8-sig")
+        self.assertIn("password.json", text)
+        self.assertIn("優先", text)
+
+    def test_設定が壊れていても起動は止めない(self) -> None:
+        self.write_settings([])
+        distribution.settings_path().write_text('{"tools": [ // コメント\n]}',
+                                                encoding="utf-8")
         data, problem = distribution.load()
         self.assertIsNone(data)
         self.assertIn("壊れています", problem)
@@ -105,29 +133,31 @@ class FileTests(_Base):
         self.assertIsNotNone(tool_registry.get(NIPPOU))
         self.assertIn("[エラー]", distribution.describe())
 
-    def test_壊れた配布設定の上には書かない(self) -> None:
-        """書くと、残っていたパスワードまで消える。"""
-        distribution.path().parent.mkdir(parents=True, exist_ok=True)
-        distribution.path().write_text("{broken", encoding="utf-8")
-
-        with self.assertRaises(ValueError):
-            distribution.set_password("abcd")
-        with self.assertRaises(ValueError):
-            tool_registry.export_distribution()
-        self.assertEqual(distribution.path().read_text(encoding="utf-8"),
-                         "{broken")
-
-    def test_書き込みに失敗しても前の配布設定は残る(self) -> None:
+    def test_壊れた設定は作り直せば直る(self) -> None:
+        self.write_settings([])
+        distribution.settings_path().write_text("{broken", encoding="utf-8")
         distribution.set_password("abcd")
-        before = distribution.path().read_text(encoding="utf-8")
+
+        tool_registry.export_distribution()
+        self.assertEqual(distribution.load()[1], "")
+        self.assertTrue(distribution.verify_password("abcd"))
+
+    def test_メモ帳で保存し直してBOMが付いても読める(self) -> None:
+        self.write_settings([self.nippou(port=9001)], encoding="utf-8-sig")
+        self.assertEqual(distribution.load()[1], "")
+        self.assertEqual(distribution.tools()[0]["port"], 9001)
+
+    def test_書き込みに失敗しても前の設定は残る(self) -> None:
+        tool_registry.export_distribution()
+        before = distribution.settings_path().read_text(encoding="utf-8")
 
         with mock.patch.object(distribution.os, "replace",
                                side_effect=OSError("ディスクがいっぱい")):
             with self.assertRaises(OSError):
                 tool_registry.export_distribution()
 
-        self.assertEqual(distribution.path().read_text(encoding="utf-8"), before)
-        self.assertTrue(distribution.verify_password("abcd"))
+        self.assertEqual(distribution.settings_path().read_text(encoding="utf-8"),
+                         before)
 
     def test_読まれている最中なら少し待って差し替える(self) -> None:
         """共有フォルダーでは、ほかの端末が読んでいると一瞬だけ断られる。"""
@@ -152,13 +182,15 @@ class FileTests(_Base):
                 mock.patch.object(distribution, "REPLACE_WAIT_SEC", 0):
             with self.assertRaises(PermissionError):
                 tool_registry.export_distribution()
-        self.assertEqual(list(distribution.path().parent.iterdir()), [])
+        leftovers = [p.name for p in distribution.folder().iterdir()
+                     if p.name.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
 
     def test_書き終えたら一時ファイルを残さない(self) -> None:
         tool_registry.export_distribution()
-        leftovers = [p.name for p in distribution.path().parent.iterdir()
-                     if p.name != distribution.FILE_NAME]
-        self.assertEqual(leftovers, [])
+        distribution.set_password("abcd")
+        names = sorted(p.name for p in distribution.folder().iterdir())
+        self.assertEqual(names, ["README.txt", "password.json", "settings.json"])
 
 
 # ------------------------------------------------------------------
@@ -175,26 +207,34 @@ class PasswordTests(_Base):
         self.assertFalse(distribution.verify_password("LINE-2024"))
 
     def test_無ければ誰も通さない(self) -> None:
-        """「無い=誰でも」にすると、ファイルを消すだけで外れる形が
-        確かめる側にまで広がる。決める手順は `admin_lock` が持つ。"""
+        """「無い=誰でも」にしない。決める手順は `admin_lock` が持つ。"""
         self.assertFalse(distribution.verify_password(""))
         self.assertFalse(distribution.verify_password("anything"))
 
     def test_パスワードそのものは保存しない(self) -> None:
         distribution.set_password("himitsu-99")
-        text = distribution.path().read_text(encoding="utf-8")
+        text = distribution.password_path().read_text(encoding="utf-8")
         self.assertNotIn("himitsu-99", text)
-        record = self.read_distribution()["password"]
+        record = json.loads(text)
         self.assertEqual(record["algorithm"], distribution.ALGORITHM)
         self.assertTrue(record["salt"])
         self.assertTrue(record["hash"])
 
+    def test_パスワードは設定と別のファイル(self) -> None:
+        """設定を作り直しても鍵が変わらず、忘れたら鍵だけ消せるように。"""
+        distribution.set_password("abcd")
+        tool_registry.export_distribution()
+        settings = distribution.settings_path().read_text(encoding="utf-8")
+        self.assertNotIn("password", settings)
+        self.assertNotIn(json.loads(distribution.password_path()
+                                    .read_text(encoding="utf-8"))["hash"], settings)
+
     def test_同じパスワードでも毎回ちがう形で残る(self) -> None:
         """塩を毎回変える。同じパスワードの現場どうしで見分けがつかないように。"""
         distribution.set_password("abcd")
-        first = self.read_distribution()["password"]
+        first = distribution.load_password()[0]
         distribution.set_password("abcd")
-        second = self.read_distribution()["password"]
+        second = distribution.load_password()[0]
         self.assertNotEqual(first["salt"], second["salt"])
         self.assertNotEqual(first["hash"], second["hash"])
 
@@ -202,36 +242,37 @@ class PasswordTests(_Base):
         for text in ("", "abc", " abcd", "abcd "):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 distribution.set_password(text)
-        self.assertFalse(distribution.path().exists())
+        self.assertFalse(distribution.password_path().exists())
 
     def test_壊れた記録では通さない(self) -> None:
         distribution.set_password("abcd")
-        data = self.read_distribution()
-        for broken in ({**data["password"], "salt": "zz"},
-                       {**data["password"], "algorithm": "md5"},
-                       {**data["password"], "iterations": "many"},
-                       "abcd"):
+        good = distribution.load_password()[0]
+        for broken in ({**good, "salt": "zz"},
+                       {**good, "algorithm": "md5"},
+                       {**good, "iterations": "many"},
+                       {"hash": "abcd"}):
             with self.subTest(broken=broken):
-                self.write_distribution([], password=broken)
+                distribution.password_path().write_text(json.dumps(broken),
+                                                        encoding="utf-8")
                 self.assertFalse(distribution.verify_password("abcd"))
 
     def test_本番の計算は重い(self) -> None:
         """ファイルを盗み見て総当たりされにくい重さにしておく。"""
         self.assertGreaterEqual(PRODUCTION_ITERATIONS, 100_000)
 
-    def test_パスワードを変えてもツール設定は反映し直さない(self) -> None:
-        """変えるたびに全端末の設定が上書きし直されると困る。"""
-        tool_registry.export_distribution()
-        before = distribution.tools_hash()
-        distribution.set_password("abcd")
-        distribution.set_password("efgh")
-        self.assertEqual(distribution.tools_hash(), before)
-
-    def test_書き出してもパスワードは残る(self) -> None:
+    def test_作り直してもパスワードは残る(self) -> None:
         distribution.set_password("abcd")
         tool_registry.export_distribution()
         tool_registry.export_distribution()
         self.assertTrue(distribution.verify_password("abcd"))
+
+    def test_パスワードを変えてもツールの設定は変わらない(self) -> None:
+        tool_registry.export_distribution()
+        before = distribution.settings_path().read_text(encoding="utf-8")
+        distribution.set_password("abcd")
+        distribution.set_password("efgh")
+        self.assertEqual(distribution.settings_path().read_text(encoding="utf-8"),
+                         before)
 
 
 # ------------------------------------------------------------------
@@ -259,6 +300,10 @@ class _Script:
         return [m for k, m in self.told if k == "error"]
 
 
+def _pair(script: _Script):
+    return script.ask, script.tell
+
+
 class AdminLockTests(_Base):
 
     def unlock(self, script: _Script) -> bool:
@@ -268,10 +313,12 @@ class AdminLockTests(_Base):
         script = _Script("line-01", "line-01")
         self.assertTrue(self.unlock(script))
         self.assertTrue(distribution.verify_password("line-01"))
+        # 配布先フォルダが無くても、そこに作る
+        self.assertTrue(distribution.password_path().exists())
 
     def test_決めずに閉じたら開かない(self) -> None:
         self.assertFalse(self.unlock(_Script(None)))
-        self.assertFalse(distribution.path().exists())
+        self.assertFalse(distribution.exists())
 
     def test_確認が合わなければ決め直す(self) -> None:
         script = _Script("line-01", "line-02", "line-03", "line-03")
@@ -306,14 +353,30 @@ class AdminLockTests(_Base):
         distribution.set_password("abcd")
         self.assertFalse(self.unlock(_Script(None)))
 
-    def test_配布設定が読めなければ開かない(self) -> None:
+    def test_パスワードのファイルが読めなければ開かない(self) -> None:
         """確かめようがないので開かない。**尋ねもしない。**"""
-        distribution.path().parent.mkdir(parents=True, exist_ok=True)
-        distribution.path().write_text("{broken", encoding="utf-8")
+        distribution.set_password("abcd")
+        distribution.password_path().write_text("{broken", encoding="utf-8")
         script = _Script()
         self.assertFalse(self.unlock(script))
         self.assertEqual(script.asked, [])
-        self.assertIn("distribution.json", script.errors[0])
+        self.assertIn("password.json", script.errors[0])
+
+    def test_設定が壊れていてもパスワードが読めれば開ける(self) -> None:
+        """壊れた設定を作り直すには［設定］を開く必要がある。"""
+        distribution.set_password("abcd")
+        distribution.settings_path().write_text("{broken", encoding="utf-8")
+        self.assertTrue(self.unlock(_Script("abcd")))
+
+    def test_パスワードのファイルを消せば決め直せる(self) -> None:
+        """忘れたときの戻し方。ツールの設定は消えない。"""
+        distribution.set_password("abcd")
+        tool_registry.export_distribution()
+        distribution.password_path().unlink()
+
+        self.assertTrue(self.unlock(_Script("efgh", "efgh")))
+        self.assertTrue(distribution.verify_password("efgh"))
+        self.assertTrue(distribution.tools())
 
     def test_保存できなければ決めたことにしない(self) -> None:
         """「決めました」と言って保存されていないと、次に開くとき
@@ -333,7 +396,7 @@ class AdminLockTests(_Base):
 
 
 # ------------------------------------------------------------------
-# 書き出す (管理者の端末)
+# 作る (配布元の端末)
 # ------------------------------------------------------------------
 class ExportTests(_Base):
 
@@ -344,7 +407,7 @@ class ExportTests(_Base):
         tool_registry.set_start_command(CALENDAR, str(self.calendar_bat))
 
     def exported(self, app_id: str) -> dict:
-        for item in self.read_distribution()["tools"]:
+        for item in self.read_settings()["tools"]:
             if item["app_id"] == app_id:
                 return item
         self.fail(f"{app_id} が書き出されていません")
@@ -359,7 +422,7 @@ class ExportTests(_Base):
     def test_区切りは斜線にする(self) -> None:
         """`\\` は JSON で2つ重ねる決まりがあり、手で直すと壊しやすい。"""
         tool_registry.export_distribution()
-        text = distribution.path().read_text(encoding="utf-8")
+        text = distribution.settings_path().read_text(encoding="utf-8")
         self.assertNotIn("\\\\", text)
 
     def test_相対にしない書き方も選べる(self) -> None:
@@ -367,11 +430,10 @@ class ExportTests(_Base):
         written = self.exported(NIPPOU)["start_command"]
         self.assertEqual(Path(written), self.nippou_bat)
         self.assertFalse(distribution.is_portable(written))
-        self.assertTrue(any(NIPPOU in e or "日報" in e
-                            for e in distribution.absolute_entries()))
+        self.assertTrue(any("日報" in e for e in distribution.absolute_entries()))
 
     def test_使わないツールも書き出す(self) -> None:
-        """［使う］を外したことも配る。配った先でも止まるように。"""
+        """［使う］を外したことも配る。配った先でも隠れるように。"""
         self.set_local(CALENDAR, enabled=False)
         tool_registry.export_distribution()
         self.assertIs(self.exported(CALENDAR)["enabled"], False)
@@ -385,44 +447,34 @@ class ExportTests(_Base):
         self.assertNotIn("health_url_override", item)
         self.assertEqual(set(item), set(distribution.EXPORT_FIELDS))
 
-    def test_いつどこで書き出したかを残す(self) -> None:
+    def test_いつどこで作ったかを残す(self) -> None:
         tool_registry.export_distribution()
-        data = self.read_distribution()
+        data = self.read_settings()
         self.assertTrue(data["generated_at"])
         self.assertIn("generated_on", data)
         self.assertEqual(data["launcher_version"], app_config.version())
-        self.assertIn("ツール:", distribution.describe())
+        self.assertIn("件", distribution.state_text())
 
-    def test_書き出した端末では読み込み直さない(self) -> None:
-        """自分の書き出しを読み込み直すと、入れたパスが書き換わり、
-        ログにも「反映しました」が出て紛らわしい。"""
-        before = tool_registry.get(NIPPOU).start_command
+    def test_作った端末の設定は変わらない(self) -> None:
+        before = tool_registry.all_tools(include_disabled=True)
         tool_registry.export_distribution()
-        with mock.patch.object(tool_registry, "log") as log:
-            tool_registry.initialize()      # 次の起動
-            after = tool_registry.get(NIPPOU).start_command
-        applied = [c for c in log.info.call_args_list
-                   if "配布設定を反映しました" in str(c)]
-        self.assertEqual(applied, [])
-        self.assertEqual(after, before)
-
-        self.set_local(NIPPOU, port=9999)
-        tool_registry.initialize()
-        self.assertEqual(tool_registry.get(NIPPOU).port, 9999)
+        tool_registry.initialize()          # 次の起動
+        self.assertEqual(
+            [(t.app_id, t.start_command, t.port, t.enabled)
+             for t in tool_registry.all_tools(include_disabled=True)],
+            [(t.app_id, t.start_command, t.port, t.enabled) for t in before])
 
 
 # ------------------------------------------------------------------
-# 読み込む (配った先の端末)
+# 起動時に読む (配った先の端末)
 # ------------------------------------------------------------------
-class ApplyTests(_Base):
-
-    def nippou(self, **fields) -> dict:
-        return {"app_id": NIPPOU, **fields}
+class LoadTests(_Base):
 
     def test_配った先で最初から設定済み(self) -> None:
-        self.write_distribution([
+        self.write_settings([
             self.nippou(display_name="日報(2ライン)", port=9001,
-                        start_command="../日報/start.bat", start_args=""),
+                        start_command="../日報/start.bat", start_args="",
+                        stop_method="stop_bat"),
             {"app_id": CALENDAR, "enabled": False},
         ])
         tool_registry.initialize()
@@ -431,152 +483,185 @@ class ApplyTests(_Base):
         self.assertEqual(tool.display_name, "日報(2ライン)")
         self.assertEqual(tool.port, 9001)
         self.assertEqual(tool.start_args, "")
+        self.assertEqual(tool.stop_method, "stop_bat")
         self.assertEqual(Path(tool.start_command), self.nippou_bat.resolve())
         self.assertTrue(tool.is_configured)
         self.assertFalse(tool_registry.get(CALENDAR).enabled)
 
-    def test_配布設定にしか無いツールも入る(self) -> None:
+    def test_配布先フォルダにしか無いツールも入る(self) -> None:
         self._make_bat("検査")
-        self.write_distribution([{
+        self.write_settings([{
             "app_id": "nlm.kensa-tool", "display_name": "検査",
             "order_no": 50, "port": 8800,
             "start_command": "../検査/start.bat"}])
         tool_registry.initialize()
         ids = [t.app_id for t in tool_registry.all_tools()]
-        self.assertIn("nlm.kensa-tool", ids)
         self.assertEqual(ids[-1], "nlm.kensa-tool")
         self.assertTrue(tool_registry.get("nlm.kensa-tool").is_configured)
 
-    def test_変わっていなければ端末で直した値を残す(self) -> None:
-        self.write_distribution([self.nippou(port=9001)])
+    def test_既存データが優先(self) -> None:
+        """すでに使っている端末に配布先フォルダを置いても、その端末の値は変わらない。"""
         tool_registry.initialize()
-        self.set_local(NIPPOU, port=9100)
+        self.set_local(NIPPOU, port=9100, display_name="日報(この端末)",
+                       start_command=str(self.nippou_bat), enabled=False)
+
+        self.write_settings([self.nippou(port=9001, display_name="日報(配布)",
+                                         start_command="../カレンダー/start.bat",
+                                         enabled=True)])
         tool_registry.initialize()          # 次の起動
-        tool_registry.initialize()          # その次
+
+        tool = tool_registry.get(NIPPOU)
+        self.assertEqual(tool.port, 9100)
+        self.assertEqual(tool.display_name, "日報(この端末)")
+        self.assertEqual(tool.start_command, str(self.nippou_bat))
+        self.assertFalse(tool.enabled)
+
+    def test_作り直して配っても既存データが優先(self) -> None:
+        self.write_settings([self.nippou(port=9001)])
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.get(NIPPOU).port, 9001)
+        self.set_local(NIPPOU, port=9100)
+
+        self.write_settings([self.nippou(port=9002)])
+        tool_registry.initialize()
         self.assertEqual(tool_registry.get(NIPPOU).port, 9100)
 
-    def test_配り直すと端末の値より優先する(self) -> None:
-        self.write_distribution([self.nippou(port=9001)])
+    def test_すでに使っている端末にも新しいツールは入る(self) -> None:
+        """既存データに無いものは「まだデータが無い」。優先とぶつからない。"""
         tool_registry.initialize()
-        self.set_local(NIPPOU, port=9100)
-
-        self.write_distribution([self.nippou(port=9002)])
+        self._make_bat("検査")
+        self.write_settings([{"app_id": "nlm.kensa-tool", "display_name": "検査",
+                              "port": 8800, "start_command": "../検査/start.bat"}])
         tool_registry.initialize()
-        self.assertEqual(tool_registry.get(NIPPOU).port, 9002)
+        self.assertTrue(tool_registry.get("nlm.kensa-tool").is_configured)
 
-    def test_書かれていない項目には触らない(self) -> None:
+    def test_空欄の起動ファイルは埋まる(self) -> None:
         tool_registry.initialize()
-        self.set_local(NIPPOU, start_args="--local", start_command=str(self.nippou_bat))
-        self.write_distribution([self.nippou(port=9001)])
+        self.assertEqual(tool_registry.get(NIPPOU).start_command, "")
+        self.write_settings([self.nippou(start_command="../日報/start.bat")])
         tool_registry.initialize()
+        self.assertTrue(tool_registry.get(NIPPOU).is_configured)
 
-        tool = tool_registry.get(NIPPOU)
-        self.assertEqual(tool.port, 9001)
-        self.assertEqual(tool.start_args, "--local")
-        self.assertEqual(tool.start_command, str(self.nippou_bat))
-
-    def test_無い起動ファイルで端末の値を潰さない(self) -> None:
-        """配った先で置き場所が違っても、その端末で直した値を残す。"""
-        tool_registry.initialize()
-        self.set_local(NIPPOU, start_command=str(self.nippou_bat))
-        self.write_distribution([self.nippou(start_command="../無い/start.bat",
-                                             port=9001)])
-        tool_registry.initialize()
-
-        tool = tool_registry.get(NIPPOU)
-        self.assertEqual(tool.start_command, str(self.nippou_bat))
-        self.assertEqual(tool.port, 9001)       # ほかの項目は入る
-
-    def test_あとからツールを置けば空欄は埋まる(self) -> None:
-        self.write_distribution([{
+    def test_無い起動ファイルは入れない_あとで置けば埋まる(self) -> None:
+        self.write_settings([{
             "app_id": "nlm.kensa-tool", "display_name": "検査", "port": 8800,
             "start_command": "../検査/start.bat"}])
         tool_registry.initialize()
-        self.assertFalse(tool_registry.get("nlm.kensa-tool").is_configured)
+        self.assertEqual(tool_registry.get("nlm.kensa-tool").start_command, "")
 
         self._make_bat("検査")                   # あとから置いた
         tool_registry.initialize()
         self.assertTrue(tool_registry.get("nlm.kensa-tool").is_configured)
 
-    def test_消したツールは配り直すまで戻らない(self) -> None:
-        self.write_distribution([self.nippou(port=9001)])
+    def test_その端末で消したツールは戻らない(self) -> None:
+        self.write_settings([self.nippou(port=9001)])
         tool_registry.initialize()
         tool_registry.delete_tool(NIPPOU)
         tool_registry.initialize()
         self.assertIsNone(tool_registry.get(NIPPOU))
 
-        self.write_distribution([self.nippou(port=9002)])
+        self.write_settings([self.nippou(port=9002)])     # 作り直して配っても
         tool_registry.initialize()
-        self.assertEqual(tool_registry.get(NIPPOU).port, 9002)
-
-    def test_配布設定に無いツールには触らない(self) -> None:
-        tool_registry.initialize()
-        self.set_local(CALENDAR, port=9300, enabled=False)
-        self.write_distribution([self.nippou(port=9001)])
-        tool_registry.initialize()
-        tool = tool_registry.get(CALENDAR)
-        self.assertEqual((tool.port, tool.enabled), (9300, False))
+        self.assertIsNone(tool_registry.get(NIPPOU))
 
     def test_形の合わない値は飛ばす(self) -> None:
-        """1項目の誤りで、そのツールの設定がまるごと壊れないように。"""
-        tool_registry.initialize()
-        before = tool_registry.get(NIPPOU)
-        self.write_distribution([
-            self.nippou(port="abc", enabled="yes", stop_method="kill",
-                        order_no=True, display_name="", health_path=3,
-                        repository="vba-daily-report-python-migration2"),
-            {"app_id": "空白 のID", "display_name": "x"},
-            {"display_name": "IDなし"},
+        """1項目の誤りで起動が止まったり、ツールの設定が壊れたりしない。"""
+        self.write_settings([
+            {"app_id": "nlm.kensa-tool", "display_name": "", "port": "abc",
+             "enabled": "yes", "stop_method": "kill", "order_no": True,
+             "health_path": 3, "repository": "vba-kensa"},
         ])
-        tool_registry.initialize()
+        tool_registry.initialize()          # 例外にならない
 
-        tool = tool_registry.get(NIPPOU)
-        self.assertEqual(tool.port, before.port)
-        self.assertEqual(tool.enabled, before.enabled)
-        self.assertEqual(tool.stop_method, before.stop_method)
-        self.assertEqual(tool.order_no, before.order_no)
-        self.assertEqual(tool.display_name, before.display_name)
-        self.assertEqual(tool.health_path, before.health_path)
-        self.assertEqual(tool.repository, "vba-daily-report-python-migration2")
+        tool = tool_registry.get("nlm.kensa-tool")
+        self.assertEqual(tool.display_name, "nlm.kensa-tool")
+        self.assertEqual(tool.port, 0)
+        self.assertTrue(tool.enabled)
+        self.assertEqual(tool.stop_method, "auto")
+        self.assertEqual(tool.order_no, 0)
+        self.assertEqual(tool.health_path, tool_registry.DEFAULT_HEALTH_PATH)
+        self.assertEqual(tool.repository, "vba-kensa")
+
+    def test_使えないアプリIDは読まない(self) -> None:
+        self.write_settings([{"app_id": "空白 のID", "display_name": "x"},
+                             {"display_name": "IDなし"}, "文字だけ"])
+        tool_registry.initialize()
         self.assertIsNone(tool_registry.get("空白 のID"))
+        self.assertEqual(len(distribution.rejected()), 3)
+        self.assertIn("[注意]", distribution.describe())
 
-    def test_パスワードを変えただけでは読み込み直さない(self) -> None:
-        self.write_distribution([self.nippou(port=9001)])
-        tool_registry.initialize()
-        self.set_local(NIPPOU, port=9100)
-        distribution.set_password("abcd")
-        tool_registry.initialize()
-        self.assertEqual(tool_registry.get(NIPPOU).port, 9100)
-
-    def test_パスワードだけの配布設定では何も変えない(self) -> None:
-        tool_registry.initialize()
-        self.set_local(NIPPOU, port=9100)
-        distribution.set_password("abcd")
-        tool_registry.initialize()
-        self.assertEqual(tool_registry.get(NIPPOU).port, 9100)
-
-    def test_診断で配布設定の起動ファイルが見つからないことを出す(self) -> None:
-        self.write_distribution([self.nippou(start_command="../無い/start.bat")])
+    def test_診断で配布先フォルダの起動ファイルが見つからないことを出す(self) -> None:
+        self.write_settings([self.nippou(start_command="../無い/start.bat")])
         text = tool_registry.describe()
         self.assertIn("../無い/start.bat", text)
         self.assertIn("見つかりません", text)
 
 
 # ------------------------------------------------------------------
-# 通しで: 1台で整えて書き出し → フォルダーごと別の場所へ → 別の端末
+# 明示的に置き換える (その端末の［設定］から)
+# ------------------------------------------------------------------
+class ReloadTests(_Base):
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_settings([self.nippou(port=9001, display_name="日報(配布)",
+                                         start_command="../日報/start.bat")])
+        tool_registry.initialize()
+
+    def test_置き換えると配布先フォルダの値になる(self) -> None:
+        self.set_local(NIPPOU, port=9100, display_name="日報(この端末)")
+        replaced = tool_registry.reload_from_distribution()
+        self.assertEqual(replaced, [NIPPOU])
+        tool = tool_registry.get(NIPPOU)
+        self.assertEqual((tool.port, tool.display_name), (9001, "日報(配布)"))
+
+    def test_消したツールも戻る(self) -> None:
+        tool_registry.delete_tool(NIPPOU)
+        tool_registry.reload_from_distribution()
+        self.assertEqual(tool_registry.get(NIPPOU).port, 9001)
+
+    def test_配布先フォルダに無いツールには触らない(self) -> None:
+        self.set_local(CALENDAR, port=9300, enabled=False)
+        tool_registry.reload_from_distribution()
+        tool = tool_registry.get(CALENDAR)
+        self.assertEqual((tool.port, tool.enabled), (9300, False))
+
+    def test_書かれていない項目には触らない(self) -> None:
+        self.set_local(NIPPOU, start_args="--local")
+        tool_registry.reload_from_distribution()
+        self.assertEqual(tool_registry.get(NIPPOU).start_args, "--local")
+
+    def test_無い起動ファイルで端末の値を潰さない(self) -> None:
+        self.write_settings([self.nippou(start_command="../無い/start.bat",
+                                         port=9002)])
+        tool_registry.reload_from_distribution()
+        tool = tool_registry.get(NIPPOU)
+        self.assertEqual(Path(tool.start_command), self.nippou_bat.resolve())
+        self.assertEqual(tool.port, 9002)       # ほかの項目は入る
+
+    def test_配布先フォルダが無ければ何もしない(self) -> None:
+        shutil.rmtree(distribution.folder())
+        self.set_local(NIPPOU, port=9100)
+        self.assertEqual(tool_registry.reload_from_distribution(), [])
+        self.assertEqual(tool_registry.get(NIPPOU).port, 9100)
+
+
+# ------------------------------------------------------------------
+# 通しで: 1台で整えて作る → フォルダーごと別の場所へ → 別の端末
 # ------------------------------------------------------------------
 class RoundTripTests(_Base):
 
     def setUp(self) -> None:
         super().setUp()
-        # 配布設定は本来の場所 (ランチャーのフォルダー) に置く。
+        # 配布先フォルダは本来の場所 (ランチャーのフォルダーの中) に置く。
         # フォルダーごと運ばれることを確かめたい
-        patcher = mock.patch.object(distribution, "path", REAL_DISTRIBUTION_PATH)
+        patcher = mock.patch.object(distribution, "folder",
+                                    REAL_DISTRIBUTION_FOLDER)
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def test_配った先で同じ設定とパスワードになる(self) -> None:
-        # --- 管理者の端末 ---
+        # --- 配布元の端末: 一度起動して［設定］で整え、配布先フォルダを作る ---
         self.assertTrue(admin_lock.unlock(*_pair(_Script("line-01", "line-01"))))
         tool_registry.initialize()
         tool_registry.set_start_command(NIPPOU, str(self.nippou_bat))
@@ -584,6 +669,8 @@ class RoundTripTests(_Base):
         self.set_local(NIPPOU, port=9001, display_name="日報(2ライン)")
         self.set_local(CALENDAR, enabled=False)
         tool_registry.export_distribution()
+        self.assertTrue((self.launcher_root / "distribution"
+                         / "settings.json").exists())
 
         # --- フォルダーごと別の場所 (別のドライブ名・別のフォルダー名) へ ---
         elsewhere = self.work_root / "別の端末" / "D_tools"
@@ -612,6 +699,7 @@ class RoundTripTests(_Base):
             self.assertTrue(admin_lock.unlock(script.ask, script.tell))
             self.assertEqual(len(script.asked), 1)
 
-
-def _pair(script: _Script):
-    return script.ask, script.tell
+            # その端末で直した値は、次の起動でも残る (既存データが優先)
+            self.set_local(NIPPOU, port=9500)
+            tool_registry.initialize()
+            self.assertEqual(tool_registry.get(NIPPOU).port, 9500)

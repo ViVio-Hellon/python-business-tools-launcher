@@ -19,9 +19,9 @@ if str(ROOT) not in sys.path:
 
 from launcher import app_config, distribution  # noqa: E402
 
-# 本来の置き場所 (ランチャーのフォルダーの `config/`)。フォルダーごと
-# 運ぶ試験ではこちらに戻す
-REAL_DISTRIBUTION_PATH = distribution.path
+# 本来の置き場所 (ランチャーのフォルダーの中)。フォルダーごと運ぶ
+# 試験ではこちらに戻す
+REAL_DISTRIBUTION_FOLDER = distribution.folder
 
 
 class LocalAreaTestCase(unittest.TestCase):
@@ -38,12 +38,12 @@ class LocalAreaTestCase(unittest.TestCase):
         os.environ[app_config.LOCAL_DIR_ENV] = str(self.local_root)
         app_config.ensure_local_dirs()
 
-        # 配布設定も一時フォルダーへ。開発機で書き出した配布設定
-        # (`config/distribution.json`) が試験に混ざらないように
-        self.distribution_path = (Path(self._tmp.name) / "app" / "config"
-                                  / distribution.FILE_NAME)
-        patcher = mock.patch.object(distribution, "path",
-                                    lambda: self.distribution_path)
+        # 配布先フォルダも一時フォルダーへ。開発機で作った配布先フォルダ
+        # (`distribution/`) が試験に混ざらないように
+        self.distribution_folder = (Path(self._tmp.name) / "app"
+                                    / distribution.FOLDER_NAME)
+        patcher = mock.patch.object(distribution, "folder",
+                                    lambda: self.distribution_folder)
         patcher.start()
         self.addCleanup(patcher.stop)
 

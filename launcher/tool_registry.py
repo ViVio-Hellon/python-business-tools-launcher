@@ -4,12 +4,12 @@
 コードに埋め込まない。設定画面から変更でき、その値がSQLiteに残る
 (要件定義書 §13.3「コードを書き換えず、設定変更だけで対応できること」)。
 
-    config/launcher.json      同梱の既定値。初回の投入だけに使う
-    config/distribution.json  配布設定。**中身が変わったときだけ**上書きする
-            ↓ 起動時
+    config/launcher.json   製品の既定値
+    distribution/          配布先フォルダ (あれば読む)
+            ↓ 起動時。**その端末にまだ無いものだけ**入れる
     %LOCALAPPDATA%\\BusinessToolsLauncher\\data\\launcher.db
             ↑ 設定画面
-    ここが動作中の唯一の参照先
+    ここが動作中の唯一の参照先。**すでにあるデータが優先**
 
 新しいツールが5個目・6個目と増えても、行を足すだけで済む形にする
 (要件定義書 §14「将来5個目、6個目のツールを追加しやすい構造」)。
@@ -234,7 +234,7 @@ def validate_start_command(path: str) -> str:
 
 
 def resolve_config_path(text: str) -> str:
-    """配布設定 (`config/launcher.json`) に書かれたパスを、この端末の絶対パスにする。
+    """配布先フォルダ・既定値に書かれたパスを、この端末の絶対パスにする。
 
     **ランチャーのフォルダーを起点にした相対パスを許す。** 配布では
     ランチャーと業務ツールを1つのフォルダーにまとめてコピーすることが
@@ -247,7 +247,7 @@ def resolve_config_path(text: str) -> str:
         └─ 日報\\start.bat  ← `..\\日報\\start.bat` で指せる
 
     設定画面で入力するパスは絶対パスのまま (相対パスは起動した場所で
-    指す先が変わるため)。**起点が決まっている配布設定だけ**の扱い。
+    指す先が変わるため)。**起点が決まっている配布先フォルダ・既定値だけ**の扱い。
 
     `%USERPROFILE%` などの環境変数も展開する。
     """
@@ -321,7 +321,6 @@ def initialize() -> None:
         _add_missing_columns(conn)
         _migrate(conn)
         _seed_missing(conn)
-        _apply_distribution(conn)
         _fill_blank_paths(conn)
 
 
@@ -389,12 +388,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def _seed_missing(conn: sqlite3.Connection) -> None:
-    """既定値と配布設定のうち、**まだ入れていないものだけ**入れる。
+    """既定値と配布先フォルダのうち、**その端末にまだ無いツールだけ**入れる。
 
-    これで、配布物に5個目を書き足せば、すでに使っている端末にも次の
-    起動で入る。**すでにある行には触らない** ── 利用者が設定した
-    `start.bat` のパスを上書きしない (配布設定の上書きは
-    `_apply_distribution` が中身の変わったときだけ行う)。
+    **すでにある行には触らない** ── その端末の既存データが優先
+    (利用者が設定した起動ファイルや表示名を上書きしない)。配布先
+    フォルダに5個目を足して配れば、すでに使っている端末にも入る。
+
+    一度入れたアプリIDは `seeded_tools` に記録する。その端末で
+    消したツールが、次の起動で復活しないように。
 
     **起動ファイルは、この端末に実在するときだけ入れる。** もっともらしい
     パスを入れると「設定したつもりで別の場所を指している」状態を作る。
@@ -404,124 +405,36 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
     seeded = {row["app_id"] for row in conn.execute(
         "SELECT app_id FROM seeded_tools")}
 
+    for app_id in distribution.rejected():
+        log.warning("配布先フォルダのアプリIDが使えないので飛ばします: %s", app_id)
+
     added = []
     for item in distribution.merged_tools():
         app_id = str(item.get("app_id", "")).strip()
-        if not app_id or app_id in seeded:
+        if validate_app_id(app_id) or app_id in seeded:
             continue
-        conn.execute(
-            """INSERT OR IGNORE INTO tools
-               (app_id, display_name, order_no, repository, start_command,
-                start_args, port, health_path, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (app_id,
-             str(item.get("display_name", app_id)),
-             int(item.get("order_no", 0)),
-             str(item.get("repository", "")),
-             _configured_start_command(item),
-             str(item.get("start_args", "")),
-             int(item.get("port", 0)),
-             str(item.get("health_path", DEFAULT_HEALTH_PATH)),
-             now))
-        conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
-                     "VALUES(?, ?)", (app_id, now))
-        added.append(app_id)
-
-    if added:
-        log.info("既定のツール定義を投入しました: %s", "、".join(added))
-
-
-def _configured_start_command(item: dict) -> str:
-    """配布設定の起動ファイル。**この端末に実在するときだけ**返す。
-
-    実在しないパスを入れてしまうと、空欄が「間違った値」に変わる。
-    そうなると次の起動で埋め直せず (空欄ではないので)、手で直すしか
-    なくなる。実在しなければ空のままにしておけば、あとからツールを
-    置いたときに次の起動で自動的に埋まる。
-    """
-    resolved = resolve_config_path(str(item.get("start_command", "")))
-    if not resolved:
-        return ""
-    return resolved if Path(resolved).is_file() else ""
-
-
-def _fill_blank_paths(conn: sqlite3.Connection) -> None:
-    """配布設定に起動ファイルがあれば、**空欄だけ**埋める。
-
-    起動のたびに見る。すでに使っている端末でも、配布設定を更新すれば
-    次の起動で入る。**利用者が設定画面で入れた値には触らない** ──
-    空欄でなければ、それがその端末の正しい値。
-    """
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    filled = []
-    for item in distribution.merged_tools():
-        app_id = str(item.get("app_id", "")).strip()
-        path = _configured_start_command(item)
-        if not app_id or not path:
-            continue
+        values = _tool_values(item)
         cursor = conn.execute(
-            """UPDATE tools SET start_command = ?, updated_at = ?
-               WHERE app_id = ? AND start_command = ''""",
-            (path, now, app_id))
-        if cursor.rowcount:
-            filled.append(app_id)
-    if filled:
-        log.info("配布設定から起動ファイルを埋めました: %s", "、".join(filled))
-
-
-# 最後に反映した配布設定の指紋。`schema_meta` に置く
-DISTRIBUTION_HASH_KEY = "distribution_hash"
-
-
-def _apply_distribution(conn: sqlite3.Connection) -> None:
-    """配布設定の**中身が変わっていたら**、書かれている項目で上書きする。
-
-    変わっていなければ何もしない。だから、
-
-      * 配布し直せば、全端末に次の起動で届く (その端末で直した値より勝つ)
-      * そのあと端末で直した値は、次に配布し直すまで残る
-
-    その端末で消したツールも、配布し直せば戻る ── 配った人が
-    「この一式で使う」と決め直した、と受け取る。配布設定に**無い**
-    ツールには触らない。止めたいツールは［使う］を外して書き出す。
-
-    **起動ファイルは、この端末に実在するときだけ**入れる。実在しない
-    パスでその端末の正しい値を潰さない。
-    """
-    current = distribution.tools_hash()
-    if not current or current == _applied_distribution_hash(conn):
-        return
-
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    applied = []
-    for app_id in distribution.rejected():
-        log.warning("配布設定のアプリIDが使えないので飛ばします: %s", app_id)
-    for item in distribution.tools():
-        app_id = item["app_id"]
-        values = _distribution_values(item)
-        conn.execute(
             """INSERT OR IGNORE INTO tools (app_id, display_name, updated_at)
                VALUES (?, ?, ?)""",
             (app_id, str(values.get("display_name") or app_id), now))
-        if values:
-            columns = ", ".join(f"{name} = ?" for name in values)
-            conn.execute(
-                f"UPDATE tools SET {columns}, updated_at = ? WHERE app_id = ?",
-                (*values.values(), now, app_id))
+        if cursor.rowcount and values:
+            _update_row(conn, app_id, values, now)
         conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
                      "VALUES(?, ?)", (app_id, now))
-        applied.append(app_id)
+        if cursor.rowcount:
+            added.append(app_id)
 
-    _record_distribution_hash(conn, current)
-    log.info("配布設定を反映しました (%d件): %s", len(applied),
-             distribution.path())
+    if added:
+        log.info("ツール定義を投入しました: %s", "、".join(added))
 
 
-def _distribution_values(item: dict) -> dict:
-    """配布設定の1件から、上書きしてよい項目だけを取り出す。
+def _tool_values(item: dict) -> dict:
+    """既定値・配布先フォルダの1件から、入れてよい項目だけを取り出す。
 
     **書かれていない項目には触らない。** 形の合わない値も飛ばす ──
-    1項目の誤りで、そのツールの設定がまるごと壊れないようにする。
+    1項目の誤り (ポートに文字、など) で、起動が止まったり、そのツールの
+    設定がまるごと壊れたりしないようにする。
     """
     values: dict = {}
     for name in ("display_name", "repository", "start_args", "health_path"):
@@ -548,29 +461,93 @@ def _distribution_values(item: dict) -> dict:
     return values
 
 
-def _applied_distribution_hash(conn: sqlite3.Connection) -> str:
-    row = conn.execute("SELECT value FROM schema_meta WHERE key = ?",
-                       (DISTRIBUTION_HASH_KEY,)).fetchone()
-    return row["value"] if row else ""
+def _update_row(conn: sqlite3.Connection, app_id: str, values: dict,
+                now: str) -> None:
+    columns = ", ".join(f"{name} = ?" for name in values)
+    conn.execute(f"UPDATE tools SET {columns}, updated_at = ? WHERE app_id = ?",
+                 (*values.values(), now, app_id))
 
 
-def _record_distribution_hash(conn: sqlite3.Connection, value: str) -> None:
-    conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES(?, ?)",
-                 (DISTRIBUTION_HASH_KEY, value))
+def _configured_start_command(item: dict) -> str:
+    """配布先フォルダの起動ファイル。**この端末に実在するときだけ**返す。
 
-
-def export_distribution(*, relative: bool = True) -> Path:
-    """この端末の設定を配布設定として書き出す。
-
-    書き出した中身は**この端末ではもう反映済み**として記録する。
-    記録しないと、次の起動で自分の書き出した値を読み込み直すことになり、
-    ログに「反映しました」が出て紛らわしい。
+    実在しないパスを入れてしまうと、空欄が「間違った値」に変わる。
+    そうなると次の起動で埋め直せず (空欄ではないので)、手で直すしか
+    なくなる。実在しなければ空のままにしておけば、あとからツールを
+    置いたときに次の起動で自動的に埋まる。
     """
-    target = distribution.export_tools(all_tools(include_disabled=True),
-                                       relative=relative)
+    resolved = resolve_config_path(str(item.get("start_command", "")))
+    if not resolved:
+        return ""
+    return resolved if Path(resolved).is_file() else ""
+
+
+def _fill_blank_paths(conn: sqlite3.Connection) -> None:
+    """配布先フォルダに起動ファイルがあれば、**空欄だけ**埋める。
+
+    起動のたびに見る。空欄は「まだデータが無い」なので、既存データ優先の
+    決まりとぶつからない。**利用者が設定画面で入れた値には触らない** ──
+    空欄でなければ、それがその端末の正しい値。
+    """
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    filled = []
+    for item in distribution.merged_tools():
+        app_id = str(item.get("app_id", "")).strip()
+        path = _configured_start_command(item)
+        if not app_id or not path:
+            continue
+        cursor = conn.execute(
+            """UPDATE tools SET start_command = ?, updated_at = ?
+               WHERE app_id = ? AND start_command = ''""",
+            (path, now, app_id))
+        if cursor.rowcount:
+            filled.append(app_id)
+    if filled:
+        log.info("配布先フォルダから起動ファイルを埋めました: %s", "、".join(filled))
+
+
+# ------------------------------------------------------------------
+# 配布先フォルダ
+# ------------------------------------------------------------------
+def export_distribution(*, relative: bool = True) -> Path:
+    """この端末の設定から配布先フォルダを作る (作り直す)。"""
+    return distribution.export_tools(all_tools(include_disabled=True),
+                                     relative=relative)
+
+
+def reload_from_distribution() -> list[str]:
+    """**この端末の設定を、配布先フォルダの内容で置き換える。**
+
+    ふだんは既存のデータが優先で、配布先フォルダを作り直しても、すでに
+    使っている端末の値は変わらない。変えたい端末で、利用者が［設定］から
+    明示的に呼ぶ。
+
+    * 配布先フォルダに書かれている項目だけ置き換える
+    * その端末で消したツールも、配布先フォルダにあれば戻す
+    * 配布先フォルダに**無い**ツールには触らない
+    * 起動ファイルは**この端末に実在するときだけ**置き換える
+
+    戻り値は置き換えたアプリID。
+    """
+    initialize()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    replaced = []
     with _connect() as conn:
-        _record_distribution_hash(conn, distribution.tools_hash())
-    return target
+        for item in distribution.tools():
+            app_id = item["app_id"]
+            values = _tool_values(item)
+            conn.execute(
+                """INSERT OR IGNORE INTO tools (app_id, display_name, updated_at)
+                   VALUES (?, ?, ?)""",
+                (app_id, str(values.get("display_name") or app_id), now))
+            if values:
+                _update_row(conn, app_id, values, now)
+            conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
+                         "VALUES(?, ?)", (app_id, now))
+            replaced.append(app_id)
+    log.info("配布先フォルダの内容で置き換えました (%d件): %s",
+             len(replaced), "、".join(replaced))
+    return replaced
 
 
 def _row_to_tool(row: sqlite3.Row) -> Tool:
@@ -870,9 +847,9 @@ def describe() -> str:
         lines.append(f"         起動: {tool.start_command or '(未設定)'}")
         want = planned.get(tool.app_id, "")
         if want and not tool.is_configured:
-            # **配布設定はあるのに入っていない。** 配置が想定と違う
+            # **配布先フォルダにはあるのに入っていない。** 配置が想定と違う
             resolved = resolve_config_path(want)
-            lines.append(f"         配布設定: {want}")
-            lines.append(f"                 → {resolved} (見つかりません)")
+            lines.append(f"         配布先フォルダ: {want}")
+            lines.append(f"                       → {resolved} (見つかりません)")
         lines.append(f"         確認: {tool.health_url or '(ポート未設定)'}")
     return "\n".join(lines)

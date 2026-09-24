@@ -1,31 +1,36 @@
-"""配布設定 (`config/distribution.json`)
+"""配布先フォルダ (`distribution/`)
 
 **ランチャーのフォルダーと一緒に運ばれる設定。** 端末ごとの設定
 (`%LOCALAPPDATA%` の設定DB) はフォルダーをコピーしても移らないので、
 配った先でも最初から設定済みにしたいものはここに置く。
 
-    config/launcher.json      製品の既定値。ランチャーを更新すると入れ替わる
-    config/distribution.json  現場の設定。**ランチャーを更新しても残す**
-    %LOCALAPPDATA%\\...\\launcher.db  その端末の設定
+    ランチャー/
+    ├─ config/launcher.json   製品の既定値。ランチャーを更新すると入れ替わる
+    └─ distribution/          配布先フォルダ。**ランチャーを更新しても残す**
+       ├─ settings.json       ツールの設定 (起動ファイルは相対パス)
+       ├─ password.json       ［設定］を開く管理者パスワードの照合値
+       └─ README.txt          このフォルダーの説明 (人が読む用)
 
-分けてあるのは、ランチャーを新しい版へ入れ替えたときに、現場で作った
-設定まで消えないようにするため。
+    %LOCALAPPDATA%\\...\\launcher.db   その端末の設定 (動作中の参照先)
 
 【作り方】
-手で書かない。JSON はコメントを許さず、`\\` を2つ重ねる決まりもあって、
-1文字の誤りで設定全体が読めなくなる。1台を［設定］で整えてから
-「この端末の設定を配布設定として書き出す」で作る (`export_tools`)。
+1台を［設定］で整えてから「配布先フォルダを作る」(`export_tools`)。
+手で書かない ── JSON はコメントを許さず、`\\` を2つ重ねる決まりもあって、
+1文字の誤りで設定全体が読めなくなる。
 
 【読み込み方】
-内容が変わったときだけ端末の設定へ反映する (`tool_registry` が見る)。
-配布し直せば全端末に届き、そのあと端末で直した値は次の配布まで残る。
+起動時にフォルダーがあれば読む (`tool_registry` が見る)。**その端末に
+すでにあるデータが優先。** 配布先フォルダから入るのは、その端末に
+まだ無いツールと、空欄の起動ファイルだけ。配布先フォルダの内容で
+置き換えたいときは、その端末の［設定］から明示的に行う。
 
 【パスワード】
-［設定］画面を開くためのパスワードもここに置く。全端末で共通になる。
+設定とは別のファイルに置く。作り直してもパスワードは変わらず、
+パスワードを忘れたときは `password.json` だけ消せば決め直せる。
 
-**これは誤操作を防ぐための鍵で、守りの固い鍵ではない。** このファイル
-を消すか書き換えられる人なら外せる。ライン作業者が起動ファイルを
-うっかり変えてしまう、を防ぐのが目的。
+**これは誤操作を防ぐための鍵で、守りの固い鍵ではない。** このフォルダー
+を書き換えられる人なら外せる。ライン作業者が起動ファイルをうっかり
+変えてしまう、を防ぐのが目的。
 """
 from __future__ import annotations
 
@@ -46,7 +51,10 @@ from .logging_utils import get_logger
 log = get_logger("distribution")
 
 FORMAT = 1
-FILE_NAME = "distribution.json"
+FOLDER_NAME = "distribution"
+SETTINGS_FILE = "settings.json"
+PASSWORD_FILE = "password.json"
+README_FILE = "README.txt"
 
 # パスワードの寄せ方。標準ライブラリだけで使える、ゆっくりした計算にする。
 # 1回あたり 0.1〜0.5 秒ほどで、画面で打つぶんには気にならないが、
@@ -61,40 +69,54 @@ MIN_PASSWORD_LENGTH = 4
 REPLACE_ATTEMPTS = 5
 REPLACE_WAIT_SEC = 0.2
 
-# 配布設定に書き出す項目。**端末ごとに違うべきもの (作業ディレクトリの
-# 上書き、起動確認URLの差し替え) は入れない**
+# 配布先フォルダに書き出す項目。**端末ごとに違うべきもの (作業
+# ディレクトリの上書き、起動確認URLの差し替え) は入れない**
 EXPORT_FIELDS = ("app_id", "display_name", "order_no", "repository",
                  "start_command", "start_args", "port", "health_path",
                  "stop_method", "enabled")
 
 
-def path() -> Path:
-    return app_config.APP_ROOT / "config" / FILE_NAME
+def folder() -> Path:
+    """配布先フォルダ。ランチャーのフォルダーの中に置く (一緒に運ばれる)。"""
+    return app_config.APP_ROOT / FOLDER_NAME
+
+
+def settings_path() -> Path:
+    return folder() / SETTINGS_FILE
+
+
+def password_path() -> Path:
+    return folder() / PASSWORD_FILE
+
+
+def exists() -> bool:
+    return folder().is_dir()
 
 
 # ------------------------------------------------------------------
 # 読む
 # ------------------------------------------------------------------
-def load() -> tuple[Optional[dict], str]:
-    """配布設定を読む。`(中身, 問題)`。
-
-    無ければ `(None, "")` ── 配布設定が無いのは普通のこと。
-    壊れていれば `(None, 理由)`。**起動は止めない。**
-    """
-    target = path()
+def _read_json(target: Path, what: str) -> tuple[Optional[dict], str]:
+    """`(中身, 問題)`。無ければ `(None, "")`、壊れていれば `(None, 理由)`。"""
     try:
-        raw = target.read_text(encoding="utf-8")
+        # メモ帳で保存し直すと BOM が付くことがある。それでも読めるように
+        raw = target.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None, ""
     except OSError as exc:
-        return None, f"配布設定を読めません ({target}): {exc}"
+        return None, f"{what}を読めません ({target}): {exc}"
     try:
         data = json.loads(raw)
     except ValueError as exc:
-        return None, f"配布設定が壊れています ({target}): {exc}"
+        return None, f"{what}が壊れています ({target}): {exc}"
     if not isinstance(data, dict):
-        return None, f"配布設定の形が違います ({target})"
+        return None, f"{what}の形が違います ({target})"
     return data, ""
+
+
+def load() -> tuple[Optional[dict], str]:
+    """配布先フォルダのツール設定を読む。**壊れていても起動は止めない。**"""
+    return _read_json(settings_path(), "配布先フォルダの設定")
 
 
 def _raw_items() -> list:
@@ -116,7 +138,7 @@ def _usable(item: Any) -> bool:
 
 
 def tools() -> list[dict[str, Any]]:
-    """配布設定のツール一覧 (使えるものだけ)。無ければ空。"""
+    """配布先フォルダのツール一覧 (使えるものだけ)。無ければ空。"""
     return [dict(item, app_id=str(item["app_id"]).strip())
             for item in _raw_items() if _usable(item)]
 
@@ -128,10 +150,13 @@ def rejected() -> list[str]:
 
 
 def merged_tools() -> list[dict[str, Any]]:
-    """製品の既定値に、配布設定を重ねた一覧。
+    """製品の既定値に、配布先フォルダの設定を重ねた一覧。
 
-    同じアプリIDなら**配布設定の項目が勝つ** (書かれている項目だけ)。
-    配布設定にしか無いツール (5個目以降) は後ろに足す。
+    同じアプリIDなら**配布先フォルダの項目が勝つ** (書かれている項目だけ)。
+    配布先フォルダにしか無いツール (5個目以降) は後ろに足す。
+
+    これは「その端末にまだ無いツール」を入れるときの元になる。
+    **その端末にすでにあるツールには使わない** (既存のデータが優先)。
     """
     merged: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -141,7 +166,7 @@ def merged_tools() -> list[dict[str, Any]]:
             merged[app_id] = dict(item)
             order.append(app_id)
     for item in tools():
-        app_id = str(item["app_id"]).strip()
+        app_id = item["app_id"]
         if app_id in merged:
             merged[app_id].update(item)
         else:
@@ -150,35 +175,18 @@ def merged_tools() -> list[dict[str, Any]]:
     return [merged[app_id] for app_id in order]
 
 
-def tools_hash(data: Optional[dict] = None) -> str:
-    """ツール設定の指紋。**変わったときだけ反映する**ための印。
-
-    パスワードや書き出し日時は含めない。パスワードを変えただけで全端末の
-    ツール設定が上書きし直されるのは困る。
-    """
-    if data is None:
-        data, _ = load()
-    items = (data or {}).get("tools") or []
-    if not items:
-        return ""                     # パスワードだけの配布設定
-    text = json.dumps(items, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 # ------------------------------------------------------------------
 # 書く
 # ------------------------------------------------------------------
-def _write(data: dict) -> Path:
+def _write(target: Path, text: str) -> Path:
     """丸ごと書き直す。**書きかけの状態を残さない。**
 
     途中で落ちると壊れた JSON が残り、配った先で読めなくなる。
     別名に書いてから差し替える (差し替えは一瞬で済む)。
     """
-    target = path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                         encoding="utf-8")
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
     try:
         for attempt in range(REPLACE_ATTEMPTS):
             try:
@@ -200,13 +208,12 @@ def _write(data: dict) -> Path:
     return target
 
 
-def _current_or_new() -> dict:
-    data, problem = load()
-    if problem:
-        # 壊れたものの上に書くと、残っていたパスワードまで消える。
-        # **黙って上書きしない**
-        raise ValueError(problem)
-    return data or {"format": FORMAT}
+def _write_json(target: Path, data: dict) -> Path:
+    return _write(target, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+# 置き場所をそのまま書いたパス (`C:/...`、`/...`、`//server/...`)
+_ABSOLUTE = re.compile(r"^([A-Za-z]:|[/\\])")
 
 
 def to_relative(start_command: str) -> str:
@@ -228,10 +235,6 @@ def to_relative(start_command: str) -> str:
     return relative.replace("\\", "/")
 
 
-# 置き場所をそのまま書いたパス (`C:/...`、`/...`、`//server/...`)
-_ABSOLUTE = re.compile(r"^([A-Za-z]:|[/\\])")
-
-
 def is_portable(start_command: str) -> bool:
     """ランチャーのフォルダーを起点にした書き方か。"""
     text = (start_command or "").strip()
@@ -239,7 +242,7 @@ def is_portable(start_command: str) -> bool:
 
 
 def absolute_entries() -> list[str]:
-    """配布設定のうち、置き場所をそのまま書いたツール。
+    """配布先フォルダのうち、置き場所をそのまま書いたツール。
 
     相対にできなかった (別のドライブにある) ものを知らせるのに使う。
     配る先でも**まったく同じ場所**に置かないと見つからない。
@@ -252,12 +255,11 @@ def absolute_entries() -> list[str]:
 
 
 def export_tools(registry_tools, *, relative: bool = True) -> Path:
-    """端末の設定を配布設定として書き出す。
+    """端末の設定から配布先フォルダを作る (作り直す)。
 
-    **パスワードは残す。** 書き出すたびに消えると、配った先の鍵が
-    外れてしまう。
+    **パスワードには触らない** (別のファイル)。作り直すたびに鍵が
+    外れると、配った先で誰でも開けてしまう。
     """
-    data = _current_or_new()
     items = []
     for tool in registry_tools:
         item = {
@@ -275,13 +277,16 @@ def export_tools(registry_tools, *, relative: bool = True) -> Path:
         }
         items.append({k: item[k] for k in EXPORT_FIELDS})
 
-    data["format"] = FORMAT
-    data["tools"] = items
-    data["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    data["generated_on"] = _computer_name()
-    data["launcher_version"] = app_config.version()
-    target = _write(data)
-    log.info("配布設定を書き出しました: %s (%d件)", target, len(items))
+    data = {
+        "format": FORMAT,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_on": _computer_name(),
+        "launcher_version": app_config.version(),
+        "tools": items,
+    }
+    target = _write_json(settings_path(), data)
+    _write_readme()
+    log.info("配布先フォルダを作りました: %s (%d件)", folder(), len(items))
     return target
 
 
@@ -289,12 +294,48 @@ def _computer_name() -> str:
     return os.environ.get("COMPUTERNAME") or platform.node() or ""
 
 
+_README = """\
+このフォルダーは「配布先フォルダ」です。
+
+業務ツール統合ランチャーが起動するときに読み込み、配った先の端末でも
+最初からツールの設定が入った状態にします。
+
+  settings.json   ツールの設定 (起動ファイルはランチャーのフォルダーからの相対パス)
+  password.json   ［設定］を開くための管理者パスワードの照合値
+
+・手で書き換えないでください。ランチャーの［設定］→「配布先フォルダを作る」で
+  作り直せます。
+・その端末にすでにある設定が優先されます。このフォルダーから入るのは、
+  その端末にまだ無いツールと、空欄の起動ファイルだけです。
+  このフォルダーの内容で置き換えたいときは、その端末で
+  ［設定］→「配布先フォルダの内容で置き換える」を押してください。
+・ランチャーを新しい版に入れ替えるときも、このフォルダーは残してください。
+・管理者パスワードを忘れたときは password.json を消してください。
+  次に［設定］を開いたときに決め直せます (ツールの設定は消えません)。
+"""
+
+
+def _write_readme() -> None:
+    """人が読む説明。メモ帳で文字化けしないよう BOM 付き UTF-8・CRLF。"""
+    try:
+        target = folder() / README_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_README.replace("\n", "\r\n"), encoding="utf-8-sig",
+                          newline="")
+    except OSError:
+        log.warning("配布先フォルダの説明を書けませんでした", exc_info=True)
+
+
 # ------------------------------------------------------------------
 # パスワード
 # ------------------------------------------------------------------
+def load_password() -> tuple[Optional[dict], str]:
+    """パスワードの照合値を読む。無ければ `(None, "")`。"""
+    return _read_json(password_path(), "管理者パスワードのファイル")
+
+
 def has_password() -> bool:
-    data, _ = load()
-    record = (data or {}).get("password")
+    record, _ = load_password()
     return isinstance(record, dict) and bool(record.get("hash"))
 
 
@@ -308,27 +349,27 @@ def validate_new_password(text: str) -> str:
 
 
 def set_password(text: str) -> Path:
-    """パスワードを決める (変える)。**ツール設定には触らない。**"""
+    """パスワードを決める (変える)。**ツールの設定には触らない。**"""
     problem = validate_new_password(text)
     if problem:
         raise ValueError(problem)
-    data = _current_or_new()
     salt = secrets.token_bytes(16)
-    data["password"] = {
+    record = {
+        "format": FORMAT,
         "algorithm": ALGORITHM,
         "iterations": ITERATIONS,
         "salt": salt.hex(),
         "hash": _derive(text, salt, ITERATIONS).hex(),
     }
-    target = _write(data)
+    target = _write_json(password_path(), record)
+    _write_readme()
     log.info("管理者パスワードを設定しました: %s", target)
     return target
 
 
 def verify_password(text: str) -> bool:
     """合っているか。**パスワードが無ければ常に偽。**"""
-    data, _ = load()
-    record = (data or {}).get("password")
+    record, _ = load_password()
     if not isinstance(record, dict) or record.get("algorithm") != ALGORITHM:
         return False
     try:
@@ -347,24 +388,47 @@ def _derive(text: str, salt: bytes, iterations: int) -> bytes:
 
 
 # ------------------------------------------------------------------
-# 診断
+# 様子
 # ------------------------------------------------------------------
-def describe() -> str:
-    """`start_debug.bat --check` に出す1枚。"""
+def state_text() -> str:
+    """［設定］に出す1行。"""
     data, problem = load()
-    lines = [f"配布設定      : {path()}"]
     if problem:
-        lines.append(f"  [エラー] {problem}")
-        return "\n".join(lines)
-    if data is None:
-        lines.append("  なし (端末ごとの設定だけで動きます)")
-        lines.append("  パスワード: なし")
-        return "\n".join(lines)
-
-    items = data.get("tools") or []
+        return "設定を読めません (起動時の案内を見てください)"
+    if data is None or not tools():
+        return "まだ作っていません"
     made = data.get("generated_at", "")
     where = data.get("generated_on", "")
-    lines.append(f"  ツール: {len(items)}件"
-                 + (f" / {made} に {where} で書き出し" if made else ""))
-    lines.append(f"  パスワード: {'あり' if has_password() else 'なし'}")
+    text = f"{len(tools())}件"
+    if made:
+        text += f" / {made}" + (f" に {where} で作成" if where else "")
+    return text
+
+
+def describe() -> str:
+    """`start_debug.bat --check` に出す1枚。"""
+    lines = [f"配布先フォルダ: {folder()}"]
+    if not exists():
+        lines.append("  なし (端末ごとの設定だけで動きます)")
+        return "\n".join(lines)
+
+    data, problem = load()
+    if problem:
+        lines.append(f"  [エラー] {problem}")
+    elif data is None:
+        lines.append("  設定: なし")
+    else:
+        made = data.get("generated_at", "")
+        where = data.get("generated_on", "")
+        lines.append(f"  設定: ツール {len(tools())}件"
+                     + (f" / {made} に {where} で作成" if made else ""))
+        for app_id in rejected():
+            lines.append(f"  [注意] アプリIDが使えないので読みません: {app_id}")
+
+    _, broken = load_password()
+    if broken:
+        lines.append(f"  [エラー] {broken}")
+    else:
+        lines.append(f"  パスワード: {'あり' if has_password() else 'なし'}")
+    lines.append("  その端末にすでにある設定が優先されます")
     return "\n".join(lines)

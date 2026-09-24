@@ -372,8 +372,8 @@ class DistributionTests(LocalAreaTestCase):
     **設定はランチャーのフォルダーと一緒に移動しない。** 各PCの
     `%LOCALAPPDATA%` にあるので、設定済みのフォルダーをコピーしても
     向こうでは全部「未設定」から始まる。既定値に書いておけば、配った
-    先でも最初から埋まる (ふだんは画面から書き出す配布設定
-    `config/distribution.json` を使う。`test_distribution` を参照)。
+    先でも最初から埋まる (ふだんは画面から作る配布先フォルダ
+    `distribution/` を使う。`test_distribution` を参照)。
     """
 
     def setUp(self) -> None:
@@ -392,14 +392,14 @@ class DistributionTests(LocalAreaTestCase):
         self.addCleanup(patcher.stop)
 
     def configure(self, app_id: str, path: str) -> None:
-        """配布設定の既存ツールに起動ファイルを書いたことにする。"""
+        """既定値の既存ツールに起動ファイルを書いたことにする。"""
         for item in app_config.load()["tools"]:
             if item["app_id"] == app_id:
                 original = item.get("start_command")
                 item["start_command"] = path
                 self.addCleanup(self._restore, item, original)
                 return
-        self.fail(f"{app_id} が配布設定にありません")
+        self.fail(f"{app_id} が既定値にありません")
 
     @staticmethod
     def _restore(item, original) -> None:
@@ -413,7 +413,7 @@ class DistributionTests(LocalAreaTestCase):
         resolved = tool_registry.resolve_config_path(r"..\日報\start.bat".replace("\\", os.sep))
         self.assertEqual(Path(resolved), self.start_bat.resolve())
 
-    def test_配布設定で最初から埋まる(self) -> None:
+    def test_既定値の起動ファイルで最初から埋まる(self) -> None:
         self.configure("nlm.nippou-tool", os.path.join("..", "日報", "start.bat"))
         tool_registry.initialize()
 
@@ -422,7 +422,7 @@ class DistributionTests(LocalAreaTestCase):
         self.assertTrue(tool.is_configured, "配った先で未設定のままです")
 
     def test_使っている端末でも空欄なら埋まる(self) -> None:
-        """配布設定をあとから更新しても届くこと。"""
+        """既定値をあとから更新しても、空欄なら届くこと。"""
         tool_registry.initialize()
         self.assertEqual(tool_registry.get("nlm.nippou-tool").start_command, "")
 
@@ -483,11 +483,11 @@ class DistributionTests(LocalAreaTestCase):
                          self.start_bat.resolve())
 
     def test_見つからないときは診断に出す(self) -> None:
-        """配布設定があるのに入っていない = 配置が想定と違う。"""
+        """既定値にあるのに入っていない = 配置が想定と違う。"""
         self.configure("nlm.nippou-tool", os.path.join("..", "無い", "start.bat"))
         tool_registry.initialize()
         text = tool_registry.describe()
-        self.assertIn("配布設定", text)
+        self.assertIn("配布先フォルダ:", text)
         self.assertIn("見つかりません", text)
 
 
