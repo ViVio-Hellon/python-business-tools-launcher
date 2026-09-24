@@ -388,7 +388,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def _seed_missing(conn: sqlite3.Connection) -> None:
-    """既定値と配布先フォルダのうち、**その端末にまだ無いツールだけ**入れる。
+    """既定値・配布先フォルダから、**その端末にまだ無いものだけ**入れる。
 
     **すでにある行には触らない** ── その端末の既存データが優先
     (利用者が設定した起動ファイルや表示名を上書きしない)。配布先
@@ -397,6 +397,13 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
     一度入れたアプリIDは `seeded_tools` に記録する。その端末で
     消したツールが、次の起動で復活しないように。
 
+    **工場出荷のままの行は「まだデータが無い」とみなす**
+    (`_untouched_default_rows`)。配布先フォルダを置く前に一度起動した
+    だけの端末でも、配布先フォルダがあれば:
+
+    * その行を配布先フォルダの値にそろえる
+    * 配布先フォルダに無ければ消す (配布元で消したツールが残らない)
+
     **起動ファイルは、この端末に実在するときだけ入れる。** もっともらしい
     パスを入れると「設定したつもりで別の場所を指している」状態を作る。
     空にしておけば、設定画面が「未設定」と出す。
@@ -404,29 +411,84 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     seeded = {row["app_id"] for row in conn.execute(
         "SELECT app_id FROM seeded_tools")}
+    from_distribution = bool(distribution.tools())
+    untouched = _untouched_default_rows(conn)
 
     for app_id in distribution.rejected():
         log.warning("配布先フォルダのアプリIDが使えないので飛ばします: %s", app_id)
 
-    added = []
+    added, aligned, removed = [], [], []
+    wanted = set()
     for item in distribution.merged_tools():
         app_id = str(item.get("app_id", "")).strip()
-        if validate_app_id(app_id) or app_id in seeded:
+        if validate_app_id(app_id):
             continue
+        wanted.add(app_id)
         values = _tool_values(item)
-        cursor = conn.execute(
-            """INSERT OR IGNORE INTO tools (app_id, display_name, updated_at)
-               VALUES (?, ?, ?)""",
-            (app_id, str(values.get("display_name") or app_id), now))
-        if cursor.rowcount and values:
-            _update_row(conn, app_id, values, now)
+        exists = conn.execute("SELECT 1 FROM tools WHERE app_id = ?",
+                              (app_id,)).fetchone()
+        if exists is None:
+            if app_id in seeded:
+                continue                        # その端末で消した
+            conn.execute(
+                """INSERT INTO tools (app_id, display_name, updated_at)
+                   VALUES (?, ?, ?)""",
+                (app_id, str(values.get("display_name") or app_id), now))
+            if values:
+                _update_row(conn, app_id, values, now)
+            added.append(app_id)
+        elif from_distribution and app_id in untouched:
+            row = untouched[app_id]
+            if any(row[name] != value for name, value in values.items()):
+                _update_row(conn, app_id, values, now)
+                aligned.append(app_id)
         conn.execute("INSERT OR IGNORE INTO seeded_tools(app_id, seeded_at) "
                      "VALUES(?, ?)", (app_id, now))
-        if cursor.rowcount:
-            added.append(app_id)
+
+    if from_distribution:
+        for app_id in untouched:
+            if app_id not in wanted:
+                conn.execute("DELETE FROM tools WHERE app_id = ?", (app_id,))
+                removed.append(app_id)
 
     if added:
         log.info("ツール定義を投入しました: %s", "、".join(added))
+    if aligned:
+        log.info("工場出荷のままのツールを配布先フォルダにそろえました: %s",
+                 "、".join(aligned))
+    if removed:
+        log.info("配布先フォルダに無い、工場出荷のままのツールを外しました: %s",
+                 "、".join(removed))
+
+
+# 利用者が［設定］で変えられる項目。工場出荷のままかを見るのに使う
+_EDITABLE_FIELDS = ("display_name", "start_args", "port", "stop_method",
+                    "enabled")
+
+
+def _untouched_default_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    """**工場出荷のまま**の行。アプリIDごと。
+
+    製品の既定値 (`config/launcher.json`) から入って、起動ファイルが空で、
+    ［設定］で変えられる項目が既定値のままのもの。**人が何も入れて
+    いない**ので、配布先フォルダにそろえても失うものが無い。
+
+    どこか1つでも変えてあれば既存データとして扱う (触らない)。
+    ［＋ ツールを追加］で足したツールは既定値に無いので、これにも入らない。
+    """
+    defaults = {str(item.get("app_id", "")).strip(): item
+                for item in app_config.default_tools()}
+    found: dict[str, sqlite3.Row] = {}
+    for row in conn.execute("SELECT * FROM tools"):
+        item = defaults.get(row["app_id"])
+        if (item is None or row["start_command"] or row["work_dir"]
+                or row["health_url_override"]):
+            continue
+        expected = {"display_name": row["app_id"], "start_args": "", "port": 0,
+                    "stop_method": "auto", "enabled": 1, **_tool_values(item)}
+        if all(row[name] == expected[name] for name in _EDITABLE_FIELDS):
+            found[row["app_id"]] = row
+    return found
 
 
 def _tool_values(item: dict) -> dict:

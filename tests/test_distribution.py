@@ -18,10 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _isolation import REAL_DISTRIBUTION_FOLDER, LocalAreaTestCase  # noqa: E402
 
-from launcher import admin_lock, app_config, distribution, tool_registry  # noqa: E402
+from app_manager import ToolManager  # noqa: E402
+from launcher import admin_lock, app_config, distribution, health, tool_registry  # noqa: E402
 
 NIPPOU = "nlm.nippou-tool"
 CALENDAR = "nlm.line-calendar"
+KANBAN = "nlm.kanban-system"
+PACKAGING = "nlm.packaging-tool"
+DEFAULT_IDS = [NIPPOU, CALENDAR, KANBAN, PACKAGING]
 
 # 本番の計算回数。試験では軽くするので、差し替える前に控えておく
 PRODUCTION_ITERATIONS = distribution.ITERATIONS
@@ -419,6 +423,23 @@ class ExportTests(_Base):
         self.assertTrue(distribution.is_portable("../日報/start.bat"))
         self.assertEqual(distribution.absolute_entries(), [])
 
+    def test_別名の道から選んでも相対パスで書く(self) -> None:
+        """ネットワークドライブ (Z:) やジャンクション越しに選んだ起動ファイル。
+
+        ランチャーの場所は実体で持つので、選んだ道が別名のままだと
+        「別のドライブ」と取り違えて相対にできない。ここではシンボリック
+        リンクで同じ形を作る。
+        """
+        alias = self.work_root / "別名"
+        try:
+            alias.symlink_to(self.parent, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("シンボリックリンクを作れない環境です")
+        tool_registry.set_start_command(NIPPOU, str(alias / "日報" / "start.bat"))
+        tool_registry.export_distribution()
+        self.assertEqual(self.exported(NIPPOU)["start_command"],
+                         "../日報/start.bat")
+
     def test_区切りは斜線にする(self) -> None:
         """`\\` は JSON で2つ重ねる決まりがあり、手で直すと壊しやすい。"""
         tool_registry.export_distribution()
@@ -590,6 +611,88 @@ class LoadTests(_Base):
         self.assertEqual(len(distribution.rejected()), 3)
         self.assertIn("[注意]", distribution.describe())
 
+    def ids(self) -> list[str]:
+        return [t.app_id for t in tool_registry.all_tools(include_disabled=True)]
+
+    def test_配布元で消したツールは配った先に出ない(self) -> None:
+        """配布先フォルダがあれば、その一覧が正。製品の既定値を混ぜない。"""
+        self.write_settings([self.nippou(order_no=10),
+                             {"app_id": CALENDAR, "order_no": 20}])
+        tool_registry.initialize()
+        self.assertEqual(self.ids(), [NIPPOU, CALENDAR])
+
+    def test_一度起動したあとで配布先フォルダを置いてもそろう(self) -> None:
+        """配布先フォルダを置く前に起動しただけの端末は「まだデータが無い」。"""
+        tool_registry.initialize()                  # 工場出荷のまま
+        self.assertEqual(self.ids(), DEFAULT_IDS)
+
+        self.write_settings([
+            self.nippou(display_name="日報(2ライン)", port=9001,
+                        start_command="../日報/start.bat", order_no=10),
+            {"app_id": CALENDAR, "enabled": False, "order_no": 20},
+        ])
+        tool_registry.initialize()                  # 次の起動
+
+        self.assertEqual(self.ids(), [NIPPOU, CALENDAR])
+        tool = tool_registry.get(NIPPOU)
+        self.assertEqual((tool.display_name, tool.port), ("日報(2ライン)", 9001))
+        self.assertTrue(tool.is_configured)
+        self.assertFalse(tool_registry.get(CALENDAR).enabled)
+
+    def test_そろえるのは最初の1回だけ(self) -> None:
+        """そろえたあとは既存データ。作り直して配っても変わらない。"""
+        tool_registry.initialize()
+        self.write_settings([self.nippou(port=9001,
+                                         start_command="../日報/start.bat")])
+        tool_registry.initialize()
+        self.write_settings([self.nippou(port=9002,
+                                         start_command="../日報/start.bat")])
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.get(NIPPOU).port, 9001)
+
+    def test_手を入れた行はそろえない(self) -> None:
+        """起動ファイルが空でも、表示名などを変えてあれば既存データ。"""
+        tool_registry.initialize()
+        self.set_local(NIPPOU, display_name="日報(この端末)")
+        self.set_local(KANBAN, port=9999)
+        self.write_settings([self.nippou(display_name="日報(配布)", port=9001)])
+        tool_registry.initialize()
+
+        tool = tool_registry.get(NIPPOU)
+        self.assertEqual((tool.display_name, tool.port), ("日報(この端末)", 8733))
+        # 配布先フォルダに無くても、手を入れた行は消さない
+        self.assertEqual(tool_registry.get(KANBAN).port, 9999)
+
+    def test_自分で足したツールは消さない(self) -> None:
+        tool_registry.initialize()
+        tool_registry.add_tool(tool_registry.Tool(
+            app_id="site.own-tool", display_name="自作", port=8900))
+        self.write_settings([self.nippou(port=9001)])
+        tool_registry.initialize()
+        self.assertIsNotNone(tool_registry.get("site.own-tool"))
+
+    def test_配布先フォルダが設定を持たなければ既定値のまま(self) -> None:
+        """パスワードだけ・壊れている・空のときは、既定値の行を消さない。"""
+        for label, prepare in (
+                ("パスワードだけ", lambda: distribution.set_password("abcd")),
+                ("壊れている", lambda: distribution.settings_path()
+                 .write_text("{broken", encoding="utf-8")),
+                ("空", lambda: self.write_settings([]))):
+            with self.subTest(label):
+                tool_registry.initialize()
+                distribution.folder().mkdir(parents=True, exist_ok=True)
+                prepare()
+                tool_registry.initialize()
+                self.assertEqual(self.ids(), DEFAULT_IDS)
+
+    def test_同じアプリIDが2度あれば1つにまとめる(self) -> None:
+        self.write_settings([self.nippou(port=9001),
+                             self.nippou(display_name="日報(後)")])
+        self.assertEqual(len(distribution.tools()), 1)
+        tool_registry.initialize()
+        tool = tool_registry.get(NIPPOU)
+        self.assertEqual((tool.port, tool.display_name), (9001, "日報(後)"))
+
     def test_診断で配布先フォルダの起動ファイルが見つからないことを出す(self) -> None:
         self.write_settings([self.nippou(start_command="../無い/start.bat")])
         text = tool_registry.describe()
@@ -621,7 +724,8 @@ class ReloadTests(_Base):
         self.assertEqual(tool_registry.get(NIPPOU).port, 9001)
 
     def test_配布先フォルダに無いツールには触らない(self) -> None:
-        self.set_local(CALENDAR, port=9300, enabled=False)
+        tool_registry.save(tool_registry.Tool(
+            app_id=CALENDAR, display_name="カレンダー", port=9300, enabled=False))
         tool_registry.reload_from_distribution()
         tool = tool_registry.get(CALENDAR)
         self.assertEqual((tool.port, tool.enabled), (9300, False))
@@ -703,3 +807,85 @@ class RoundTripTests(_Base):
             self.set_local(NIPPOU, port=9500)
             tool_registry.initialize()
             self.assertEqual(tool_registry.get(NIPPOU).port, 9500)
+
+
+# ------------------------------------------------------------------
+# 通しで、実際に起動まで: 配布元で整える → フォルダーごと別の場所へ →
+# まっさらな端末で、引き継いだ設定のままツールが起動する
+# ------------------------------------------------------------------
+from _fake_tool_support import free_port, make_tool_dir  # noqa: E402
+from test_app_manager import ManagerTestCase  # noqa: E402
+
+
+class InheritAndStartTests(ManagerTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(distribution, "ITERATIONS", 1000)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.parent = self.work_root / "業務ツール"
+        self.launcher_root = self.parent / "ランチャー"
+        self.launcher_root.mkdir(parents=True)
+        patcher = mock.patch.object(app_config, "APP_ROOT", self.launcher_root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # 配布先フォルダは本来の場所 (ランチャーのフォルダーの中) に置く
+        patcher = mock.patch.object(distribution, "folder",
+                                    REAL_DISTRIBUTION_FOLDER)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_まっさらな端末で引き継いだ設定のまま起動できる(self) -> None:
+        # --- 配布元の端末: 一度起動して［設定］で整える ---
+        port = free_port()
+        tool_dir = make_tool_dir(self.parent, app_id=NIPPOU, port=port,
+                                 display_name="日報")
+        self.assertTrue(admin_lock.unlock(
+            *_pair(_Script("line-01", "line-01"))))
+        tool_registry.save(tool_registry.Tool(
+            app_id=NIPPOU, display_name="日報(2ライン)", port=port,
+            start_command=str(tool_dir / "start.bat"),
+            start_args="--no-browser", order_no=10))
+        for app_id in (CALENDAR, KANBAN, PACKAGING):
+            tool_registry.delete_tool(app_id)       # この現場では日報だけ
+        tool_registry.export_distribution()
+
+        # --- フォルダーごと別の場所へ ---
+        elsewhere = self.work_root / "別の端末" / "D_tools"
+        shutil.copytree(self.parent, elsewhere)
+
+        # --- 配った先の端末: 設定DBはまっさら ---
+        other_local = self.local_root.parent / "other-local"
+        with mock.patch.dict(os.environ,
+                             {app_config.LOCAL_DIR_ENV: str(other_local)}), \
+                mock.patch.object(app_config, "APP_ROOT",
+                                  elsewhere / "ランチャー"):
+            app_config.ensure_local_dirs()
+            self.assertFalse(app_config.settings_db_path().exists())
+            tool_registry.initialize()
+
+            tools = tool_registry.all_tools(include_disabled=True)
+            self.assertEqual([t.app_id for t in tools], [NIPPOU])
+            tool = tools[0]
+            self.assertEqual(tool.display_name, "日報(2ライン)")
+            self.assertEqual(Path(tool.start_command),
+                             (elsewhere / NIPPOU / "start.bat").resolve())
+
+            # 引き継いだ設定のまま、実際に起動する
+            self.manager = ToolManager(on_status=self.statuses.append)
+            try:
+                self.start(tool)
+                running = self.manager.current
+                self.assertIsNotNone(running, self.statuses[-1:])
+                self.assertEqual(running.app_id, NIPPOU)
+                self.assertEqual(running.port, port)
+                self.assertTrue(health.is_tool(health.probe(running.health_url), NIPPOU))
+            finally:
+                self._stop_everything()
+
+            # ［設定］は同じパスワードで開く
+            script = _Script("line-01")
+            self.assertTrue(admin_lock.unlock(script.ask, script.tell))
+            self.assertEqual(len(script.asked), 1)

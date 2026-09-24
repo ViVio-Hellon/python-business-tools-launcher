@@ -19,10 +19,17 @@
 1文字の誤りで設定全体が読めなくなる。
 
 【読み込み方】
-起動時にフォルダーがあれば読む (`tool_registry` が見る)。**その端末に
-すでにあるデータが優先。** 配布先フォルダから入るのは、その端末に
-まだ無いツールと、空欄の起動ファイルだけ。配布先フォルダの内容で
-置き換えたいときは、その端末の［設定］から明示的に行う。
+起動時にフォルダーがあれば読む (`tool_registry` が見る)。
+
+* 配布先フォルダがあれば、**そのツール一覧が正**。製品の既定値の一覧は
+  混ぜない (配布元で消したツールが、配った先に出てこないように)
+* **その端末にすでにあるデータが優先。** 入るのは、その端末にまだ無い
+  ツールと空欄の起動ファイルだけ
+* ただし**工場出荷のまま** (起動ファイルが空で、既定値から何も変えて
+  いない) の行は「まだデータが無い」とみなし、配布先フォルダにそろえる。
+  配布先フォルダを置く前に一度起動しただけの端末も、きれいに引き継げる
+* 手を入れた端末を配布先フォルダにそろえたいときは、その端末の［設定］
+  から明示的に置き換える
 
 【パスワード】
 設定とは別のファイルに置く。作り直してもパスワードは変わらず、
@@ -138,9 +145,17 @@ def _usable(item: Any) -> bool:
 
 
 def tools() -> list[dict[str, Any]]:
-    """配布先フォルダのツール一覧 (使えるものだけ)。無ければ空。"""
-    return [dict(item, app_id=str(item["app_id"]).strip())
-            for item in _raw_items() if _usable(item)]
+    """配布先フォルダのツール一覧 (使えるものだけ)。無ければ空。
+
+    同じアプリIDが2度あれば1つにまとめる (後に書かれた項目が勝つ)。
+    画面から作れば重ならないが、手で直したときの取りこぼしに備える。
+    """
+    unique: dict[str, dict[str, Any]] = {}
+    for item in _raw_items():
+        if _usable(item):
+            app_id = str(item["app_id"]).strip()
+            unique.setdefault(app_id, {}).update(item, app_id=app_id)
+    return list(unique.values())
 
 
 def rejected() -> list[str]:
@@ -150,29 +165,23 @@ def rejected() -> list[str]:
 
 
 def merged_tools() -> list[dict[str, Any]]:
-    """製品の既定値に、配布先フォルダの設定を重ねた一覧。
+    """その端末へ入れるツールの元になる一覧。
 
-    同じアプリIDなら**配布先フォルダの項目が勝つ** (書かれている項目だけ)。
-    配布先フォルダにしか無いツール (5個目以降) は後ろに足す。
+    * 配布先フォルダにツールがあれば、**その一覧だけ**。製品の既定値の
+      一覧は混ぜない ── 混ぜると、配布元で消したツールが配った先に
+      「未設定」で出てくる。同じアプリIDの既定値は、配布先フォルダに
+      書かれていない項目を補うのにだけ使う
+    * 無ければ (壊れている・空も含む) 製品の既定値
 
-    これは「その端末にまだ無いツール」を入れるときの元になる。
     **その端末にすでにあるツールには使わない** (既存のデータが優先)。
     """
-    merged: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for item in app_config.default_tools():
-        app_id = str(item.get("app_id", "")).strip()
-        if app_id:
-            merged[app_id] = dict(item)
-            order.append(app_id)
-    for item in tools():
-        app_id = item["app_id"]
-        if app_id in merged:
-            merged[app_id].update(item)
-        else:
-            merged[app_id] = dict(item)
-            order.append(app_id)
-    return [merged[app_id] for app_id in order]
+    defaults = {str(item.get("app_id", "")).strip(): dict(item)
+                for item in app_config.default_tools()
+                if str(item.get("app_id", "")).strip()}
+    listed = tools()
+    if not listed:
+        return list(defaults.values())
+    return [{**defaults.get(item["app_id"], {}), **item} for item in listed]
 
 
 # ------------------------------------------------------------------
@@ -228,10 +237,16 @@ def to_relative(start_command: str) -> str:
     text = (start_command or "").strip().strip('"')
     if not text:
         return ""
+    # **両方とも実体の場所にそろえてから比べる。** ランチャーの場所は
+    # 実体で持っている (`Path.resolve()`)。ネットワークドライブ (Z:) は
+    # `\\server\share` に、ジャンクションは本当の場所に置き換わるので、
+    # 選んだ起動ファイルが `Z:/...` のままだと「別のドライブ」と誤って
+    # 相対にできない
     try:
-        relative = os.path.relpath(text, str(app_config.APP_ROOT))
+        relative = os.path.relpath(os.path.realpath(text),
+                                   os.path.realpath(str(app_config.APP_ROOT)))
     except ValueError:
-        return text.replace("\\", "/")        # 別ドライブ
+        return text.replace("\\", "/")        # 本当に別のドライブ
     return relative.replace("\\", "/")
 
 
@@ -305,9 +320,13 @@ _README = """\
 
 ・手で書き換えないでください。ランチャーの［設定］→「配布先フォルダを作る」で
   作り直せます。
+・このフォルダーがあれば、ツールの一覧はこのフォルダーのとおりになります
+  (配布元で消したツールは、配った先にも出ません)。
 ・その端末にすでにある設定が優先されます。このフォルダーから入るのは、
   その端末にまだ無いツールと、空欄の起動ファイルだけです。
-  このフォルダーの内容で置き換えたいときは、その端末で
+  ただし、まだ何も設定していない端末 (工場出荷のまま) は、
+  このフォルダーのとおりにそろえます。
+  設定済みの端末をこのフォルダーの内容で置き換えたいときは、その端末で
   ［設定］→「配布先フォルダの内容で置き換える」を押してください。
 ・ランチャーを新しい版に入れ替えるときも、このフォルダーは残してください。
 ・管理者パスワードを忘れたときは password.json を消してください。
