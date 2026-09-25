@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 HEADLESS_MODULES = ("process_manager", "launch_guard", "app_manager",
                     "launcher.tool_registry", "launcher.health",
                     "launcher.app_config", "launcher.runtime_state",
-                    "launcher.distribution", "launcher.admin_lock")
+                    "launcher.distribution", "launcher.admin_lock",
+                    "launcher.startup_progress")
 
 
 class HeadlessImportTests(unittest.TestCase):

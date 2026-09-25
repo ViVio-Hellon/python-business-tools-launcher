@@ -22,6 +22,7 @@ from .. import app_config, tool_registry
 from ..logging_utils import get_logger
 from . import geometry, password, theme
 from .geometry import POSITION_KEY
+from .progress_window import ProgressWindow
 from .settings_dialog import SettingsDialog
 from .version_dialog import VersionDialog
 
@@ -55,6 +56,9 @@ class LauncherBar:
         manager.set_status_callback(self.queue.put)
 
         self.root = tk.Tk()
+        # 起動・切り替えの進み具合は別の窓に出す。バーの1行だけでは、
+        # ツールが立ち上がるまでの数十秒が「何も起きていない」ように見える
+        self.progress = ProgressWindow(self.root)
         # **タスクバーと Alt+Tab に版を出す。** バーのバッジは画面を
         # 見ている人にしか届かないが、タイトルは窓の一覧にも出るので、
         # 「どれが動いているか」を離れた場所からも確かめられる
@@ -552,6 +556,9 @@ class LauncherBar:
         try:
             while True:
                 status = self.queue.get_nowait()
+                # 進み具合の窓には**1つずつ**渡す。最後の1つだけだと、
+                # 途中の段 (前の画面を閉じる、など) が抜ける
+                self.progress.update(status)
         except queue.Empty:
             pass
         if status is not None:

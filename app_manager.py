@@ -69,6 +69,15 @@ class State(str, Enum):
     ERROR = "error"              # 起動できませんでした
 
 
+# 起動・切り替えのどの段にいるか。**進み具合の窓** (`startup_progress`)
+# が、どこまで済んだかを描くのに使う
+PHASE_CLOSE_BROWSER = "close_browser"    # 前のツールの画面を閉じる
+PHASE_STOP_TOOL = "stop_tool"            # 前のツールを終了する
+PHASE_SPAWN = "spawn"                    # 起動ファイルを実行する
+PHASE_WAIT = "wait"                      # 起動の完了を待つ (/api/health)
+PHASE_OPEN_BROWSER = "open_browser"      # 画面を開く
+
+
 @dataclass
 class Status:
     """画面に渡す1枚。**画面はこれだけを見て描く**。"""
@@ -93,6 +102,15 @@ class Status:
     # 動いているツールの版 (`/api/health` が返した値)。
     # どの版が動いているかを、起動のたびにログへ残すために持つ
     tool_version: str = ""
+    # 起動・切り替えのどの段か (`PHASE_*`)。忙しくないときは空
+    phase: str = ""
+    # 切り替えで**次に起動する**ツールの表示名。前のツールを止めて
+    # いるあいだも、何のために待っているのかを出せるように
+    target_name: str = ""
+    # ツールが `/api/health` で返した準備の段階 (「アプリを準備中」など)
+    stage: str = ""
+    # 起動を待つ上限 (秒)。経過と並べて出す
+    timeout: float = 0.0
 
     @property
     def busy(self) -> bool:
@@ -130,6 +148,8 @@ class ToolManager:
         # ボタンを素早く2回押すと、どちらの要求も「まだ何も動いていない」
         # と見て、両方が `start.bat` を実行してしまう
         self._starting: Optional[str] = None
+        # 切り替えで次に起こすツールの表示名。前を止めているあいだに出す
+        self._switch_target = ""
 
     # --------------------------------------------------------------
     # 状態
@@ -162,7 +182,9 @@ class ToolManager:
     def _set(self, state: State, message: str, tool: Optional[Tool] = None,
              *, detail: str = "", elapsed: float = 0.0,
              responding: bool = False,
-             browser_open: Optional[bool] = None) -> None:
+             browser_open: Optional[bool] = None,
+             phase: str = "", target_name: str = "", stage: str = "",
+             timeout: float = 0.0) -> None:
         if browser_open is None:
             browser_open = (self._current is not None
                             and process_manager.is_browser_open(self._current))
@@ -176,7 +198,8 @@ class ToolManager:
                                 if self._current else "")),
             message=message, detail=detail, elapsed=elapsed,
             responding=responding, browser_open=browser_open,
-            browser_managed=managed))
+            browser_managed=managed, phase=phase, target_name=target_name,
+            stage=stage, timeout=timeout))
 
     # --------------------------------------------------------------
     # 起動していたものを引き継ぐ
@@ -282,8 +305,13 @@ class ToolManager:
 
         # --- 別のツールが動いている (要件定義書 §8) ---
         if self._current is not None:
-            if not self._stop_current(generation):
-                return                        # 止められなかった。理由は出してある
+            # 止めているあいだも「何を起動するために待っているか」を出す
+            self._switch_target = tool.display_name
+            try:
+                if not self._stop_current(generation):
+                    return                    # 止められなかった。理由は出してある
+            finally:
+                self._switch_target = ""
             if self._superseded(generation):
                 return
 
@@ -310,20 +338,27 @@ class ToolManager:
             return True
 
         name = running.display_name or running.app_id
+        target = self._switch_target
         # 画面を閉じることから始まるので、そう伝える (要件定義書 §8.2)
         if running.browser_managed and process_manager.is_browser_open(running):
-            self._set(State.STOPPING, f"{name}の画面を閉じています...")
+            self._set(State.STOPPING, f"{name}の画面を閉じています...",
+                      phase=PHASE_CLOSE_BROWSER, target_name=target)
         else:
-            self._set(State.STOPPING, f"{name}を終了しています...")
+            self._set(State.STOPPING, f"{name}を終了しています...",
+                      phase=PHASE_STOP_TOOL, target_name=target)
+
+        def on_backend() -> None:
+            self._set(State.STOPPING, f"{name}を終了しています...",
+                      phase=PHASE_STOP_TOOL, target_name=target)
 
         # `process_manager.stop` が中で画面を先に閉じてから
         # バックエンドを止める (要件定義書 §8.3 の処理順序)
         result = process_manager.stop(
             running, force=force,
-            timeout=float(app_config.ui_setting("stop_timeout_seconds")))
+            timeout=float(app_config.ui_setting("stop_timeout_seconds")),
+            on_backend=on_backend)
         if result.browser_closed:
             browser.forget(running.browser_pid)
-            self._set(State.STOPPING, f"{name}を終了しています...")
 
         if result.busy:
             # 実行中の処理がある。**止めずに知らせる** (基盤仕様書 2.8)。
@@ -351,7 +386,9 @@ class ToolManager:
         self._health_failures = 0
         runtime_state.clear()
         log.info("停止完了: %s (%s)", name, result.method)
-        if not self._superseded(generation):
+        # 切り替えの途中なら「終了しました」は出さない。すぐ次の起動が
+        # 続くので、出すとバーの表示と進み具合の窓が一瞬途切れる
+        if not self._superseded(generation) and not target:
             self._set(State.IDLE, f"{name}を終了しました")
         return True
 
@@ -426,13 +463,14 @@ class ToolManager:
 
     def _start_locked(self, tool: Tool, generation: int) -> None:
         """起動の本体。**同じツールでは1つしか走らない**ことが前提。"""
-        self._set(State.STARTING, f"{tool.display_name}を起動しています...", tool)
+        timeout = float(app_config.ui_setting("start_timeout_seconds"))
+        self._set(State.STARTING, f"{tool.display_name}を起動しています...", tool,
+                  phase=PHASE_SPAWN, timeout=timeout)
         proc = self._spawn(tool)
         if proc is None:
             return
         self._process = proc
 
-        timeout = float(app_config.ui_setting("start_timeout_seconds"))
         started = time.monotonic()
         # BATが先に落ちたことを、時間切れと区別するための入れ物。
         # 「90秒待った末に時間切れ」より「start.bat が3秒で終了した
@@ -455,7 +493,8 @@ class ToolManager:
             message = f"{tool.display_name}を起動しています..."
             if stage:
                 message = f"{tool.display_name}: {stage}"
-            self._set(State.STARTING, message, tool, elapsed=elapsed)
+            self._set(State.STARTING, message, tool, elapsed=elapsed,
+                      phase=PHASE_WAIT, stage=stage, timeout=timeout)
 
         payload = health.wait_ready(
             tool.health_url, tool.app_id, timeout=timeout,
@@ -487,6 +526,9 @@ class ToolManager:
         # ツールが自分でブラウザーを開いているので、ここでも開けば
         # **同じツールの画面が2枚**になり、作業状態を奪い合う
         if tool.suppresses_browser:
+            self._set(State.STARTING, f"{tool.display_name}の画面を開いています...",
+                      tool, elapsed=time.monotonic() - started,
+                      phase=PHASE_OPEN_BROWSER, timeout=timeout)
             self._open_browser(running, running.url or tool.home_url)
         else:
             log.info("画面はツール側が開きます: %s", tool.display_name)

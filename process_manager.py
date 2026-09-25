@@ -38,7 +38,7 @@ import time
 import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
@@ -124,8 +124,14 @@ def is_running(running: RunningTool) -> bool:
 # 停止
 # ------------------------------------------------------------------
 def stop(running: RunningTool, *, force: bool = False,
-         timeout: float = GRACEFUL_WAIT_SEC) -> StopResult:
-    """1つのツールを止める。上に書いた順序どおりに試す。"""
+         timeout: float = GRACEFUL_WAIT_SEC,
+         on_backend: Optional[Callable[[], None]] = None) -> StopResult:
+    """1つのツールを止める。上に書いた順序どおりに試す。
+
+    `on_backend` は、画面を閉じ終えて**バックエンドを止めにかかる直前**に
+    呼ぶ。画面に「〜を終了しています」を、終わってからではなく
+    始めるときに出すため。
+    """
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
     log.info("停止開始: %s (force=%s)", running.summary(), force)
@@ -134,6 +140,8 @@ def stop(running: RunningTool, *, force: bool = False,
     # バックエンドを先に落とすと、閉じるまでのあいだ利用者の画面に
     # 「接続できません」が出る
     result.browser_closed = close_browser(running)
+    if on_backend is not None:
+        on_backend()
 
     if not is_running(running):
         # 応答しない。プロセスだけ残っていないか確かめてから片付ける
@@ -158,6 +166,9 @@ def stop(running: RunningTool, *, force: bool = False,
 
         if outcome is None:
             continue                        # その手は使えなかった。次へ
+        # 画面を閉じたかどうかは、止め方の結果にも引き継ぐ。落とすと
+        # 呼び出し側が「閉じた画面」の後始末をしない
+        outcome.browser_closed = result.browser_closed
         if outcome.busy:
             # 実行中の処理がある。**止めずに知らせる** (基盤仕様書 2.8)。
             # 中断してよいかは利用者が決める
