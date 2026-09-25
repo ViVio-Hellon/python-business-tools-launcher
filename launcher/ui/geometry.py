@@ -26,6 +26,18 @@ ANCHORS = ("center", "bottom_left", "bottom_center", "bottom_right")
 # **値があること自体が「手動」の印**。無ければ状態に合わせて自動で寄る
 POSITION_KEY = "bar_position"
 
+# 位置の覚え方の版。**以前の覚え方では、自分で動かしたぶんを手で置いた
+# ものと取り違えて覚えることがあった** (Windows では、動かしたという知らせが
+# 遅れて届くことがある)。この版になる前に覚えた位置は信用せず、1度だけ
+# 忘れる
+POSITION_RULE_KEY = "bar_position_rule"
+POSITION_RULE = "2"
+
+# 自分で置いた場所からこれ以内のずれは「利用者が動かした」とみなさない。
+# Windows は窓の枠のぶん (数px) ずらして報告することがある。手で
+# ドラッグすれば、ふつうはこれよりずっと大きく動く
+MOVE_TOLERANCE = 24
+
 
 class Placement(NamedTuple):
     """`geometry()` に渡す値。"""
@@ -180,3 +192,36 @@ def parse_saved(text: str) -> Optional[tuple[int, int]]:
 
 def format_saved(x: int, y: int) -> str:
     return f"{x},{y}"
+
+
+def parse_geometry_xy(text: str) -> Optional[tuple[int, int]]:
+    """`"600x56+100+200"` や `"+-8+100"` から位置 (x, y) を取り出す。
+
+    `winfo_x()` ではなく **`geometry()` の文字で比べる**。置くときに使う
+    書き方と同じなので、Windows の枠のずれが混ざらない。
+    """
+    import re
+
+    match = re.search(r"([+-])(-?\d+)([+-])(-?\d+)$", (text or "").strip())
+    if not match:
+        return None
+    x = int(match.group(2)) * (-1 if match.group(1) == "-" else 1)
+    y = int(match.group(4)) * (-1 if match.group(3) == "-" else 1)
+    return x, y
+
+
+def moved_by_user(expected: Optional[tuple[int, int]],
+                  actual: Optional[tuple[int, int]],
+                  tolerance: int = MOVE_TOLERANCE) -> bool:
+    """いまの位置が、自分で置いた場所から**はっきり**離れているか。
+
+    離れていなければ、届いた「動いた」という知らせは自分で動かしたぶんの
+    こだま。覚えない ── 覚えると、以後の自動の移動が止まってしまう。
+    """
+    if actual is None:
+        return False
+    if expected is None:
+        return True
+    return (abs(actual[0] - expected[0]) > tolerance
+            or abs(actual[1] - expected[1]) > tolerance)
+

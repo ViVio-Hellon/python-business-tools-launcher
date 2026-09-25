@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -774,6 +775,103 @@ def probe_tool_folder(start_command: str) -> dict:
     if port:
         found["port"] = port
     return found
+
+
+# ------------------------------------------------------------------
+# 起動引数を決める
+# ------------------------------------------------------------------
+# ツールの中を探すときに見ない場所。大きいうえ、ツール自身の作りではない
+_SKIP_DIRS = {".git", "venv", ".venv", "env", "__pycache__", "node_modules",
+              "site-packages", "Lib", "Scripts", "dist", "build"}
+# 探す深さと数の上限。起動ファイルを選んだ直後に待たせない
+_SCAN_DEPTH = 3
+_SCAN_FILES = 400
+_SCAN_BYTES = 1_000_000
+
+# `.bat` が受け取った引数を先へ渡している印 (`%*` か `%1`〜`%9`)
+_BAT_ARGS = re.compile(r"%\*|%[1-9]")
+
+
+def recommend_start_args(start_command: str) -> tuple[str, str]:
+    """起動引数に何を入れればよいか。`(起動引数, 理由)`。
+
+    **利用者に考えさせない。** `--no-browser` を入れるのは、次の2つが
+    そろったときだけ:
+
+    * 起動ファイルが引数をツールへ渡す (`.bat` の `%*`、`.vbs` の
+      `WScript.Arguments`)
+    * ツールが `--no-browser` を知っている (ツールのフォルダーの `.py` に
+      その文字がある)
+
+    そろわなければ空にする。空でも起動はする ── 画面をツールが自分で
+    ふだんのブラウザーに開くだけ (その画面は切り替えのとき自動では
+    閉じられない)。受け付けない引数を渡すと、ツールによっては起動
+    そのものに失敗するので、迷ったら空に倒す。
+    """
+    path = Path((start_command or "").strip().strip('"'))
+    if not path.is_file():
+        return "", "起動ファイルが見つからないため、判定できません"
+
+    kind = path.suffix.lower()
+    if kind == ".vbs":
+        forwards = _vbs_forwards_args(str(path))
+    elif kind == ".bat":
+        forwards = _bat_forwards_args(path)
+    else:
+        forwards = False
+    if not forwards:
+        hint = ""
+        sibling = path.with_name("start.bat")
+        if kind == ".vbs" and sibling.is_file() and _bat_forwards_args(sibling):
+            hint = "（同じフォルダーの start.bat を選ぶと、ランチャーが画面を閉じられます）"
+        return "", (f"{path.name} は引数をツールへ渡さないため、空にしました。"
+                    "画面はツールが自分で開きます" + hint)
+
+    if not _mentions_no_browser(path.parent):
+        return "", ("ツールの中に --no-browser が見つからないため、空にしました。"
+                    "画面はツールが自分で開きます")
+    return NO_BROWSER_ARG, ("ツールが --no-browser を受け付けるので入れました。"
+                            "画面はランチャーが開き、切り替えのとき閉じます")
+
+
+def _bat_forwards_args(path: Path) -> bool:
+    """その `.bat` が受け取った引数を先へ渡しているか。"""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    return bool(_BAT_ARGS.search(raw.decode("cp932", "replace")))
+
+
+def _mentions_no_browser(folder: Path) -> bool:
+    """ツールのフォルダーの `.py` か起動ファイルに `--no-browser` があるか。"""
+    mark = NO_BROWSER_ARG.encode("ascii")
+    scanned = 0
+    stack = [(folder, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir():
+                if depth < _SCAN_DEPTH and entry.name not in _SKIP_DIRS:
+                    stack.append((entry, depth + 1))
+                continue
+            if entry.suffix.lower() not in (".py", ".bat", ".vbs"):
+                continue
+            scanned += 1
+            if scanned > _SCAN_FILES:
+                return False
+            try:
+                if entry.stat().st_size > _SCAN_BYTES:
+                    continue
+                if mark in entry.read_bytes():
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def _first_port(server) -> int:

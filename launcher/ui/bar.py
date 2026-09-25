@@ -79,6 +79,10 @@ class LauncherBar:
         # 自分で動かしている最中か。**利用者のドラッグと区別する印**
         self._programmatic = False
         self._programmatic_handle = None
+        # 最後に自分で置いた場所。届いた「動いた」が自分のこだまか、
+        # 利用者のドラッグかを、**場所で**見分ける
+        self._expected_xy = None
+        self._forget_untrusted_position()
         # 利用者が手で置いたか。置いていれば自動の移動をやめる ──
         # **利用者が決めた場所がいちばん強い**
         self._manual = self._saved_position() is not None
@@ -374,7 +378,8 @@ class LauncherBar:
 
     def _move_to(self, placement) -> None:
         """新しい置き場所へ移す。滑らせて、どこへ行ったか分かるようにする。"""
-        start = (self.root.winfo_x(), self.root.winfo_y())
+        start = (geometry.parse_geometry_xy(self.root.geometry())
+                 or (self.root.winfo_x(), self.root.winfo_y()))
         target = (placement.x, placement.y)
         # 幅は先に合わせる。動かしながら幅も変えると途中の形が崩れて見える
         self._apply_geometry(
@@ -408,6 +413,9 @@ class LauncherBar:
         self._programmatic = True
         if self._programmatic_handle is not None:
             self.root.after_cancel(self._programmatic_handle)
+        placed = geometry.parse_geometry_xy(text)
+        if placed is not None:
+            self._expected_xy = placed
         self.root.geometry(text)
         self._programmatic_handle = self.root.after(
             PROGRAMMATIC_TAIL_MS, self._clear_programmatic)
@@ -437,18 +445,45 @@ class LauncherBar:
         self._save_handle = self.root.after(MOVE_SAVE_MS, self._save_position)
 
     def _save_position(self) -> None:
-        """手で置かれた場所を覚え、以後の自動移動をやめる。"""
+        """手で置かれた場所を覚え、以後の自動移動をやめる。
+
+        **自分で置いた場所から動いていなければ覚えない。** 時間で見分ける
+        だけだと、遅れて届いた知らせ (Windows では窓が出た瞬間などに
+        起きる) を「利用者が動かした」と取り違え、以後ずっと中央に
+        居座ることになる。
+        """
         self._save_handle = None
+        actual = geometry.parse_geometry_xy(self.root.geometry())
+        if not geometry.moved_by_user(self._expected_xy, actual):
+            return
         try:
             tool_registry.set_pc_setting(
-                POSITION_KEY,
-                geometry.format_saved(self.root.winfo_x(), self.root.winfo_y()))
+                POSITION_KEY, geometry.format_saved(*actual))
         except Exception:                     # noqa: BLE001 - 覚えられなくても続ける
             log.warning("位置を保存できませんでした", exc_info=True)
             return
         if not self._manual:
-            log.info("手で置かれたので、自動の移動をやめます")
+            log.info("手で置かれたので、自動の移動をやめます: %s", actual)
         self._manual = True
+        self._expected_xy = actual
+
+    def _forget_untrusted_position(self) -> None:
+        """以前の覚え方で覚えた位置を、1度だけ忘れる。
+
+        以前は、自分で動かしたぶんを手で置いたものと取り違えて覚える
+        ことがあった。その位置が残っていると、直したあとも自動で寄らない。
+        """
+        try:
+            if tool_registry.get_pc_setting(geometry.POSITION_RULE_KEY) \
+                    == geometry.POSITION_RULE:
+                return
+            if tool_registry.get_pc_setting(POSITION_KEY):
+                tool_registry.clear_pc_setting(POSITION_KEY)
+                log.info("以前の版で覚えたバーの位置を忘れます (自動に戻します)")
+            tool_registry.set_pc_setting(geometry.POSITION_RULE_KEY,
+                                         geometry.POSITION_RULE)
+        except Exception:                     # noqa: BLE001 - 位置で起動を止めない
+            log.warning("バーの位置の覚え方を確かめられませんでした", exc_info=True)
 
     # --------------------------------------------------------------
     # 操作

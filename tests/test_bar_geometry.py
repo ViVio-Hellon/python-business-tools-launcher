@@ -258,3 +258,30 @@ class FitButtonsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UserMoveTests(unittest.TestCase):
+    """自分で動かしたこだまを、利用者のドラッグと取り違えない。
+
+    以前は時間だけで見分けていたため、Windows で遅れて届いた知らせを
+    「利用者が動かした」と覚え、以後バーが中央から動かなくなっていた。
+    """
+
+    def test_geometryの文字から位置を取る(self) -> None:
+        self.assertEqual(geometry.parse_geometry_xy("600x56+100+200"), (100, 200))
+        self.assertEqual(geometry.parse_geometry_xy("+-8+100"), (-8, 100))
+        self.assertEqual(geometry.parse_geometry_xy("600x56-10-20"), (-10, -20))
+        self.assertIsNone(geometry.parse_geometry_xy("600x56"))
+        self.assertIsNone(geometry.parse_geometry_xy(""))
+
+    def test_置いた場所のままなら利用者の移動ではない(self) -> None:
+        self.assertFalse(geometry.moved_by_user((400, 500), (400, 500)))
+        # Windows は枠のぶん数pxずらして報告することがある
+        self.assertFalse(geometry.moved_by_user((400, 500), (408, 492)))
+
+    def test_はっきり動いていれば利用者の移動(self) -> None:
+        self.assertTrue(geometry.moved_by_user((400, 500), (700, 500)))
+        self.assertTrue(geometry.moved_by_user((400, 500), (400, 200)))
+
+    def test_位置が分からなければ覚えない(self) -> None:
+        self.assertFalse(geometry.moved_by_user((400, 500), None))

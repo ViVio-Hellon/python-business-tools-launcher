@@ -541,3 +541,61 @@ class ShippedConfigTests(LocalAreaTestCase):
         self.assertIn(f"| {launcher.__version__} |", readme,
                       "README の「版の履歴」に今の版がありません")
 
+
+
+class RecommendStartArgsTests(LocalAreaTestCase):
+    """起動引数が分からなくても、起動ファイルとツールの中身から決める。"""
+
+    def make(self, entry: str, body: str, *, python: str = "") -> Path:
+        folder = self.work_root / "tool"
+        folder.mkdir(exist_ok=True)
+        if python:
+            (folder / "app.py").write_text(python, encoding="utf-8")
+        path = folder / entry
+        path.write_text(body, encoding="cp932")
+        return path
+
+    def test_引数を渡して受け付けるなら入れる(self) -> None:
+        bat = self.make("start.bat", "@echo off\r\npython app.py %*\r\n",
+                        python='parser.add_argument("--no-browser")\n')
+        args, reason = tool_registry.recommend_start_args(str(bat))
+        self.assertEqual(args, "--no-browser")
+        self.assertIn("閉じます", reason)
+
+    def test_起動ファイルが引数を渡さなければ空(self) -> None:
+        bat = self.make("start.bat", "@echo off\r\npython app.py\r\n",
+                        python='parser.add_argument("--no-browser")\n')
+        args, reason = tool_registry.recommend_start_args(str(bat))
+        self.assertEqual(args, "")
+        self.assertIn("引数をツールへ渡さない", reason)
+
+    def test_ツールが知らなければ空(self) -> None:
+        """受け付けない引数を渡すと、起動そのものに失敗することがある。"""
+        bat = self.make("start.bat", "@echo off\r\npython app.py %*\r\n",
+                        python="print('hello')\n")
+        args, reason = tool_registry.recommend_start_args(str(bat))
+        self.assertEqual(args, "")
+        self.assertIn("見つからない", reason)
+
+    def test_VBSを選んだら隣のstartbatを勧める(self) -> None:
+        self.make("start.bat", "@echo off\r\npython app.py %*\r\n",
+                  python='"--no-browser"\n')
+        vbs = self.make("Start.vbs", 'shell.Run "pythonw app.py", 0, False\r\n')
+        args, reason = tool_registry.recommend_start_args(str(vbs))
+        self.assertEqual(args, "")
+        self.assertIn("start.bat を選ぶと", reason)
+
+    def test_仮想環境の中までは探さない(self) -> None:
+        """ライブラリの中の --no-browser を、ツールのものと取り違えない。"""
+        bat = self.make("start.bat", "@echo off\r\npython app.py %*\r\n",
+                        python="print('hello')\n")
+        lib = bat.parent / ".venv" / "Lib" / "site-packages" / "other"
+        lib.mkdir(parents=True)
+        (lib / "cli.py").write_text('"--no-browser"\n', encoding="utf-8")
+        self.assertEqual(tool_registry.recommend_start_args(str(bat))[0], "")
+
+    def test_起動ファイルが無ければ判定しない(self) -> None:
+        args, reason = tool_registry.recommend_start_args(
+            str(self.work_root / "無い.bat"))
+        self.assertEqual(args, "")
+        self.assertIn("見つからない", reason)

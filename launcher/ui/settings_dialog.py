@@ -152,17 +152,21 @@ class SettingsDialog:
             return
 
         found = tool_registry.probe_tool_folder(chosen)
+        # 起動引数は**こちらで決める**。利用者には分からないことが多い
+        args, reason = tool_registry.recommend_start_args(chosen)
         tool = Tool(app_id=found.get("app_id", ""),
                     display_name=found.get("display_name", ""),
                     port=int(found.get("port", 0)),
                     order_no=tool_registry.next_order_no(),
                     start_command=chosen,
-                    start_args="--no-browser")
+                    start_args=args)
         hint = getattr(self, "_empty_hint", None)
         if hint is not None:
             hint.destroy()
             self._empty_hint = None
-        self.rows.append(_ToolRow(self.body, tool, is_new=True))
+        row = _ToolRow(self.body, tool, is_new=True)
+        row.show_note(reason)
+        self.rows.append(row)
         if not found:
             messagebox.showinfo(
                 "設定",
@@ -464,18 +468,25 @@ class _ToolRow:
             tk.Label(title, text=f"  {tool.app_id}", bg=theme.BG,
                      fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left")
 
+        # **［使う］と［削除］は同時に選べない。** 両方にチェックが入ると、
+        # どちらになるのか分からない。［削除］を選んだら［使う］は外して
+        # 押せなくし、［削除］を外したら元に戻す
         self.delete_var = tk.BooleanVar(value=False)
         tk.Checkbutton(title, text="削除", variable=self.delete_var,
+                       command=self._on_delete_toggled,
                        bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
                        activebackground=theme.BG, activeforeground=theme.FG,
                        font=theme.FONT_SMALL, bd=0,
                        highlightthickness=0).pack(side="right")
         self.enabled_var = tk.BooleanVar(value=tool.enabled)
-        tk.Checkbutton(title, text="使う", variable=self.enabled_var,
-                       bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
-                       activebackground=theme.BG, activeforeground=theme.FG,
-                       font=theme.FONT_SMALL, bd=0,
-                       highlightthickness=0).pack(side="right", padx=(0, 10))
+        self._enabled_before_delete = tool.enabled
+        self.enabled_check = tk.Checkbutton(
+            title, text="使う", variable=self.enabled_var,
+            bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
+            activebackground=theme.BG, activeforeground=theme.FG,
+            disabledforeground="#5c6672",
+            font=theme.FONT_SMALL, bd=0, highlightthickness=0)
+        self.enabled_check.pack(side="right", padx=(0, 10))
 
         # --- 起動ファイルのパス (要件定義書 §13.1) ---
         path_row = tk.Frame(box, bg=theme.BG)
@@ -500,11 +511,46 @@ class _ToolRow:
                  font=theme.FONT_SMALL).pack(side="left", padx=(0, 12))
         _label(detail, "起動引数")
         tk.Entry(detail, textvariable=self.args_var, width=16,
-                 font=theme.FONT_SMALL).pack(side="left", padx=(0, 12))
+                 font=theme.FONT_SMALL).pack(side="left", padx=(0, 2))
+        # 何を入れればよいか分からないときは、起動ファイルとツールの中身を
+        # 見て決める (`recommend_start_args`)
+        tk.Button(detail, text="自動", command=self.recommend_args,
+                  bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
+                  padx=8, pady=1, font=theme.FONT_SMALL,
+                  cursor="hand2").pack(side="left", padx=(0, 12))
         _label(detail, "停止方法")
         ttk.Combobox(detail, textvariable=self.stop_var, width=13,
                      values=list(STOP_METHODS), state="readonly",
                      font=theme.FONT_SMALL).pack(side="left")
+
+        # 起動引数を決めた理由など、1行の案内。ふだんは出さない
+        self.note = tk.Label(box, text="", bg=theme.BG, fg=theme.MUTED,
+                             font=theme.FONT_SMALL, anchor="w", justify="left",
+                             wraplength=560)
+
+    def show_note(self, text: str) -> None:
+        if text:
+            self.note.configure(text=text)
+            self.note.pack(fill="x", pady=(2, 0))
+        else:
+            self.note.pack_forget()
+
+    def recommend_args(self) -> None:
+        """［自動］。いまの起動ファイルから起動引数を決め直す。"""
+        args, reason = tool_registry.recommend_start_args(
+            self.path_var.get().strip().strip('"'))
+        if Path(self.path_var.get().strip().strip('"')).is_file():
+            self.args_var.set(args)
+        self.show_note(reason)
+
+    def _on_delete_toggled(self) -> None:
+        if self.delete_var.get():
+            self._enabled_before_delete = bool(self.enabled_var.get())
+            self.enabled_var.set(False)
+            self.enabled_check.configure(state="disabled")
+        else:
+            self.enabled_check.configure(state="normal")
+            self.enabled_var.set(self._enabled_before_delete)
 
     def browse(self) -> None:
         """ファイル選択ダイアログからBATを選ぶ (要件定義書 §13.1)。"""
@@ -519,6 +565,8 @@ class _ToolRow:
                        ("すべてのファイル", "*.*")])
         if chosen:
             self.path_var.set(chosen)
+            # 起動ファイルが変われば、渡せる引数も変わる
+            self.recommend_args()
 
     def label(self) -> str:
         """問題を知らせるときの呼び名。"""

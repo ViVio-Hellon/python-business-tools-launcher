@@ -151,6 +151,9 @@ class ToolManager:
         self._starting: Optional[str] = None
         # 切り替えで次に起こすツールの表示名。前を止めているあいだに出す
         self._switch_target = ""
+        # 切り替えで止めたツールの画面が残っているときの案内。
+        # 次のツールが起動し終わったところで出す
+        self._leftover_note = ""
 
     # --------------------------------------------------------------
     # 状態
@@ -389,10 +392,20 @@ class ToolManager:
         self._health_failures = 0
         runtime_state.clear()
         log.info("停止完了: %s (%s)", name, result.method)
+        # **ランチャーが閉じられない画面が残るなら、そう伝える。**
+        # 「終了しました」とだけ出ると、残ったタブを見た利用者は
+        # 止まっていないのかと思う
+        note = _leftover_note(running, name)
         # 切り替えの途中なら「終了しました」は出さない。すぐ次の起動が
-        # 続くので、出すとバーの表示と進み具合の窓が一瞬途切れる
-        if not self._superseded(generation) and not target:
-            self._set(State.IDLE, f"{name}を終了しました")
+        # 続くので、出すとバーの表示と進み具合の窓が一瞬途切れる。
+        # 残った画面の案内は、次のツールが起動し終わってから出す
+        if target:
+            self._leftover_note = note
+        elif not self._superseded(generation):
+            message = f"{name}を終了しました"
+            if note:
+                message += "（画面は手で閉じてください）"
+            self._set(State.IDLE, message, detail=note)
         return True
 
     # `start.bat` の受け皿が終わるのを待つ上限 (秒)
@@ -546,6 +559,10 @@ class ToolManager:
             detail = ("画面は既定のブラウザーで開きました。\n"
                       "切り替えのときに自動では閉じないので、"
                       "不要になったタブは手で閉じてください。")
+        if self._leftover_note:
+            # 切り替えで止めた前のツールの画面が残っている
+            detail = "\n\n".join(t for t in (self._leftover_note, detail) if t)
+            self._leftover_note = ""
         self._set(State.RUNNING, f"現在：{tool.display_name}", tool,
                   detail=detail, elapsed=time.monotonic() - started,
                   responding=True)
@@ -830,6 +847,24 @@ def _entry_command(tool: Tool) -> list[str]:
     if tool.entry_kind == "vbs":
         return ["wscript.exe", path] + args
     return [path] + args
+
+
+def _leftover_note(running: RunningTool, name: str) -> str:
+    """止めたあとに残る画面の案内。残らなければ空。
+
+    * ランチャーが開いた専用画面 → ふつうは閉じてある。閉じきれずに
+      残っていれば、そう伝える
+    * ツールが自分で開いた画面・既定のブラウザーへ渡した画面・ランチャーの
+      外で起動されたツールの画面 → **閉じる手がかりが無い**ので残る
+    """
+    if running.browser_managed:
+        if running.browser_pid and process_manager.is_browser_open(running):
+            return (f"{name}の画面を閉じられませんでした。\n"
+                    "ブラウザーの画面を手で閉じてください。")
+        return ""
+    return (f"{name}の画面（ふだんのブラウザーのタブ）は、"
+            "ランチャーからは閉じられません。\n"
+            "ツールは終了しているので、タブを手で閉じてください。")
 
 
 def _tool_opens_browser_note(tool: Tool) -> str:

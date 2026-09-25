@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -516,3 +517,43 @@ class MonitorTests(ManagerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeftoverScreenTests(ManagerTestCase):
+    """止めたあとに残る画面は、残ると伝える。"""
+
+    def register_self_opening(self, app_id: str, name: str):
+        """ツールが自分で画面を開く形 (起動引数が届かない・空)。"""
+        tool = self.register(app_id, name)
+        tool_registry.save(replace(tool, start_args=""))
+        return tool_registry.get(app_id)
+
+    def test_ランチャーが閉じられない画面は手で閉じてと出す(self) -> None:
+        tool = self.register_self_opening("fake.self", "日報")
+        self.start(tool)
+        self.assertFalse(self.manager.current.browser_managed)
+
+        self.manager._stop_current(self.manager._generation)
+        status = self.manager.status
+        self.assertEqual(status.state, State.IDLE)
+        self.assertIn("手で閉じて", status.message)
+        self.assertIn("タブを手で閉じて", status.detail)
+
+    def test_ランチャーが閉じた画面なら何も足さない(self) -> None:
+        tool = self.register("fake.managed", "日報")
+        self.start(tool)
+        self.assertTrue(self.manager.current.browser_managed)
+
+        self.manager._stop_current(self.manager._generation)
+        self.assertEqual(self.manager.status.message, "日報を終了しました")
+        self.assertEqual(self.manager.status.detail, "")
+
+    def test_切り替えで残った前の画面は次の起動のあとに伝える(self) -> None:
+        first = self.register_self_opening("fake.self", "日報")
+        second = self.register("fake.next", "看板")
+        self.start(first)
+        self.start(second)
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING)
+        self.assertIn("日報の画面", status.detail)
+        self.assertIn("手で閉じて", status.detail)
