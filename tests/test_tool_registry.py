@@ -519,3 +519,25 @@ class OldDatabaseTests(LocalAreaTestCase):
         self.assertEqual(tool.health_path, tool_registry.DEFAULT_HEALTH_PATH)
         self.assertTrue(tool.enabled)
 
+
+class ShippedConfigTests(LocalAreaTestCase):
+    """出荷する設定そのもの。"""
+
+    def test_出荷時はツールを持たない(self) -> None:
+        """現場ごとに使うツールが違う。［＋ ツールを追加］で登録する。"""
+        import json
+
+        shipped = json.loads(app_config.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(shipped.get("tools"), [])
+
+        app_config.load()["tools"] = shipped["tools"]   # 試験用の4ツールを外す
+        tool_registry.initialize()
+        self.assertEqual(tool_registry.all_tools(include_disabled=True), [])
+
+    def test_版を上げたら履歴にも書く(self) -> None:
+        import launcher
+
+        readme = (app_config.APP_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"| {launcher.__version__} |", readme,
+                      "README の「版の履歴」に今の版がありません")
+

@@ -71,8 +71,21 @@ class SettingsDialog:
                  anchor="w").pack(fill="x", padx=16, pady=(0, 10))
 
         self.body = self._scrollable_body()
-        for tool in tool_registry.all_tools(include_disabled=True):
+        tools = tool_registry.all_tools(include_disabled=True)
+        for tool in tools:
             self.rows.append(_ToolRow(self.body, tool))
+        if not tools:
+            # 出荷時は空。1行目の作り方を案内する
+            self._empty_hint = tk.Label(
+                self.body,
+                text="まだツールがありません。\n"
+                     "下の［＋ ツールを追加］で、各ツールの start.bat (または "
+                     "Start.vbs) を選んでください。\n"
+                     "アプリID・表示名・ポートは、そのツールの config/app.json "
+                     "から読み取ります。",
+                bg=theme.BG, fg=theme.MUTED, font=theme.FONT, justify="left",
+                anchor="w")
+            self._empty_hint.pack(fill="x", padx=6, pady=(4, 12))
 
         self._build_add_button()
         self._build_pc_mode()
@@ -145,6 +158,10 @@ class SettingsDialog:
                     order_no=tool_registry.next_order_no(),
                     start_command=chosen,
                     start_args="--no-browser")
+        hint = getattr(self, "_empty_hint", None)
+        if hint is not None:
+            hint.destroy()
+            self._empty_hint = None
         self.rows.append(_ToolRow(self.body, tool, is_new=True))
         if not found:
             messagebox.showinfo(

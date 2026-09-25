@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tempfile
@@ -37,6 +38,16 @@ class LocalAreaTestCase(unittest.TestCase):
         self._orig = os.environ.get(app_config.LOCAL_DIR_ENV)
         os.environ[app_config.LOCAL_DIR_ENV] = str(self.local_root)
         app_config.ensure_local_dirs()
+
+        # 製品の既定値のツール一覧を、試験用の4ツールにする。出荷する
+        # 設定は空だが、「既定値に書けば各端末へ入る」仕組みは残して
+        # あるので、それを確かめる試験のために置く
+        from _sample_tools import SAMPLE_TOOLS
+
+        config = app_config.load()
+        original_tools = config.get("tools")
+        config["tools"] = copy.deepcopy(SAMPLE_TOOLS)
+        self.addCleanup(config.__setitem__, "tools", original_tools)
 
         # 配布先フォルダも一時フォルダーへ。開発機で作った配布先フォルダ
         # (`distribution/`) が試験に混ざらないように

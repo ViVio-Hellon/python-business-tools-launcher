@@ -179,7 +179,9 @@ class LauncherBar:
 
         tools = tool_registry.all_tools()
         if not tools:
-            tk.Label(self.tool_frame, text="ツールが登録されていません",
+            # 出荷時はツールを1つも持たない。何をすればよいかを出す
+            tk.Label(self.tool_frame,
+                     text="ツールがありません —［設定］→［＋ ツールを追加］で登録",
                      bg=theme.BG, fg=theme.MUTED, font=theme.FONT).pack(side="left")
             return
 
