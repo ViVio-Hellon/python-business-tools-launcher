@@ -33,25 +33,23 @@ If Not fso.FileExists(script) Then
     WScript.Quit 1
 End If
 
-' Python があるか先に確かめる。無いまま起動すると、
-' コンソールが出ない分だけ「何も起きない」ように見えてしまう
-If shell.Run("cmd /c python --version", 0, True) <> 0 Then
-    MsgBox "Python が見つかりません。" & vbCrLf & vbCrLf & _
+' pythonw があるかを先に確かめる。無いまま起動すると、
+' コンソールが出ないぶん「何も起きない」ように見えてしまう。
+'
+' **確かめるのは1回だけ、cmd を挟まずに。** 以前は python と pythonw を
+' cmd 経由で1回ずつ確かめていて、そのぶん(端末によっては数秒)何も
+' 画面に出ないまま待たせていた。見つからないときは Run がエラーを返す
+Dim code
+On Error Resume Next
+code = shell.Run("pythonw --version", 0, True)
+If Err.Number <> 0 Then code = -1
+On Error GoTo 0
+If code <> 0 Then
+    MsgBox "Python (pythonw) が見つかりません。" & vbCrLf & vbCrLf & _
            "https://www.python.org/downloads/ からインストールし、" & vbCrLf & _
-           "インストールの最初の画面で「Add python.exe to PATH」に" & vbCrLf & _
+           "インストーラの最初の画面で「Add python.exe to PATH」に" & vbCrLf & _
            "チェックを入れてください。" & vbCrLf & vbCrLf & _
            "詳しい理由を見るには start_debug.bat を実行してください。", _
-           vbCritical, APP_NAME
-    WScript.Quit 1
-End If
-
-' 実際に使うのは pythonw のほう。python はあるのに pythonw が無い場合が
-' あるので、走らせる前に確かめる(黙って飛ばすと無言で失敗する)
-If shell.Run("cmd /c pythonw --version", 0, True) <> 0 Then
-    MsgBox "pythonw が見つかりません。" & vbCrLf & vbCrLf & _
-           "Python は入っていますが、画面を出さずに起動するための" & vbCrLf & _
-           "pythonw.exe がありません。" & vbCrLf & _
-           "start_debug.bat から起動してください(コンソールが開きます)。", _
            vbCritical, APP_NAME
     WScript.Quit 1
 End If

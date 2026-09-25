@@ -147,88 +147,44 @@ def log_environment() -> None:
 
 
 def start() -> int:
-    """ランチャーを出して常駐する。戻り値はプロセスの終了コード。"""
+    """ランチャーを出して常駐する。戻り値はプロセスの終了コード。
+
+    **まず起動中の窓を出す。** 下ごしらえ (`boot.run`) には端末によって
+    数秒かかり、そのあいだ何も出ないと、作業者には「押したのに何も
+    起きない」としか見えない。
+    """
+    import boot
     import launch_guard
-    from app_manager import ToolManager
-    from launcher import tool_registry
 
     log = get_logger("launcher")
     log_environment()
 
-    # --- 多重起動の判定 (基盤仕様書 2.4) ---
-    # **調べてから書くのではなく、取れたら起動する。** `Start.vbs` は
-    # 押しても数秒は何も出ないので、利用者はもう一度押す。調べる/書くを
-    # 分けていると、その2回が両方とも通ってしまう
-    guard = launch_guard.acquire()
-    if not guard.should_start:
-        log.info("多重起動のため終了します: %s", guard.reason)
+    try:
+        from launcher.ui.splash import run_with_splash
+
+        result = run_with_splash(boot.STEPS, lambda report: boot.run(report))
+    except ImportError:
+        # 窓を出す部品が読めない。窓なしで進める
+        result = boot.run()
+
+    if not result.started:
         _show_message("すでに起動しています",
-                      f"{guard.reason}\n\n"
+                      f"{result.reason}\n\n"
                       "すでに動いているランチャーバーを探してください"
                       "(画面の中央、またはツール使用中なら左下にあります)。")
         return 0
-    log.info("多重起動の判定: %s", guard.reason)
 
     # ここから先は**ロックを持っている**。失敗しても必ず外す
-
-    # 設定ファイルが壊れていたら、**黙って進めない。** 既定値で動くが、
-    # 既定値のツール一覧は空なので、新しい端末では**ボタンが1つも出ない**。
-    # 利用者には「ランチャーが壊れている」としか見えないので、理由を出す
-    problem = app_config.load_error()
-    if problem:
-        _show_message(
-            "設定ファイルを読めません",
-            f"{problem}\n\n"
-            "既定の設定で起動します (ツールの設定は設定DBにあるので消えません)。\n"
-            "config/launcher.json を配布元のものに戻してください。\n\n"
-            "よくある原因: JSON にコメント (//) を書いた、"
-            "カンマの過不足、メモ帳で別の文字コードで保存した")
-
-    # 配布先フォルダがあれば読む (`tool_registry.initialize`)。壊れていても
-    # 起動は止めない ── その端末の設定で動く。黙っていると「配ったのに
-    # 設定が入らない」「設定が開かない」としか見えないので、ここで知らせる
-    from launcher import distribution
-
-    _, problem = distribution.load()
-    if problem:
-        log.warning("%s", problem)
-        _show_message(
-            "配布先フォルダの設定を読めません",
-            f"{problem}\n\n"
-            "この端末の設定のまま起動します。\n"
-            "配布元の端末で［設定］→「配布先フォルダを作る」から"
-            "作り直してください。")
-    _, problem = distribution.load_password()
-    if problem:
-        log.warning("%s", problem)
-        _show_message(
-            "管理者パスワードのファイルを読めません",
-            f"{problem}\n\n"
-            "パスワードを確かめられないため、［設定］は開けません。\n"
-            f"{distribution.PASSWORD_FILE} を消すと、次に［設定］を開くときに"
-            "決め直せます (ツールの設定は消えません)。")
-
-    tool_registry.initialize()
-
-    # 登録が無くなったツールの画面プロファイルを片付ける。
-    # 起動時に1度だけ ── 消し忘れたキャッシュが端末に溜まらないように
     try:
-        from launcher import browser
-
-        browser.purge_unused(t.app_id for t in
-                             tool_registry.all_tools(include_disabled=True))
-    except Exception:                         # noqa: BLE001 - 片付けで起動を止めない
-        log.warning("画面プロファイルの片付けに失敗しました", exc_info=True)
-
-    try:
-        manager = ToolManager()
-        # すでに動いているツールがあれば引き継ぐ (要件定義書 §9)
-        manager.adopt_running()
+        # 下ごしらえで見つかった問題は、起動中の窓を閉じてから出す
+        # (別スレッドからダイアログは出せない)
+        for title, body in result.warnings:
+            _show_message(title, body)
 
         from launcher.ui import bar
 
         log.info("ランチャーバーを出します (%.2f秒)", time.monotonic() - _BOOT_AT)
-        bar.run(manager)
+        bar.run(result.manager)
         return 0
     finally:
         launch_guard.remove_lock()

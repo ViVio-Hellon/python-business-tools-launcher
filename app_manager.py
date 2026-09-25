@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -220,9 +221,11 @@ class ToolManager:
                       responding=True)
             return recorded
 
-        # 記録が無い、または応答しない。設定されているツールを順に当たる
-        for tool in tool_registry.all_tools():
-            payload = health.probe(tool.health_url)
+        # 記録が無い、または応答しない。設定されているツールを当たる
+        tools = tool_registry.all_tools()
+        payloads = _probe_all(tools)
+        for tool in tools:
+            payload = payloads.get(tool.app_id)
             if not health.is_tool(payload, tool.app_id):
                 continue
             running = _running_from_health(tool, payload, launch_pid=0)
@@ -765,6 +768,27 @@ class ToolManager:
         running.browser_profile = session.profile_dir
         if self._current is running:
             runtime_state.write(running)
+
+
+# 起動時に動いているツールを探すとき、同時に当たる数の上限
+PROBE_WORKERS = 8
+
+
+def _probe_all(tools: list[Tool]) -> dict[str, Optional[dict]]:
+    """全ツールの `/api/health` を**同時に**当たる。アプリIDごとの応答。
+
+    1つずつ当たると、ツールの数だけ待ちが積み重なる。Windows では
+    閉じているポートへの接続が断られるまで1〜2秒かかることがあり、
+    5ツールなら**ランチャーの起動だけで数秒**になる。同時に当たれば、
+    いちばん遅い1つぶんで済む。
+    """
+    targets = [t for t in tools if t.health_url]
+    if not targets:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(targets)),
+                            thread_name_prefix="probe") as pool:
+        answers = pool.map(lambda t: health.probe(t.health_url), targets)
+        return {t.app_id: payload for t, payload in zip(targets, answers)}
 
 
 def _running_from_health(tool: Tool, payload: Optional[dict],
