@@ -1,12 +1,10 @@
-"""起動・切り替えの進み具合 (画面に出す中身)
+"""起動・停止の進み具合 (画面に出す中身)
 
 バーの1行だけでは、ツールが立ち上がるまでの数十秒が「何も起きて
 いない」ように見える。**いまどの段にいて、何が済んだか**を別の窓に
 出すための中身をここで組み立てる。
 
-    日報 → 看板 に切り替えています
-      ✓ 日報の画面を閉じる
-      ✓ 日報を終了する
+    看板を起動しています
       ✓ 看板の起動ファイルを実行する
       ▶ 看板の準備ができるのを待つ   アプリを準備中
       ・ 看板の画面を開く
@@ -56,7 +54,7 @@ class ProgressTracker:
     """状態の通知を受けて、進み具合の中身を返す。
 
     忙しくない (起動中でも終了中でもない) 通知が来たら `None` ──
-    窓を閉じる合図。**1回の起動・切り替えを通して**、どの段を通って
+    窓を閉じる合図。**1回の起動・停止を通して**、どの段を通って
     きたかを覚えておき、済んだ段に印を付ける。
     """
 
@@ -66,34 +64,39 @@ class ProgressTracker:
 
     def _reset(self) -> None:
         self._started: Optional[float] = None
-        self._previous = ""       # 止めているツール
-        self._target = ""         # 起こすツール
+        self._app_id = ""         # 見ている操作のツール
+        self._name = ""
+        self._kind = ""           # "start" か "stop"
         self._closes_browser = False
         self._last = None
 
     def update(self, status) -> Optional[ProgressView]:
+        """知らせを1つ受け取る。窓に出す中身か、閉じる合図の `None`。
+
+        ツールは同時に複数動くので、**見ている操作が終わるまで、ほかの
+        ツールの知らせは混ぜない** (混ぜると、窓が2つのツールのあいだを
+        行ったり来たりする)。
+        """
+        app_id = getattr(status, "app_id", "")
+        if self._app_id and app_id != self._app_id:
+            return self.view()
+
         if not getattr(status, "busy", False):
             self._reset()
             return None
 
         phase = getattr(status, "phase", "")
-        if phase in STOP_PHASES:
-            target = getattr(status, "target_name", "")
-            if (self._started is not None
-                    and (status.display_name != self._previous
-                         or target != self._target)):
-                self._reset()             # 別の操作が始まった
-            self._previous = status.display_name
-            self._target = target
-            if phase == CLOSE_BROWSER:
-                self._closes_browser = True
-        elif phase in START_PHASES:
-            if self._started is not None and status.display_name != self._target:
-                self._reset()             # 起こすツールが変わった
-            self._target = status.display_name
-
+        kind = ("stop" if phase in STOP_PHASES
+                else "start" if phase in START_PHASES else "")
+        if self._started is not None and kind and kind != self._kind:
+            self._reset()                 # 同じツールで、止めてから起こした
         if self._started is None:
             self._started = self._clock()
+            self._app_id = app_id
+            self._name = getattr(status, "display_name", "") or app_id
+            self._kind = kind
+        if phase == CLOSE_BROWSER:
+            self._closes_browser = True
         self._last = status
         return self.view()
 
@@ -103,16 +106,21 @@ class ProgressTracker:
         if status is None:
             return None
         phase = getattr(status, "phase", "")
+        name = self._name
 
         plan: list[tuple[str, str]] = []
-        if self._previous:
+        if self._kind == "stop":
             if self._closes_browser:
-                plan.append((CLOSE_BROWSER, f"{self._previous}の画面を閉じる"))
-            plan.append((STOP_TOOL, f"{self._previous}を終了する"))
-        if self._target:
-            plan.append((SPAWN, f"{self._target}の起動ファイルを実行する"))
-            plan.append((WAIT, f"{self._target}の準備ができるのを待つ"))
-            plan.append((OPEN_BROWSER, f"{self._target}の画面を開く"))
+                plan.append((CLOSE_BROWSER, f"{name}の画面を閉じる"))
+            plan.append((STOP_TOOL, f"{name}を終了する"))
+            title = f"{name}を終了しています"
+        elif self._kind == "start":
+            plan.append((SPAWN, f"{name}の起動ファイルを実行する"))
+            plan.append((WAIT, f"{name}の準備ができるのを待つ"))
+            plan.append((OPEN_BROWSER, f"{name}の画面を開く"))
+            title = f"{name}を起動しています"
+        else:
+            title = status.message or "処理しています"
 
         order = [key for key, _ in plan]
         current = order.index(phase) if phase in order else -1
@@ -120,15 +128,6 @@ class ProgressTracker:
             Step(label, DONE if i < current else
                  ACTIVE if i == current else PENDING)
             for i, (_, label) in enumerate(plan))
-
-        if self._previous and self._target:
-            title = f"{self._previous} → {self._target} に切り替えています"
-        elif self._target:
-            title = f"{self._target}を起動しています"
-        elif self._previous:
-            title = f"{self._previous}を終了しています"
-        else:
-            title = status.message or "処理しています"
 
         elapsed = max(0, int(self._clock() - (self._started or self._clock())))
         elapsed_text = f"{elapsed}秒"

@@ -269,7 +269,16 @@ def absolute_entries() -> list[str]:
                 str(item["start_command"]))]
 
 
-def export_tools(registry_tools, *, relative: bool = True) -> Path:
+def bar_position_active() -> str:
+    """配布先フォルダに書かれた「ツールを起動したあとのバーの位置」。無ければ空。"""
+    data, _ = load()
+    bar = (data or {}).get("bar")
+    value = bar.get("position_active") if isinstance(bar, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
+def export_tools(registry_tools, *, relative: bool = True,
+                 bar_position_active: str = "") -> Path:
     """端末の設定から配布先フォルダを作る (作り直す)。
 
     **パスワードには触らない** (別のファイル)。作り直すたびに鍵が
@@ -299,6 +308,10 @@ def export_tools(registry_tools, *, relative: bool = True) -> Path:
         "launcher_version": app_config.version(),
         "tools": items,
     }
+    if bar_position_active:
+        # 端末ごとの位置 (手で動かした場所) ではなく、**ツールを起動した
+        # あとにどこへ寄るか**の決まりだけを配る
+        data["bar"] = {"position_active": bar_position_active}
     target = _write_json(settings_path(), data)
     _write_readme()
     log.info("配布先フォルダを作りました: %s (%d件)", folder(), len(items))

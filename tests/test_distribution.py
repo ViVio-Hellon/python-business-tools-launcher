@@ -889,3 +889,31 @@ class InheritAndStartTests(ManagerTestCase):
             script = _Script("line-01")
             self.assertTrue(admin_lock.unlock(script.ask, script.tell))
             self.assertEqual(len(script.asked), 1)
+
+
+class ActiveBarPositionTests(_Base):
+    """ツールを起動したあとのバーの位置: その端末 → 配布先フォルダ → 既定。"""
+
+    def test_既定は左下(self) -> None:
+        self.assertEqual(tool_registry.active_bar_position(), "bottom_left")
+
+    def test_配布先フォルダに書けば配った先もそうなる(self) -> None:
+        tool_registry.set_active_bar_position("top_right")
+        tool_registry.export_distribution()
+        self.assertEqual(self.read_settings()["bar"],
+                         {"position_active": "top_right"})
+
+        # 配った先 (その端末では決めていない)
+        tool_registry.clear_pc_setting(tool_registry.BAR_POSITION_ACTIVE_KEY)
+        self.assertEqual(tool_registry.active_bar_position(), "top_right")
+
+    def test_その端末で決めたものが優先(self) -> None:
+        self.write_settings([], bar={"position_active": "top_right"})
+        tool_registry.set_active_bar_position("bottom_center")
+        self.assertEqual(tool_registry.active_bar_position(), "bottom_center")
+
+    def test_知らない値は使わない(self) -> None:
+        self.write_settings([], bar={"position_active": "まんなか"})
+        self.assertEqual(tool_registry.active_bar_position(), "bottom_left")
+        with self.assertRaises(ValueError):
+            tool_registry.set_active_bar_position("まんなか")

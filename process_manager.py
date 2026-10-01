@@ -800,36 +800,41 @@ def main(argv: Optional[list[str]] = None) -> int:
     from launcher.logging_utils import configure_logging
     configure_logging()
 
-    running = runtime_state.read()
-    if running is None:
+    records = runtime_state.read_all()
+    if not records:
         print("ランチャーから起動した業務ツールはありません。")
         return 0
 
-    if args.status:
-        payload = status(running)
-        if payload is None:
-            print(f"{running.summary()} は応答していません(記録だけが残っています)。")
-            return 0
-        print(f"{running.summary()} は動いています。")
-        for key in ("app_id", "display_name", "version", "app_root", "ready"):
-            if key in payload:
-                print(f"  {key}: {payload[key]}")
-        return 0
+    # ツールは同時に複数動く。**記録にあるものを1つずつ**扱う
+    code = 0
+    for running in records.values():
+        if args.status:
+            payload = status(running)
+            if payload is None:
+                print(f"{running.summary()} は応答していません"
+                      "(記録だけが残っています)。")
+                continue
+            print(f"{running.summary()} は動いています。")
+            for key in ("app_id", "display_name", "version", "app_root", "ready"):
+                if key in payload:
+                    print(f"  {key}: {payload[key]}")
+            continue
 
-    result = stop(running, force=args.force)
-    if running.browser_managed:
-        print("[済] 画面を閉じました" if result.browser_closed
-              else "[--] 画面を閉じられませんでした")
-    elif running.browser_pid or running.url:
-        print("[--] 画面は既定のブラウザーで開いています。手で閉じてください")
-    print(result)
-    if result.busy:
-        print("  中断して止めるには --force を付けてください。")
-        return 1
-    if result.stopped:
-        runtime_state.clear()
-        return 0
-    return 1
+        result = stop(running, force=args.force)
+        if running.browser_managed:
+            print("[済] 画面を閉じました" if result.browser_closed
+                  else "[--] 画面を閉じられませんでした")
+        elif running.browser_pid or running.url:
+            print("[--] 画面はふだんのブラウザーで開いています。手で閉じてください")
+        print(result)
+        if result.busy:
+            print("  中断して止めるには --force を付けてください。")
+            code = 1
+        elif result.stopped:
+            runtime_state.remove(running.app_id)
+        else:
+            code = 1
+    return code
 
 
 if __name__ == "__main__":

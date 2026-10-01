@@ -2,9 +2,10 @@
 
 画面下部に置く細長い窓。業務ツールより大きな画面を占有しない。
 
-    [日報] [カレンダー] [看板] [総合]   ● 現在：日報      [設定] [終了]
+    [● 日報] [● 看板] [カレンダー] [総合]   ● 動作中：日報、看板   [設定] [終了]
 
-ツールを切り替えてもこの窓は残る (要件定義書 §5.2)。
+ツールは**同時に使える**。動いているツールのボタンは緑で ● が付く。
+起動直後は画面中央に出て、ツールを起動すると［設定］で選んだ場所へ寄る。
 
 【スレッドの約束】
 `ToolManager` は起動・停止を別スレッドで行い、そこから状態を通知して
@@ -14,7 +15,9 @@
 from __future__ import annotations
 
 import queue
+import threading
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox
 from typing import Optional
 
@@ -22,6 +25,7 @@ from .. import app_config, tool_registry
 from ..logging_utils import get_logger
 from . import geometry, password, theme
 from .geometry import POSITION_KEY
+from .texts import close_question, fit_text
 from .progress_window import ProgressWindow
 from .settings_dialog import SettingsDialog
 from .version_dialog import VersionDialog
@@ -74,7 +78,15 @@ class LauncherBar:
         # 並び順。あふれ判定は番号で行うので、対応を持っておく
         self._order: list[str] = []
         self._last_detail = ""
-        self._current_app_id = ""
+        # 最後に選ばれたツール。［▼］に隠さない
+        self._focus_id = ""
+        # 状態の全文 (バーには「…」で切って出すことがある)
+        self._status_full = ""
+        # 利用者がツールを選んだか。**選ぶまでは画面中央に居続ける** ──
+        # 起動したとき、すでに動いているツールを引き継いでいても
+        self._engaged = False
+        # 生存監視が回っている最中か (重ねて走らせない)
+        self._polling = False
         self._save_handle = None
         # 自分で動かしている最中か。**利用者のドラッグと区別する印**
         self._programmatic = False
@@ -116,12 +128,8 @@ class LauncherBar:
         self.tool_frame.pack(side="left")
         # 入りきらないツールの受け皿。バーは折り返さないので、
         # あふれたぶんはここへ入れる (数が増えても細いままにする)
-        self.overflow_button = tk.Button(
-            self.tool_frame, text="▼", command=self.show_overflow,
-            bg=theme.BUTTON_BG, fg=theme.FG,
-            activebackground=theme.BUTTON_ACTIVE, activeforeground=theme.FG,
-            relief="flat", bd=0, padx=10, pady=6, font=theme.FONT,
-            cursor="hand2")
+        self.overflow_button = self._tool_button("▼", self.show_overflow)
+        self.overflow_button.configure(padx=10)
         self.overflow_menu = tk.Menu(self.root, tearoff=0,
                                      bg=theme.BUTTON_BG, fg=theme.FG,
                                      activebackground=theme.BUTTON_ACTIVE,
@@ -139,7 +147,7 @@ class LauncherBar:
         # ボタンを1つ増やさずに済むよう、バッジ自体を入口にする
         version = tk.Button(
             right, text=app_config.version_label(), command=self.show_version,
-            bg=theme.BG, fg=theme.MUTED, activebackground=theme.BUTTON_BG,
+            bg=theme.BG, fg=theme.MUTED, activebackground=theme.UTIL_BG,
             activeforeground=theme.FG, relief="flat", bd=0,
             padx=8, pady=5, font=theme.FONT_SMALL, cursor="hand2")
         version.pack(side="right", padx=(4, 0))
@@ -153,8 +161,13 @@ class LauncherBar:
         # 出せる詳細があるときだけ見せる。ふだんは畳んでおく
 
         # --- 状態表示 (要件定義書 §5.2) ---
-        status = tk.Frame(frame, bg=theme.BG)
+        # **幅を決めておく。** 決めないと、長い案内で文が途中で切れたり、
+        # 右の操作が押し出されたりする。収まらない文は「…」で切り、
+        # 全文はマウスを載せたときと［詳細］で出す
+        status = tk.Frame(frame, bg=theme.BG, width=theme.STATUS_WIDTH,
+                          height=28)
         status.pack(side="left", padx=(12, 0))
+        status.pack_propagate(False)
         self.lamp = tk.Canvas(status, width=12, height=12, bg=theme.BG,
                               highlightthickness=0)
         self.lamp.pack(side="left")
@@ -164,7 +177,12 @@ class LauncherBar:
         self.status_label = tk.Label(status, text="起動していません",
                                      bg=theme.BG, fg=theme.FG,
                                      font=theme.FONT_BOLD, anchor="w")
-        self.status_label.pack(side="left", padx=(6, 0))
+        self.status_label.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        self._status_font = tkfont.Font(font=theme.FONT_BOLD)
+        self.status_label.bind("<Enter>", self._show_full_status)
+        self.status_label.bind("<Leave>", self._hide_full_status)
+        self.status_label.bind("<Button-1>", lambda _e: self.show_detail())
+        self._tip: Optional[tk.Toplevel] = None
 
     def _build_tool_buttons(self) -> None:
         """設定にあるツールぶんのボタンを作り直す。
@@ -190,23 +208,16 @@ class LauncherBar:
             return
 
         for tool in tools:
-            button = tk.Button(
-                self.tool_frame, text=tool.display_name,
-                command=lambda app_id=tool.app_id: self.on_select(app_id),
-                bg=theme.BUTTON_BG, fg=theme.FG,
-                activebackground=theme.BUTTON_ACTIVE, activeforeground=theme.FG,
-                relief="flat", bd=0, padx=14, pady=6, font=theme.FONT,
-                cursor="hand2")
+            button = self._tool_button(
+                tool.display_name,
+                lambda app_id=tool.app_id: self.on_select(app_id))
             button.pack(side="left", padx=(0, 4))
             self.buttons[tool.app_id] = button
             self._names[tool.app_id] = tool.display_name
             self._order.append(tool.app_id)
             self._configured[tool.app_id] = tool.is_configured
-            if not tool.is_configured:
-                # 押しても起動しないことを、押す前に見せる
-                button.configure(bg=theme.BUTTON_UNSET)
         self._apply_overflow()
-        self._paint_buttons(self._current_app_id)
+        self._paint_buttons(self.manager.status)
 
     # --------------------------------------------------------------
     # 入りきらないツール
@@ -229,8 +240,8 @@ class LauncherBar:
         budget = self._tool_budget()
         widths = [self.buttons[app_id].winfo_reqwidth() + 4
                   for app_id in self._order]
-        must_show = (self._order.index(self._current_app_id)
-                     if self._current_app_id in self._order else None)
+        must_show = (self._order.index(self._focus_id)
+                     if self._focus_id in self._order else None)
         visible, hidden = geometry.fit_buttons(
             widths, budget=budget,
             overflow_width=self.overflow_button.winfo_reqwidth() + 4,
@@ -264,10 +275,11 @@ class LauncherBar:
         if not self._hidden:
             return
         self.overflow_menu.delete(0, "end")
+        running = set(self.manager.status.running_ids)
         for app_id in self._hidden:
             label = self._names.get(app_id, app_id)
-            if app_id == self._current_app_id:
-                label = f"● {label}"
+            if app_id in running:
+                label = f"● {label}（動作中）"
             elif not self._configured.get(app_id):
                 label = f"{label}（未設定）"
             self.overflow_menu.add_command(
@@ -281,9 +293,19 @@ class LauncherBar:
         finally:
             self.overflow_menu.grab_release()
 
+    def _tool_button(self, text: str, command) -> tk.Button:
+        """ツールのボタン。**押すものだと一目で分かる**よう、地より明るく太く。"""
+        return tk.Button(self.tool_frame, text=text, command=command,
+                         bg=theme.TOOL_BG, fg=theme.FG,
+                         activebackground=theme.TOOL_ACTIVE,
+                         activeforeground=theme.FG,
+                         relief="flat", bd=0, padx=14, pady=5,
+                         font=theme.FONT_TOOL, cursor="hand2")
+
     def _small_button(self, parent: tk.Widget, text: str, command) -> tk.Button:
+        """設定・終了などの操作。ツールのボタンより控えめにする。"""
         return tk.Button(parent, text=text, command=command,
-                         bg=theme.BUTTON_BG, fg=theme.MUTED,
+                         bg=theme.UTIL_BG, fg=theme.UTIL_FG,
                          activebackground=theme.BUTTON_ACTIVE,
                          activeforeground=theme.FG,
                          relief="flat", bd=0, padx=10, pady=5,
@@ -326,10 +348,12 @@ class LauncherBar:
         なるので隅へ寄る (要件定義書 §5.2「業務ツールの操作をできるだけ
         邪魔しない」)。
         """
-        active = (self.manager.current is not None
-                  or status.state.value in ("starting", "stopping"))
-        key = "position_active" if active else "position_idle"
-        return geometry.normalize_anchor(str(app_config.ui_setting(key)))
+        active = self._engaged and bool(
+            status.running_ids or status.starting_ids or status.stopping_ids)
+        if active:
+            return tool_registry.active_bar_position()
+        return geometry.normalize_anchor(
+            str(app_config.ui_setting("position_idle")), fallback="center")
 
     def _place(self) -> None:
         """最初の置き場所を決める (要件定義書 §5.1)。
@@ -489,24 +513,60 @@ class LauncherBar:
     # 操作
     # --------------------------------------------------------------
     def on_select(self, app_id: str) -> None:
-        """ツールのボタンが押された (要件定義書 §6)。"""
-        if self.manager.status.busy:
-            # 起動・停止の途中。押し直しは受け付けるが、何が起きているかは
-            # 出しておく。無反応に見えるのがいちばん困る
-            log.info("処理中に %s が押されました", app_id)
+        """ツールのボタンが押された (要件定義書 §6)。
+
+        **ほかのツールは止めない。** 動いていなければ起こし、動いて
+        いれば画面を前に出す。
+        """
+        self._engaged = True
+        self._focus_id = app_id
         self.manager.select(app_id)
 
     def on_stop_tool(self) -> None:
-        """動いているツールだけを止める。ランチャーは残る。"""
-        running = self.manager.current
-        if running is None:
+        """［ツール停止］。動いているツールを止める。ランチャーは残る。
+
+        1つだけなら確かめて止める。2つ以上なら、どれを止めるか選んで
+        もらう (すべて止める、も選べる)。
+        """
+        status = self.manager.status
+        running = self.manager.running
+        starting = [a for a in status.starting_ids if a not in running]
+        if len(running) == 1 and not starting:
+            only = next(iter(running.values()))
+            if messagebox.askyesno(
+                    app_config.display_name(),
+                    f"{only.display_name} を終了しますか?\n\n"
+                    "ほかのツールやランチャーはそのまま使えます。",
+                    parent=self.root):
+                self.manager.stop(only.app_id)
             return
-        if not messagebox.askyesno(
-                app_config.display_name(),
-                f"{running.display_name} を終了しますか?",
-                parent=self.root):
-            return
-        self.manager.stop_current()
+
+        menu = tk.Menu(self.root, tearoff=0, bg=theme.UTIL_BG, fg=theme.FG,
+                       activebackground=theme.TOOL_ACTIVE,
+                       activeforeground=theme.FG, font=theme.FONT)
+        for app_id, item in running.items():
+            menu.add_command(label=f"{item.display_name or app_id} を止める",
+                             command=lambda target=app_id: self.manager.stop(target))
+        for app_id in starting:
+            name = self._names.get(app_id, app_id)
+            menu.add_command(label=f"{name} の起動をやめる",
+                             command=lambda target=app_id: self.manager.stop(target))
+        if len(running) >= 2:
+            menu.add_separator()
+            menu.add_command(label="すべて止める", command=self._stop_all)
+        try:
+            menu.tk_popup(self.stop_button.winfo_rootx(),
+                          self.stop_button.winfo_rooty()
+                          + self.stop_button.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _stop_all(self) -> None:
+        names = "、".join(r.display_name for r in self.manager.running.values())
+        if messagebox.askyesno(app_config.display_name(),
+                               f"{names} をすべて終了しますか?",
+                               parent=self.root):
+            self.manager.stop_all()
 
     def show_version(self) -> None:
         """バージョン情報 (どの版が入っていて、どの版が動いているか)。"""
@@ -525,10 +585,10 @@ class LauncherBar:
             self._build_tool_buttons()
             # ツールが増えたぶん、窓を広げないとボタンが切れる
             self._resize_to_content()
-            # 設定画面で「位置を既定に戻す」が押されているかもしれない
+            # 設定画面で「自動に戻す」や、起動後の位置が変わったかもしれない
             self._manual = self._saved_position() is not None
             if not self._manual:
-                self._anchor = ""             # 次の状態変化で寄せ直す
+                self._anchor = ""             # 新しい決まりで寄せ直す
                 self._follow_state(self.manager.status)
 
     def show_detail(self) -> None:
@@ -542,17 +602,19 @@ class LauncherBar:
 
         **業務ツールまで止めるかを尋ねる。** ブラウザーを閉じることと
         バックエンドを止めることは別 (要件定義書 §11) なので、ランチャー
-        だけ終わらせたい場面がある。
+        だけ終わらせたい場面がある。止めずに閉じたツールは:
+
+        * そのまま使い続けられる (画面も残る)
+        * 画面を閉じれば、そのツールは自分で終わる
+        * 次にランチャーを起動したとき引き継ぐ (二重に起動しない)
         """
-        running = self.manager.current
+        running = self.manager.running
         stop_tools = False
-        if running is not None:
+        if running:
+            names = "、".join(r.display_name or a for a, r in running.items())
             answer = messagebox.askyesnocancel(
                 app_config.display_name(),
-                f"{running.display_name} が動いています。\n\n"
-                "「はい」  … ツールも終了してランチャーを閉じる\n"
-                "「いいえ」… ツールは動かしたままランチャーだけ閉じる\n"
-                "「キャンセル」… 閉じない",
+                close_question(names),
                 parent=self.root)
             if answer is None:
                 return
@@ -560,7 +622,7 @@ class LauncherBar:
 
         log.info("ランチャーを終了します (ツールも停止=%s)", stop_tools)
         if stop_tools:
-            self._set_status_text("stopping", "終了しています...")
+            self._set_status_text("stopping", "ツールを終了しています...")
             self.root.update_idletasks()
 
         if not self.manager.shutdown(stop_tools=stop_tools):
@@ -608,26 +670,22 @@ class LauncherBar:
             # 経過を出す。「進んでいる」ことが分かればよいので秒だけ
             # (基盤仕様書 2.2)
             message = f"{message} ({status.elapsed:.0f}秒)"
-        elif (status.state.value == "running" and status.browser_managed
-                and not status.browser_open):
-            # **画面を閉じると、ツールはまもなく自分から終わる。**
-            # 各ツールは「誰も見ていなければ終了する」見張りを持っていて、
-            # 画面の心拍が途切れると数秒で落ちる。「画面だけ閉じた状態が
-            # 続く」かのように見せると、実態と食い違う
-            message = f"{message}（画面を閉じました・まもなく終了します）"
         self._set_status_text(status.state.value, message)
 
         self._last_detail = status.detail
         if status.detail:
+            # 読んでほしい案内がある。**目立たせる**
+            self.detail_button.configure(text="詳細 ！", bg=theme.ATTENTION_BG,
+                                         fg=theme.FG)
             self.detail_button.pack(side="right", padx=(4, 0))
         else:
             self.detail_button.pack_forget()
 
-        self._current_app_id = (status.app_id
-                                if status.state.value == "running" else "")
-        self._paint_buttons(self._current_app_id)
+        if status.focus_id:
+            self._focus_id = status.focus_id
+        self._paint_buttons(status)
 
-        if self.manager.current is not None:
+        if status.running_ids or status.starting_ids:
             self.stop_button.pack(side="right", padx=(4, 0))
         else:
             self.stop_button.pack_forget()
@@ -635,23 +693,69 @@ class LauncherBar:
         self._follow_state(status)
 
     def _set_status_text(self, state: str, message: str) -> None:
-        self.status_label.configure(text=message)
+        """状態の文を出す。**枠に収まらなければ「…」で切る。**"""
+        self._status_full = message
+        width = max(40, theme.STATUS_WIDTH - 24)
+        self.status_label.configure(
+            text=fit_text(message, width, self._status_font.measure))
         self.lamp.itemconfigure(
             self._lamp_dot,
             fill=theme.STATE_COLORS.get(state, theme.MUTED))
 
-    def _paint_buttons(self, current_app_id: str) -> None:
-        """いま使っているツールのボタンを目立たせる (要件定義書 §5.2)。"""
-        if current_app_id and current_app_id in self._hidden:
-            # 使っているツールが［▼］の中に隠れている。**どれが動いて
+    def _show_full_status(self, _event=None) -> None:
+        """切れている文の全文を、マウスを載せたあいだだけ出す。"""
+        if self.status_label.cget("text") == self._status_full or self._tip:
+            return
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=self._status_full, bg=theme.UTIL_BG, fg=theme.FG,
+                 font=theme.FONT, padx=8, pady=4, justify="left",
+                 wraplength=480).pack()
+        tip.update_idletasks()
+        x = self.status_label.winfo_rootx()
+        y = self.status_label.winfo_rooty() - tip.winfo_reqheight() - 6
+        if y < 0:
+            y = self.status_label.winfo_rooty() + self.status_label.winfo_height() + 6
+        tip.geometry(f"+{x}+{y}")
+        self._tip = tip
+
+    def _hide_full_status(self, _event=None) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+    def _paint_buttons(self, status) -> None:
+        """動いているツールのボタンを目立たせる (要件定義書 §5.2)。
+
+        動いている → 緑と ●、起動・停止の最中 → 橙と …、未設定 → 茶。
+        **色だけに頼らず印も付ける** (色の見分けにくい人、遠目にも分かる)。
+        """
+        running = set(status.running_ids)
+        busy = set(status.starting_ids) | set(status.stopping_ids)
+        hidden_running = [a for a in running | busy if a in self._hidden]
+        if hidden_running:
+            # 動いているツールが［▼］の中に隠れている。**どれが動いて
             # いるか見えなくなる**ので、出し直す
+            self._focus_id = hidden_running[0]
             self._apply_overflow()
         for app_id, button in self.buttons.items():
-            if app_id == current_app_id:
-                button.configure(bg=theme.BUTTON_CURRENT)
-                continue
-            button.configure(bg=theme.BUTTON_BG if self._configured.get(app_id)
-                             else theme.BUTTON_UNSET)
+            name = self._names.get(app_id, app_id)
+            if app_id in busy:
+                button.configure(text=f"… {name}", bg=theme.TOOL_BUSY,
+                                 fg=theme.FG, activebackground=theme.TOOL_BUSY)
+            elif app_id in running:
+                button.configure(text=f"● {name}", bg=theme.TOOL_RUNNING,
+                                 fg=theme.FG,
+                                 activebackground=theme.TOOL_RUNNING_ACTIVE)
+            elif not self._configured.get(app_id):
+                # 押しても起動しないことを、押す前に見せる
+                button.configure(text=name, bg=theme.TOOL_UNSET,
+                                 fg=theme.TOOL_UNSET_FG,
+                                 activebackground=theme.TOOL_UNSET)
+            else:
+                button.configure(text=name, bg=theme.TOOL_BG, fg=theme.FG,
+                                 activebackground=theme.TOOL_ACTIVE)
 
     # --------------------------------------------------------------
     # 生存監視 (基盤仕様書 2.9)
@@ -666,11 +770,22 @@ class LauncherBar:
         いるのはツール側だけで、ブラウザーの有無は問わない
         (要件定義書 §11)。
         """
+        # **画面のスレッドでは回さない。** ツールが重い処理をしていると、
+        # 応答を待つあいだバーが固まる (ツールが増えるほど長くなる)。
+        # 結果は状態の知らせとしてキュー経由で届く
+        if not self._polling:
+            self._polling = True
+            threading.Thread(target=self._poll_worker, name="poll",
+                             daemon=True).start()
+        self.root.after(self._poll_interval_ms(), self._poll_health)
+
+    def _poll_worker(self) -> None:
         try:
             self.manager.poll_health()
         except Exception:                     # noqa: BLE001 - 監視で画面を止めない
             log.exception("生存監視で失敗しました")
-        self.root.after(self._poll_interval_ms(), self._poll_health)
+        finally:
+            self._polling = False
 
     # --------------------------------------------------------------
     def run(self) -> None:

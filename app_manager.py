@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ツールの起動・切替・停止 (要件定義書 §7 / §8 / §9)
+"""ツールの起動・停止 (要件定義書 §7 / §8 / §9)
 
 ランチャーの中身はほぼこれ1つ。**業務ロジックは持たない** ──
 各ツールの起動方法は、それぞれのリポジトリの `start.bat` に集約する
@@ -7,23 +7,19 @@
 
     ボタンが押された
        ↓
-    同じツールが動いている?  → はい: 画面を出すだけ (二重起動しない §9)
+    そのツールが動いている?  → はい: 画面を前に出すだけ (二重起動しない §9)
        ↓ いいえ
-    別のツールが動いている?  → はい:
-           そのツールの画面を閉じる        (§8.3)
-           そのツールのバックエンドを止める (§8.1)
-           終了を確認する
-       ↓
-    start.bat を実行する
+    start.bat を実行する          ※ ほかのツールは止めない (同時に使える)
        ↓
     /api/health が応答するまで待つ  ← **ここを飛ばさない** (§7.2)
        ↓
     ブラウザー画面を開く
        ↓
-    現在：<ツール名>
+    動作中：<ツール名>、<ツール名>
 
-画面とバックエンドは別々に扱う (§11)。利用者が画面だけ手で閉じても
-バックエンドは動いたままで、ランチャーはその状態を把握する。
+画面とバックエンドは別々に扱う (§11)。利用者が画面だけ手で閉じると、
+ツールは「誰も見ていない」と判断して自分で終わる。ランチャーはそれに
+気づいて、そのツールを一覧から外す。
 
 画面 (tkinter) はこのモジュールを読み込むが、**このモジュールは画面を
 読み込まない**。起動・停止の判断だけを持つので、画面が無い環境でも
@@ -63,17 +59,17 @@ NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 class State(str, Enum):
     """ランチャーバーに出す状態 (要件定義書 §5.2)。"""
 
-    IDLE = "idle"                # 何も起動していない
+    IDLE = "idle"                # 何も動いていない
     STARTING = "starting"        # 起動しています...
-    RUNNING = "running"          # 現在：<ツール名>
+    RUNNING = "running"          # 動作中：<ツール名>
     STOPPING = "stopping"        # 終了しています...
     ERROR = "error"              # 起動できませんでした
 
 
-# 起動・切り替えのどの段にいるか。**進み具合の窓** (`startup_progress`)
+# 起動・停止のどの段にいるか。**進み具合の窓** (`startup_progress`)
 # が、どこまで済んだかを描くのに使う
-PHASE_CLOSE_BROWSER = "close_browser"    # 前のツールの画面を閉じる
-PHASE_STOP_TOOL = "stop_tool"            # 前のツールを終了する
+PHASE_CLOSE_BROWSER = "close_browser"    # 止めるツールの画面を閉じる
+PHASE_STOP_TOOL = "stop_tool"            # ツールを終了する
 PHASE_SPAWN = "spawn"                    # 起動ファイルを実行する
 PHASE_WAIT = "wait"                      # 起動の完了を待つ (/api/health)
 PHASE_OPEN_BROWSER = "open_browser"      # 画面を開く
@@ -81,37 +77,42 @@ PHASE_OPEN_BROWSER = "open_browser"      # 画面を開く
 
 @dataclass
 class Status:
-    """画面に渡す1枚。**画面はこれだけを見て描く**。"""
+    """画面に渡す1枚。**画面はこれだけを見て描く**。
+
+    `state` / `message` は**いま起きたこと** (起動した・止めた・失敗した)。
+    どのツールが動いているかは `running_ids` などの一覧で持つ ──
+    ツールは同時に複数動くので、1つの状態では表せない。
+    """
 
     state: State = State.IDLE
+    # その知らせが**どのツールのことか**。全体の知らせなら空
     app_id: str = ""
     display_name: str = ""
     message: str = ""
-    # 利用者が次に何をすればよいか。エラーのときだけ入る
+    # 利用者が次に何をすればよいか。案内があるときだけ入る
     detail: str = ""
     elapsed: float = 0.0
     # バックエンドが応答しているか (基盤仕様書 2.9)。
     # ブラウザーを閉じたことと、ツールが落ちたことは別物
     responding: bool = False
-    # ランチャーが開いた画面がまだ出ているか (要件定義書 §8.3 / §11)。
-    # `responding` とは**別に持つ** ── 画面だけ閉じられた状態を
-    # 「ツールが落ちた」と取り違えないため
+    # ランチャーが開いた画面がまだ出ているか (要件定義書 §8.3 / §11)
     browser_open: bool = False
     # その画面をランチャーが閉じられるか。既定ブラウザーへ渡しただけの
-    # ときは False で、切り替えのとき手で閉じてもらうことになる
+    # ときやツールが自分で開いたときは False
     browser_managed: bool = False
-    # 動いているツールの版 (`/api/health` が返した値)。
-    # どの版が動いているかを、起動のたびにログへ残すために持つ
     tool_version: str = ""
-    # 起動・切り替えのどの段か (`PHASE_*`)。忙しくないときは空
+    # 起動・停止のどの段か (`PHASE_*`)。忙しくないときは空
     phase: str = ""
-    # 切り替えで**次に起動する**ツールの表示名。前のツールを止めて
-    # いるあいだも、何のために待っているのかを出せるように
-    target_name: str = ""
     # ツールが `/api/health` で返した準備の段階 (「アプリを準備中」など)
     stage: str = ""
     # 起動を待つ上限 (秒)。経過と並べて出す
     timeout: float = 0.0
+    # --- その時点の全体の様子 (ボタンの色分けに使う) ---
+    running_ids: tuple[str, ...] = ()
+    starting_ids: tuple[str, ...] = ()
+    stopping_ids: tuple[str, ...] = ()
+    # 最後に選ばれたツール。バーで少し強めに目立たせる
+    focus_id: str = ""
 
     @property
     def busy(self) -> bool:
@@ -122,38 +123,42 @@ StatusCallback = Callable[[Status], None]
 
 
 class ToolManager:
-    """起動中のツールを1つだけ持つ。
+    """動いているツールを**同時に複数**持つ。
 
-    同時に1つしか動かさないのは、要件定義書 §8 が「AからBへ切り替える」
-    ときにAを止めると決めているため。将来2つ並べたくなったら、ここを
-    辞書にすれば済むように、状態はすべてこのクラスの中に閉じてある。
+    以前は「AからBへ切り替えるときAを止める」1つずつの作りだった。
+    ところがツールが自分の画面をふだんのブラウザーに開く形 (ランチャー
+    が閉じられない画面) だと、止めたツールの画面が残り、どれも
+    「バックエンドに接続できません」になる。
+
+    そこで**選んだツールを起こすだけで、ほかは止めない**形にした。
+    各ツールは「誰も見ていなければ終了する」見張りを持っているので、
+    画面を閉じればそのツールは自分で終わる。ランチャーはそれに気づいて
+    ボタンの色を戻す。
     """
 
     def __init__(self, on_status: Optional[StatusCallback] = None) -> None:
         self._on_status = on_status
         self._status = Status()
-        # 起動・停止は時間がかかるので別スレッドで行う。画面を固めない
-        self._worker: Optional[threading.Thread] = None
         self._lock = threading.RLock()
-        # 要求ごとに増える番号。**古い待機を打ち切るための印**。
-        # 日報の起動を待っている最中に看板を押されたら、日報の待機は
-        # そこでやめる (でないと2つの待機が同時に画面を書き換える)
-        self._generation = 0
-        self._current: Optional[RunningTool] = runtime_state.read()
-        self._process: Optional[subprocess.Popen] = None
+        # 動いているツール。アプリIDごと
+        self._running: dict[str, RunningTool] = runtime_state.read_all()
+        # `start.bat` で起こしたプロセス (cmd.exe)。引き取るために持つ
+        self._processes: dict[str, subprocess.Popen] = {}
         # 応答が無かった回数。**1回で「終了した」と断じない** ──
         # スリープ復帰直後や、重い処理でHTTP応答が遅れたときに
         # 動いているツールを落ちた扱いにしてしまう
-        self._health_failures = 0
-        # いま起こしている最中のツール。**同じものを二重に起こさない印**。
-        # ボタンを素早く2回押すと、どちらの要求も「まだ何も動いていない」
-        # と見て、両方が `start.bat` を実行してしまう
-        self._starting: Optional[str] = None
-        # 切り替えで次に起こすツールの表示名。前を止めているあいだに出す
-        self._switch_target = ""
-        # 切り替えで止めたツールの画面が残っているときの案内。
-        # 次のツールが起動し終わったところで出す
-        self._leftover_note = ""
+        self._failures: dict[str, int] = {}
+        # いま起こしている・止めている最中のツール。**同じものを二重に
+        # 起こさない印**。ボタンを素早く2回押すと、どちらの要求も
+        # 「まだ動いていない」と見て、両方が `start.bat` を実行してしまう
+        self._starting: set[str] = set()
+        self._stopping: set[str] = set()
+        # 起動を待っている最中に「やめる」と言われたツール
+        self._cancelled: set[str] = set()
+        # 画面が開いていたか (前回の見回り)。変わったときだけ知らせる
+        self._browser_seen: dict[str, bool] = {}
+        # 最後に選ばれたツール
+        self._focus = ""
 
     # --------------------------------------------------------------
     # 状態
@@ -172,8 +177,24 @@ class ToolManager:
         return self._status
 
     @property
+    def running(self) -> dict[str, RunningTool]:
+        """動いているツール (写し)。"""
+        with self._lock:
+            return dict(self._running)
+
+    @property
     def current(self) -> Optional[RunningTool]:
-        return self._current
+        """最後に選ばれた (無ければ最後に起動した) 動いているツール。"""
+        with self._lock:
+            if self._focus in self._running:
+                return self._running[self._focus]
+            if not self._running:
+                return None
+            return max(self._running.values(), key=lambda r: r.started_at)
+
+    def is_busy(self, app_id: str) -> bool:
+        with self._lock:
+            return app_id in self._starting or app_id in self._stopping
 
     def _emit(self, status: Status) -> None:
         self._status = status
@@ -183,179 +204,221 @@ class ToolManager:
             except Exception:                 # noqa: BLE001 - 画面の都合で処理を止めない
                 log.exception("状態の通知に失敗しました")
 
-    def _set(self, state: State, message: str, tool: Optional[Tool] = None,
-             *, detail: str = "", elapsed: float = 0.0,
-             responding: bool = False,
-             browser_open: Optional[bool] = None,
-             phase: str = "", target_name: str = "", stage: str = "",
-             timeout: float = 0.0) -> None:
+    def _set(self, state: State, message: str, who=None, *, detail: str = "",
+             elapsed: float = 0.0, responding: bool = False,
+             browser_open: Optional[bool] = None, phase: str = "",
+             stage: str = "", timeout: float = 0.0) -> None:
+        """知らせを出す。`who` は `Tool` か `RunningTool` (どのツールのことか)。"""
+        app_id = getattr(who, "app_id", "") if who is not None else ""
+        name = getattr(who, "display_name", "") if who is not None else ""
+        with self._lock:
+            running = self._running.get(app_id)
+            running_ids = tuple(self._running)
+            starting = set(self._starting)
+            stopping = set(self._stopping)
+        if state not in (State.STARTING, State.STOPPING) and app_id:
+            # **終わったという知らせ**は、そのツールを「最中」に数えない。
+            # 起動・停止の印は知らせを出したあとで外すので、ここで外して
+            # おかないと、動いているのに「…」のままボタンに残る
+            starting.discard(app_id)
+            stopping.discard(app_id)
+        starting_ids = tuple(sorted(starting))
+        stopping_ids = tuple(sorted(stopping))
         if browser_open is None:
-            browser_open = (self._current is not None
-                            and process_manager.is_browser_open(self._current))
-        managed = self._current is not None and self._current.browser_managed
+            browser_open = (running is not None
+                            and process_manager.is_browser_open(running))
         self._emit(Status(
-            state=state,
-            app_id=tool.app_id if tool else (self._current.app_id
-                                             if self._current else ""),
-            display_name=(tool.display_name if tool
-                          else (self._current.display_name
-                                if self._current else "")),
+            state=state, app_id=app_id, display_name=name or app_id,
             message=message, detail=detail, elapsed=elapsed,
             responding=responding, browser_open=browser_open,
-            browser_managed=managed, phase=phase, target_name=target_name,
-            stage=stage, timeout=timeout))
+            browser_managed=bool(running and running.browser_managed),
+            phase=phase, stage=stage, timeout=timeout,
+            running_ids=running_ids, starting_ids=starting_ids,
+            stopping_ids=stopping_ids, focus_id=self._focus))
+
+    def summary(self) -> str:
+        """「動作中：日報、看板」。何も動いていなければ「起動していません」。"""
+        with self._lock:
+            names = [r.display_name or r.app_id for r in self._running.values()]
+        if not names:
+            return "起動していません"
+        return "動作中：" + "、".join(names)
+
+    def _settled_state(self) -> State:
+        """何も起きていないときの状態。動いているツールがあれば RUNNING。"""
+        with self._lock:
+            return State.RUNNING if self._running else State.IDLE
 
     # --------------------------------------------------------------
     # 起動していたものを引き継ぐ
     # --------------------------------------------------------------
-    def adopt_running(self) -> Optional[RunningTool]:
-        """すでに動いているツールを見つけて、現在のツールとして扱う。
+    def adopt_running(self) -> list[RunningTool]:
+        """すでに動いているツールを**すべて**見つけて、引き継ぐ。
 
-        2つの場面がある。ランチャーを再起動したとき (記録は残っている)
-        と、利用者が `Start.vbs` から直接ツールを起動していたとき。
-        どちらも「動いているのに、ランチャーは何も知らない」状態で、
-        そのままボタンを押すと二重起動になる (要件定義書 §9)。
+        ランチャーを再起動したとき (記録は残っている) と、利用者が
+        `Start.vbs` から直接ツールを起動していたとき。どちらも「動いて
+        いるのに、ランチャーは何も知らない」状態で、そのままボタンを
+        押すと二重起動になる (要件定義書 §9)。
         """
-        recorded = runtime_state.read()
-        if recorded is not None and process_manager.is_running(recorded):
-            self._current = recorded
-            log.info("動いているツールを引き継ぎました: %s", recorded.summary())
-            self._set(State.RUNNING, f"現在：{recorded.display_name}",
-                      responding=True)
-            return recorded
-
-        # 記録が無い、または応答しない。設定されているツールを当たる
+        recorded = runtime_state.read_all()
         tools = tool_registry.all_tools()
         payloads = _probe_all(tools)
+
+        adopted: dict[str, RunningTool] = {}
+        outside: list[str] = []
         for tool in tools:
             payload = payloads.get(tool.app_id)
             if not health.is_tool(payload, tool.app_id):
                 continue
-            running = _running_from_health(tool, payload, launch_pid=0)
-            self._current = running
-            runtime_state.write(running)
-            log.info("ランチャー外で動いているツールを見つけました: %s",
-                     running.summary())
-            # **この画面はランチャーが開いたものではない。** 閉じる
-            # 手がかりが無いので、切り替えのときに残る。黙っていると
-            # 「閉じたはずの画面が残っている」と見える
-            self._set(State.RUNNING, f"現在：{tool.display_name}",
-                      detail=("このツールはランチャーの外で起動されています。\n"
-                              "画面はランチャーからは閉じられないので、"
-                              "切り替えのときは手で閉じてください。"),
-                      responding=True)
-            return running
+            running = recorded.get(tool.app_id)
+            if running is None:
+                # **この画面はランチャーが開いたものではない。** 閉じる
+                # 手がかりが無い
+                running = _running_from_health(tool, payload, launch_pid=0)
+                outside.append(tool.display_name)
+            adopted[tool.app_id] = running
+        # 登録から消えたツールでも、記録があって応答していれば引き継ぐ
+        for app_id, running in recorded.items():
+            if app_id not in adopted and app_id not in payloads \
+                    and process_manager.is_running(running):
+                adopted[app_id] = running
 
-        if recorded is not None:
-            # 応答しない記録が残っている。片付けておく
-            runtime_state.clear()
-        self._current = None
-        self._set(State.IDLE, "起動していません")
-        return None
+        with self._lock:
+            self._running = adopted
+            self._failures = {}
+        runtime_state.replace_all(adopted)
+        for running in adopted.values():
+            log.info("動いているツールを引き継ぎました: %s", running.summary())
+
+        detail = ""
+        if outside:
+            detail = ("次のツールはランチャーの外で起動されています: "
+                      + "、".join(outside) + "\n画面はランチャーからは閉じられ"
+                      "ないので、止めたあとは手で閉じてください。")
+        self._set(self._settled_state(), self.summary(), detail=detail,
+                  responding=bool(adopted))
+        return list(adopted.values())
 
     # --------------------------------------------------------------
     # ボタンが押された
     # --------------------------------------------------------------
     def select(self, app_id: str) -> None:
-        """ツールのボタンが押されたときの入口。すぐ戻る (処理は別スレッド)。"""
+        """ツールのボタンが押されたときの入口。すぐ戻る (処理は別スレッド)。
+
+        **ほかのツールは止めない。** 動いていなければ起こし、動いて
+        いれば画面を前に出す。
+        """
         tool = tool_registry.get(app_id)
         if tool is None:
             self._set(State.ERROR, "登録されていないツールです",
                       detail=f"アプリID: {app_id}")
             return
+        self._focus = app_id
+        threading.Thread(target=self._run_select, args=(tool,),
+                         name=f"select-{tool.app_id}", daemon=True).start()
 
-        with self._lock:
-            if self._worker is not None and self._worker.is_alive():
-                # 前の要求がまだ動いている。番号を進めれば、そちらは
-                # 次の節目で自分から抜ける。連続して押されても、
-                # 最後に押したものが残る
-                log.info("前の処理を打ち切ります: %s", tool.display_name)
-            self._generation += 1
-            generation = self._generation
-            self._worker = threading.Thread(
-                target=self._run_select, args=(tool, generation),
-                name=f"select-{tool.app_id}", daemon=True)
-            self._worker.start()
-
-    def _run_select(self, tool: Tool, generation: int) -> None:
+    def _run_select(self, tool: Tool) -> None:
         try:
-            self._select_blocking(tool, generation)
+            self._select_blocking(tool)
         except Exception as exc:                  # noqa: BLE001 - 画面に出して継続
             log.exception("起動処理で予期しない失敗: %s", tool.app_id)
             self._set(State.ERROR, f"{tool.display_name}を起動できませんでした",
                       tool, detail=f"{exc}\nログ: {app_config.local_dir('logs')}")
 
-    def _select_blocking(self, tool: Tool, generation: int) -> None:
-        """起動・切替の本体。試験からはこちらを直接呼ぶ。"""
-        # --- すでに同じツールが動いている (要件定義書 §9) ---
-        current = self._current
-        if current is not None and current.app_id == tool.app_id:
-            if process_manager.is_running(current):
-                if process_manager.is_browser_open(current):
-                    # 画面はもう出ている。**もう1枚開かない** ──
-                    # 同じツールの窓が2つ並ぶほうが分かりにくい
-                    log.info("すでに動いていて画面も出ています: %s",
-                             tool.display_name)
-                else:
-                    # 利用者が画面だけ手で閉じていた。バックエンドは
-                    # 動いたままなので、起動し直さず画面だけ開く (§11)
-                    log.info("画面だけ開き直します: %s", tool.display_name)
-                    self._open_browser(current, current.url or tool.home_url)
-                self._set(State.RUNNING, f"現在：{tool.display_name}", tool,
-                          responding=True)
+    def _select_blocking(self, tool: Tool) -> None:
+        """起動の本体。試験からはこちらを直接呼ぶ。"""
+        self._focus = tool.app_id
+        with self._lock:
+            running = self._running.get(tool.app_id)
+        if running is not None:
+            if process_manager.is_running(running):
+                self._show(tool, running)
                 return
             # 記録はあるが応答しない。落ちている。起動し直す
             log.info("%s は応答しないので起動し直します", tool.display_name)
-            self._current = None
-            runtime_state.clear()
+            self._forget(tool.app_id)
+        self._start(tool)
 
-        # --- 別のツールが動いている (要件定義書 §8) ---
-        if self._current is not None:
-            # 止めているあいだも「何を起動するために待っているか」を出す
-            self._switch_target = tool.display_name
-            try:
-                if not self._stop_current(generation):
-                    return                    # 止められなかった。理由は出してある
-            finally:
-                self._switch_target = ""
-            if self._superseded(generation):
-                return
-
-        self._start(tool, generation)
+    def _show(self, tool: Tool, running: RunningTool) -> None:
+        """動いているツールの画面を出す。**起動し直さない** (§9)。"""
+        if process_manager.is_browser_open(running):
+            # もう出ている。**もう1枚開かない** ── 同じツールの窓が2つ
+            # 並ぶと作業状態を奪い合う。前に出すだけにする
+            brought = browser.bring_to_front(running.browser_pid)
+            log.info("すでに動いていて画面も出ています: %s (前へ=%s)",
+                     tool.display_name, brought)
+            detail = ""
+        elif running.browser_managed or tool.suppresses_browser:
+            # 利用者が画面だけ手で閉じていた。バックエンドは動いたまま
+            # なので、起動し直さず画面だけ開く (§11)
+            log.info("画面だけ開き直します: %s", tool.display_name)
+            self._open_browser(running, running.url or tool.home_url)
+            detail = ""
+        else:
+            detail = (f"{tool.display_name}は動いています。画面はツールが"
+                      "ふだんのブラウザーに開いているので、そちらを見てください。")
+        self._set(State.RUNNING, self.summary(), tool, detail=detail,
+                  responding=True)
 
     # --------------------------------------------------------------
     # 停止
     # --------------------------------------------------------------
-    def stop_current(self, *, force: bool = False) -> None:
-        """「終了」が押されたとき。すぐ戻る。"""
+    def stop(self, app_id: str, *, force: bool = False) -> None:
+        """1つのツールを止める。すぐ戻る。起動中なら起動をやめる。"""
         with self._lock:
-            self._generation += 1
-            generation = self._generation
-            self._worker = threading.Thread(
-                target=self._stop_current, args=(generation,),
-                kwargs={"force": force}, name="stop", daemon=True)
-            self._worker.start()
+            if app_id in self._starting:
+                self._cancelled.add(app_id)
+                return
+        threading.Thread(target=self._stop_blocking, args=(app_id,),
+                         kwargs={"force": force}, name=f"stop-{app_id}",
+                         daemon=True).start()
 
-    def _stop_current(self, generation: int, *, force: bool = False) -> bool:
-        """現在のツールを止めて、**終了を確認する** (要件定義書 §8.1)。"""
-        running = self._current
-        if running is None:
-            self._set(State.IDLE, "起動していません")
-            return True
+    def stop_current(self, *, force: bool = False) -> None:
+        """最後に選ばれたツールを止める。"""
+        running = self.current
+        if running is not None:
+            self.stop(running.app_id, force=force)
 
+    def stop_all(self, *, force: bool = False) -> None:
+        """動いているツールをすべて止める。すぐ戻る。"""
+        threading.Thread(target=self._stop_all_blocking, kwargs={"force": force},
+                         name="stop-all", daemon=True).start()
+
+    def _stop_all_blocking(self, *, force: bool = False) -> bool:
+        with self._lock:
+            self._cancelled.update(self._starting)
+            targets = list(self._running)
+        results = [self._stop_blocking(app_id, force=force) for app_id in targets]
+        return all(results)
+
+    def _stop_blocking(self, app_id: str, *, force: bool = False) -> bool:
+        """1つのツールを止めて、**終了を確認する** (要件定義書 §8.1)。"""
+        with self._lock:
+            running = self._running.get(app_id)
+            if running is None:
+                return True
+            if app_id in self._stopping:
+                return False                  # すでに止めている最中
+            self._stopping.add(app_id)
+        try:
+            return self._stop_locked(running, force=force)
+        finally:
+            with self._lock:
+                self._stopping.discard(app_id)
+
+    def _stop_locked(self, running: RunningTool, *, force: bool) -> bool:
         name = running.display_name or running.app_id
-        target = self._switch_target
         # 画面を閉じることから始まるので、そう伝える (要件定義書 §8.2)
         if running.browser_managed and process_manager.is_browser_open(running):
-            self._set(State.STOPPING, f"{name}の画面を閉じています...",
-                      phase=PHASE_CLOSE_BROWSER, target_name=target)
+            self._set(State.STOPPING, f"{name}の画面を閉じています...", running,
+                      phase=PHASE_CLOSE_BROWSER)
         else:
-            self._set(State.STOPPING, f"{name}を終了しています...",
-                      phase=PHASE_STOP_TOOL, target_name=target)
+            self._set(State.STOPPING, f"{name}を終了しています...", running,
+                      phase=PHASE_STOP_TOOL)
 
         def on_backend() -> None:
-            self._set(State.STOPPING, f"{name}を終了しています...",
-                      phase=PHASE_STOP_TOOL, target_name=target)
+            self._set(State.STOPPING, f"{name}を終了しています...", running,
+                      phase=PHASE_STOP_TOOL)
 
         # `process_manager.stop` が中で画面を先に閉じてから
         # バックエンドを止める (要件定義書 §8.3 の処理順序)
@@ -373,45 +436,43 @@ class ToolManager:
                       + "、".join(result.busy_jobs)
                       + "\n終了するときは「強制終了」を選んでください")
             if result.browser_closed:
-                # 画面は先に閉じてある。バックエンドは動いたままなので、
-                # **黙っていると「消えた」ように見える**
                 detail += ("\n画面は閉じましたが、処理は続いています。"
                            "同じボタンを押すと画面を開き直せます。")
-            self._set(State.RUNNING, f"現在：{name}", detail=detail,
+            self._set(State.RUNNING, self.summary(), running, detail=detail,
                       responding=True)
             return False
 
         if not result.stopped:
-            self._set(State.ERROR, f"{name}を終了できませんでした",
+            self._set(State.ERROR, f"{name}を終了できませんでした", running,
                       detail=(f"{result.message}\n"
                               f"ログ: {app_config.local_dir('logs')}"))
             return False
 
-        self._reap_process()
-        self._current = None
-        self._health_failures = 0
-        runtime_state.clear()
+        self._forget(running.app_id)
         log.info("停止完了: %s (%s)", name, result.method)
         # **ランチャーが閉じられない画面が残るなら、そう伝える。**
         # 「終了しました」とだけ出ると、残ったタブを見た利用者は
         # 止まっていないのかと思う
         note = _leftover_note(running, name)
-        # 切り替えの途中なら「終了しました」は出さない。すぐ次の起動が
-        # 続くので、出すとバーの表示と進み具合の窓が一瞬途切れる。
-        # 残った画面の案内は、次のツールが起動し終わってから出す
-        if target:
-            self._leftover_note = note
-        elif not self._superseded(generation):
-            message = f"{name}を終了しました"
-            if note:
-                message += "（画面は手で閉じてください）"
-            self._set(State.IDLE, message, detail=note)
+        message = f"{name}を終了しました"
+        if note:
+            message += "（画面は手で閉じてください）"
+        self._set(self._settled_state(), message, running, detail=note)
         return True
+
+    def _forget(self, app_id: str) -> None:
+        """止まったツールを一覧から外し、`start.bat` の受け皿を引き取る。"""
+        self._reap_process(app_id)
+        with self._lock:
+            self._running.pop(app_id, None)
+            self._failures.pop(app_id, None)
+            self._browser_seen.pop(app_id, None)
+        runtime_state.remove(app_id)
 
     # `start.bat` の受け皿が終わるのを待つ上限 (秒)
     REAP_WAIT_SEC = 3.0
 
-    def _reap_process(self) -> None:
+    def _reap_process(self, app_id: str) -> None:
         """`start.bat` で起こしたプロセスを引き取る。
 
         引き取らないと、終了済みのプロセスがゾンビとしてPID表に残り、
@@ -419,11 +480,11 @@ class ToolManager:
 
         業務ツール本体が止まれば、それを起こした `cmd.exe` もふつうは
         一緒に終わる。**終わらないときは落とす** ── 残しておくと、
-        見えないコンソールが切り替えのたびに1つずつ増えていく。
+        見えないコンソールが起動のたびに1つずつ増えていく。
         自分で起こしたプロセスなので、照合は要らない。
         """
-        proc = self._process
-        self._process = None
+        with self._lock:
+            proc = self._processes.pop(app_id, None)
         if proc is None:
             return
         try:
@@ -441,7 +502,7 @@ class ToolManager:
     # --------------------------------------------------------------
     # 起動
     # --------------------------------------------------------------
-    def _start(self, tool: Tool, generation: int) -> None:
+    def _start(self, tool: Tool) -> None:
         problem = tool_registry.validate_start_command(tool.start_command)
         if not tool.start_command.strip():
             self._set(State.ERROR, f"{tool.display_name}が設定されていません", tool,
@@ -453,31 +514,27 @@ class ToolManager:
                       detail=f"{problem}\n設定画面で指定し直してください。")
             return
 
-        # **ここから先は1つずつ。** 同じツールが起こされている最中なら、
-        # 2度目は何もしない ── 2つ目の `start.bat` はポートが空いて
-        # いないので失敗し、**起動できているのに「起動できませんでした」**
-        # と出ることになる
+        # **同じツールは1つずつ。** 起こしている最中なら、2度目は何もしない
+        # ── 2つ目の `start.bat` はポートが空いていないので失敗し、
+        # **起動できているのに「起動できませんでした」**と出ることになる
         with self._lock:
-            if self._superseded(generation):
+            if tool.app_id in self._starting:
+                log.info("%s を起こしている最中です", tool.app_id)
                 return
-            if self._starting is not None:
-                log.info("%s を起こしている最中です。%s は起動しません",
-                         self._starting, tool.app_id)
-                return
-            if (self._current is not None
-                    and self._current.app_id == tool.app_id):
+            if tool.app_id in self._running:
                 log.info("%s はすでに動いています", tool.app_id)
                 return
-            self._starting = tool.app_id
+            self._starting.add(tool.app_id)
+            self._cancelled.discard(tool.app_id)
 
         try:
-            self._start_locked(tool, generation)
+            self._start_locked(tool)
         finally:
             with self._lock:
-                if self._starting == tool.app_id:
-                    self._starting = None
+                self._starting.discard(tool.app_id)
+                self._cancelled.discard(tool.app_id)
 
-    def _start_locked(self, tool: Tool, generation: int) -> None:
+    def _start_locked(self, tool: Tool) -> None:
         """起動の本体。**同じツールでは1つしか走らない**ことが前提。"""
         timeout = float(app_config.ui_setting("start_timeout_seconds"))
         self._set(State.STARTING, f"{tool.display_name}を起動しています...", tool,
@@ -485,7 +542,8 @@ class ToolManager:
         proc = self._spawn(tool)
         if proc is None:
             return
-        self._process = proc
+        with self._lock:
+            self._processes[tool.app_id] = proc
 
         started = time.monotonic()
         # BATが先に落ちたことを、時間切れと区別するための入れ物。
@@ -494,7 +552,7 @@ class ToolManager:
         early_exit: dict[str, int] = {}
 
         def should_stop() -> bool:
-            if self._superseded(generation):
+            if tool.app_id in self._cancelled:
                 return True
             code = proc.poll()
             if code is not None and code != 0:
@@ -503,8 +561,6 @@ class ToolManager:
             return False
 
         def on_progress(elapsed: float, payload: Optional[dict]) -> None:
-            if self._superseded(generation):
-                return
             stage = health.stage_text(payload)
             message = f"{tool.display_name}を起動しています..."
             if stage:
@@ -516,21 +572,28 @@ class ToolManager:
             tool.health_url, tool.app_id, timeout=timeout,
             on_progress=on_progress, should_stop=should_stop)
 
-        if self._superseded(generation):
-            # 待っているあいだに別のツールが選ばれた。**起こしかけた
+        if tool.app_id in self._cancelled:
+            # 待っているあいだに「やめる」と言われた。**起こしかけた
             # ものを置き去りにしない** ── 誰も知らないまま動き続ける
-            log.info("起動待ちを打ち切りました: %s", tool.display_name)
+            log.info("起動をやめました: %s", tool.display_name)
+            with self._lock:
+                self._processes.pop(tool.app_id, None)
             self._abandon(tool, proc)
+            self._set(self._settled_state(), f"{tool.display_name}の起動をやめました",
+                      tool)
             return
 
         if payload is None:
+            with self._lock:
+                self._processes.pop(tool.app_id, None)
             self._report_start_failure(tool, proc, early_exit,
                                        time.monotonic() - started)
             return
 
         running = _running_from_health(tool, payload, launch_pid=proc.pid)
-        self._current = running
-        self._health_failures = 0
+        with self._lock:
+            self._running[tool.app_id] = running
+            self._failures[tool.app_id] = 0
         # **どの版が動き出したかを残す。** 「入れ替えたのに直らない」を
         # 調べるとき、ログにこの1行があるかどうかで手間が変わる
         log.info("起動完了: %s (版 %s)", running.summary(),
@@ -550,22 +613,17 @@ class ToolManager:
             log.info("画面はツール側が開きます: %s", tool.display_name)
         # 画面のPIDまで入った状態で記録する。`stop.bat` は別プロセス
         # なので、書いておかないとそちらから画面を閉じられない
-        runtime_state.write(running)
+        runtime_state.put(running)
 
         detail = ""
         if not tool.suppresses_browser:
             detail = _tool_opens_browser_note(tool)
         elif not running.browser_managed:
             detail = ("画面は既定のブラウザーで開きました。\n"
-                      "切り替えのときに自動では閉じないので、"
+                      "止めるときに自動では閉じないので、"
                       "不要になったタブは手で閉じてください。")
-        if self._leftover_note:
-            # 切り替えで止めた前のツールの画面が残っている
-            detail = "\n\n".join(t for t in (self._leftover_note, detail) if t)
-            self._leftover_note = ""
-        self._set(State.RUNNING, f"現在：{tool.display_name}", tool,
-                  detail=detail, elapsed=time.monotonic() - started,
-                  responding=True)
+        self._set(State.RUNNING, self.summary(), tool, detail=detail,
+                  elapsed=time.monotonic() - started, responding=True)
 
     def _spawn(self, tool: Tool) -> Optional[subprocess.Popen]:
         """起動入口を実行する (要件定義書 §12.2)。
@@ -628,7 +686,7 @@ class ToolManager:
     def _abandon(self, tool: Tool, proc: subprocess.Popen) -> None:
         """起こしかけたツールを片付ける。
 
-        切り替えで打ち切ったとき、こちらは記録を持たないまま去るので、
+        起動をやめたとき、こちらは記録を持たないまま去るので、
         止める人が誰も居なくなる。**立ち上がっていれば止める**。
         """
         payload = health.probe(tool.health_url)
@@ -682,64 +740,83 @@ class ToolManager:
     # 生存監視 (基盤仕様書 2.9)
     # --------------------------------------------------------------
     def poll_health(self) -> bool:
-        """現在のツールがまだ応答しているか。画面から定期的に呼ぶ。
+        """動いているツールがまだ応答しているか。画面から定期的に呼ぶ。
 
         **ブラウザーを閉じたこととツールが落ちたことは別物** なので、
-        ここで見るのはツール側だけ。落ちていたら状態を戻し、利用者が
+        ここで見るのはツール側。落ちていたら一覧から外し、利用者が
         もう一度押せば起動し直せるようにする (要件定義書 §11)。
+
+        何か1つでも動いていれば真。
         """
-        running = self._current
-        if running is None or self._status.busy:
-            return False
+        with self._lock:
+            targets = [(a, r) for a, r in self._running.items()
+                       if a not in self._starting and a not in self._stopping]
+        if not targets:
+            return bool(self._running)
 
         # 利用者が手で閉じた画面を片付ける
         browser.reap()
-
-        if process_manager.is_running(running):
-            self._health_failures = 0
-            # **画面の生死はバックエンドと別に見る** (要件定義書 §11)。
-            # 利用者が画面だけ手で閉じても、バックエンドは動いたまま。
-            # そのことを表に出す ── 出さないと「終わったつもり」で
-            # 残り続ける
-            browser_open = process_manager.is_browser_open(running)
-            if (not self._status.responding
-                    or self._status.browser_open != browser_open):
-                detail = ""
-                if running.browser_managed and not browser_open:
-                    # **画面を閉じると、ツールはまもなく自分から終わる。**
-                    # 各ツールは「誰も見ていなければ終了する」見張りを
-                    # 持っていて、画面の心拍が途切れると数秒で落ちる。
-                    # 「画面だけ閉じた」状態が続くかのように見せない
-                    log.info("画面が閉じられました。ツールはまもなく終了します: %s",
-                             running.app_id)
-                    detail = (
-                        f"{running.display_name}のブラウザー画面を閉じました。\n"
-                        "ツール側は「誰も見ていない」と判断して、まもなく自動で"
-                        "終了します(実行中の処理があれば終わるまで待ちます)。\n\n"
-                        "続けて使うときは、もう一度ボタンを押してください。")
-                self._set(State.RUNNING, f"現在：{running.display_name}",
-                          detail=detail, responding=True,
-                          browser_open=browser_open)
-            return True
-
-        # --- 応答が無い ---
-        self._health_failures += 1
         limit = max(1, int(app_config.ui_setting("health_failures_before_dead")))
-        if self._health_failures < limit:
-            log.info("応答がありません (%d/%d): %s",
-                     self._health_failures, limit, running.app_id)
-            return True                       # まだ判断しない
+        answers = _probe_running([r for _, r in targets])
 
-        log.warning("応答が途切れました: %s (%d回連続)",
-                    running.summary(), self._health_failures)
-        self._health_failures = 0
-        self._reap_process()
-        self._current = None
-        runtime_state.clear()
-        self._set(State.ERROR, f"{running.display_name}が終了しました",
-                  detail=("ツール側が停止したか、応答しなくなりました。\n"
-                          "もう一度ボタンを押すと起動し直します。"))
-        return False
+        for app_id, running in targets:
+            if answers.get(app_id):
+                self._failures[app_id] = 0
+                self._watch_browser(running)
+                continue
+
+            # --- 応答が無い ---
+            count = self._failures.get(app_id, 0) + 1
+            self._failures[app_id] = count
+            if count < limit:
+                log.info("応答がありません (%d/%d): %s", count, limit, app_id)
+                continue                      # まだ判断しない
+            self._lost(running, count)
+        return bool(self._running)
+
+    def _watch_browser(self, running: RunningTool) -> None:
+        """画面を閉じたら知らせる。**閉じるとツールはまもなく自分で終わる。**
+
+        各ツールは「誰も見ていなければ終了する」見張りを持っていて、
+        画面の心拍が途切れると数秒で落ちる。「画面だけ閉じた状態が
+        続く」かのように見せない。
+        """
+        if not running.browser_managed:
+            return
+        open_now = process_manager.is_browser_open(running)
+        before = self._browser_seen.get(running.app_id)
+        self._browser_seen[running.app_id] = open_now
+        if before is None or before == open_now or open_now:
+            return
+        name = running.display_name or running.app_id
+        log.info("画面が閉じられました。ツールはまもなく終了します: %s",
+                 running.app_id)
+        self._set(State.RUNNING, f"{name}の画面を閉じました（まもなく終了します）",
+                  running, responding=True, browser_open=False,
+                  detail=(f"{name}のブラウザー画面を閉じました。\n"
+                          "ツール側は「誰も見ていない」と判断して、まもなく自動で"
+                          "終了します(実行中の処理があれば終わるまで待ちます)。\n\n"
+                          "続けて使うときは、もう一度ボタンを押してください。"))
+
+    def _lost(self, running: RunningTool, count: int) -> None:
+        """応答が途切れたツールを一覧から外す。"""
+        name = running.display_name or running.app_id
+        log.warning("応答が途切れました: %s (%d回連続)", running.summary(), count)
+        was_open = (running.browser_managed
+                    and process_manager.is_browser_open(running))
+        self._forget(running.app_id)
+        if was_open:
+            # 画面は出ているのにツールが答えない。**思わぬ停止**
+            self._set(State.ERROR, f"{name}が終了しました", running,
+                      detail=("ツール側が停止したか、応答しなくなりました。\n"
+                              "もう一度ボタンを押すと起動し直します。"))
+            return
+        # 画面を閉じたので、ツールが自分で終わった。ふつうのこと
+        self._set(self._settled_state(), f"{name}は終了しました", running,
+                  detail=("画面を閉じると、ツールは自分で終了します。\n"
+                          "続けて使うときは、もう一度ボタンを押してください。"
+                          + ("" if running.browser_managed else
+                             "\n画面 (タブ) が残っていれば、手で閉じてください。")))
 
     # --------------------------------------------------------------
     # 後始末
@@ -751,28 +828,29 @@ class ToolManager:
         こととバックエンドを止めることは別 (要件定義書 §11)。長い処理の
         途中でランチャーを閉じただけで落とされるのは困る。
 
+        止めずに終わったツールは動き続け、次にランチャーを起動したとき
+        引き継ぐ。画面を閉じれば、各ツールは自分で終わる。
+
         **止まらなかったことを黙って飲み込まない。** 実行中の処理が
         あって止められなかったのに閉じてしまうと、利用者は「止めた
         つもり」で残ったツールに気づけない。
         """
+        if stop_tools:
+            return self._stop_all_blocking(force=force)
         with self._lock:
-            self._generation += 1
-        if stop_tools and self._current is not None:
-            return self._stop_current(self._generation, force=force)
-        self._reap_process()
+            self._cancelled.update(self._starting)
+            pending = list(self._processes)
+        for app_id in pending:
+            self._reap_process(app_id)
         return True
 
     # --------------------------------------------------------------
-    def _superseded(self, generation: int) -> bool:
-        """自分より新しい要求が来ているか。"""
-        return generation != self._generation
-
     def _open_browser(self, running: RunningTool, url: str) -> None:
         """画面を開き、閉じるための手がかりを記録に残す。
 
         専用プロファイルのアプリウィンドウとして開けたときだけ、PIDと
         プロファイルの道が入る。既定ブラウザーへ渡しただけのときは
-        空のままで、切り替えのときに閉じられないことが記録に残る。
+        空のままで、止めるときに閉じられないことが記録に残る。
         """
         if not url:
             return
@@ -783,8 +861,11 @@ class ToolManager:
             return
         running.browser_pid = session.pid
         running.browser_profile = session.profile_dir
-        if self._current is running:
-            runtime_state.write(running)
+        with self._lock:
+            known = self._running.get(running.app_id) is running
+        if known:
+            runtime_state.put(running)
+            self._browser_seen[running.app_id] = True
 
 
 # 起動時に動いているツールを探すとき、同時に当たる数の上限
@@ -806,6 +887,16 @@ def _probe_all(tools: list[Tool]) -> dict[str, Optional[dict]]:
                             thread_name_prefix="probe") as pool:
         answers = pool.map(lambda t: health.probe(t.health_url), targets)
         return {t.app_id: payload for t, payload in zip(targets, answers)}
+
+
+def _probe_running(records: list[RunningTool]) -> dict[str, bool]:
+    """動いているはずのツールを**同時に**当たる。答えたかどうか。"""
+    if not records:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(records)),
+                            thread_name_prefix="alive") as pool:
+        answers = pool.map(process_manager.is_running, records)
+        return {r.app_id: bool(alive) for r, alive in zip(records, answers)}
 
 
 def _running_from_health(tool: Tool, payload: Optional[dict],
@@ -875,8 +966,9 @@ def _tool_opens_browser_note(tool: Tool) -> str:
         lines.append(f"起動引数「{tool.start_args}」は "
                      f"{Path(tool.start_command).name} が転送しないため"
                      "届いていません。")
-    lines.append("切り替えのときランチャーからは閉じられないので、"
-                 "不要になった画面は手で閉じてください。")
+    lines.append("止めるときランチャーからは閉じられないので、"
+                 "不要になった画面は手で閉じてください。"
+                 "(画面を閉じると、ツールは自分で終了します)")
     return "\n".join(lines)
 
 

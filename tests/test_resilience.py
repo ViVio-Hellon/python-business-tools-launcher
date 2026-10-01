@@ -47,9 +47,10 @@ class HealthFailureTests(LocalAreaTestCase):
         self.running = RunningTool(
             app_id="fake.alive", display_name="日報", pid=1, port=9,
             health_url="http://127.0.0.1:9/api/health")
-        self.manager._current = self.running
-        runtime_state.write(self.running)
-        self.manager._set(State.RUNNING, "現在：日報", responding=True)
+        self.manager._running = {self.running.app_id: self.running}
+        runtime_state.put(self.running)
+        self.manager._set(State.RUNNING, "動作中：日報", self.running,
+                          responding=True)
 
     def test_1回の失敗では終了扱いにしない(self) -> None:
         with mock.patch.object(process_manager, "is_running", return_value=False):
@@ -58,7 +59,7 @@ class HealthFailureTests(LocalAreaTestCase):
         self.assertEqual(self.manager.status.state, State.RUNNING)
         self.assertIsNotNone(runtime_state.read(),
                              "1回の失敗で記録を消しています")
-        self.assertIsNotNone(self.manager.current)
+        self.assertIn("fake.alive", self.manager.running)
 
     def test_続けて失敗すれば終了扱いにする(self) -> None:
         limit = int(app_config.ui_setting("health_failures_before_dead"))
@@ -66,7 +67,10 @@ class HealthFailureTests(LocalAreaTestCase):
             for _ in range(limit):
                 self.manager.poll_health()
 
-        self.assertEqual(self.manager.status.state, State.ERROR)
+        # 画面の手がかりが無いツール。画面を閉じて自分で終わったのと
+        # 見分けがつかないので、エラーにはせず「終了しました」と出す
+        self.assertNotIn("fake.alive", self.manager.running)
+        self.assertIn("日報は終了しました", self.manager.status.message)
         self.assertIsNone(runtime_state.read())
 
     def test_途中で戻れば数え直す(self) -> None:
@@ -104,7 +108,9 @@ class BrowserClosedTests(LocalAreaTestCase):
             app_id="fake.win", display_name="日報", pid=1, port=9,
             health_url="http://127.0.0.1:9/api/health",
             browser_pid=1234, browser_profile=str(self.work_root / "prof"))
-        self.manager._current = self.running
+        self.manager._running = {self.running.app_id: self.running}
+        # ランチャーが開いた画面 (開いたことを見ている)
+        self.manager._browser_seen[self.running.app_id] = True
 
     def test_まもなく終了することを伝える(self) -> None:
         with mock.patch.object(process_manager, "is_running", return_value=True), \
@@ -136,8 +142,7 @@ class AdoptedToolTests(LocalAreaTestCase):
         self.proc = None
 
     def _stop(self) -> None:
-        running = runtime_state.read()
-        if running is not None:
+        for running in runtime_state.read_all().values():
             process_manager.stop(running, force=True, timeout=5)
         if self.proc is not None and self.proc.poll() is None:
             self.proc.kill()
@@ -161,7 +166,7 @@ class AdoptedToolTests(LocalAreaTestCase):
         deadline = time.monotonic() + 15
         manager = ToolManager()
         while time.monotonic() < deadline:
-            if manager.adopt_running() is not None:
+            if manager.adopt_running():
                 break
             time.sleep(0.1)
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,7 +25,11 @@ from .logging_utils import get_logger
 
 log = get_logger("runtime_state")
 
-STATE_FILE = "current.json"
+# 動いているツールの記録。**同時に複数動く**ので、アプリIDごとに持つ
+STATE_FILE = "running.json"
+# 以前の版 (同時に1つだけ) の記録。残っていれば読み、次に書くときに消す
+LEGACY_FILE = "current.json"
+FORMAT = 1
 
 
 @dataclass
@@ -82,42 +87,122 @@ def state_path() -> Path:
     return app_config.local_dir("runtime") / STATE_FILE
 
 
-def write(running: Optional[RunningTool]) -> None:
-    """いま動いているツールを記録する。`None` で消す。"""
-    path = state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if running is None:
-        try:
-            path.unlink()
-            log.info("実行中の記録を消しました")
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            log.warning("実行中の記録を消せませんでした: %s", exc)
-        return
-
-    try:
-        path.write_text(json.dumps(asdict(running), ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-    except OSError as exc:
-        log.warning("実行中の記録を書けませんでした: %s", exc)
-        return
-    log.info("実行中の記録: %s", running.summary())
+def _legacy_path() -> Path:
+    return app_config.local_dir("runtime") / LEGACY_FILE
 
 
-def read() -> Optional[RunningTool]:
-    """記録を読む。壊れていれば `None`。
+# 同じランチャーの中で、起動と停止が別々のスレッドから同時に書きに来る。
+# 読んで・直して・書くあいだに割り込まれると、片方の書き込みが消える
+_LOCK = threading.RLock()
+
+
+def read_all() -> dict[str, RunningTool]:
+    """動いているツールの記録をすべて読む。アプリIDごと。
 
     **読めないことを理由に止まらない。** 記録はあくまで手掛かりで、
     正しさの最終判断は `/api/health` の応答で行う。
+
+    以前の版 (同時に1つだけ) の `current.json` が残っていれば、それも読む。
     """
+    with _LOCK:
+        found: dict[str, RunningTool] = {}
+        raw = _read_json(state_path())
+        if isinstance(raw, dict):
+            for item in (raw.get("tools") or {}).values():
+                running = _from_dict(item)
+                if running is not None:
+                    found[running.app_id] = running
+        legacy = _from_dict(_read_json(_legacy_path()))
+        if legacy is not None and legacy.app_id not in found:
+            found[legacy.app_id] = legacy
+        return found
+
+
+def put(running: RunningTool) -> None:
+    """1つのツールの記録を書く (あれば置き換える)。"""
+    with _LOCK:
+        records = read_all()
+        records[running.app_id] = running
+        _write_all(records)
+    log.info("実行中の記録: %s", running.summary())
+
+
+def remove(app_id: str) -> None:
+    """1つのツールの記録を消す。"""
+    with _LOCK:
+        records = read_all()
+        if records.pop(app_id, None) is not None:
+            _write_all(records)
+            log.info("実行中の記録を消しました: %s", app_id)
+
+
+def replace_all(records: dict[str, RunningTool]) -> None:
+    """記録を丸ごと入れ替える (起動時の引き継ぎで、応答しないものを落とす)。"""
+    with _LOCK:
+        _write_all(dict(records))
+
+
+def clear() -> None:
+    """記録をすべて消す。"""
+    with _LOCK:
+        _write_all({})
+
+
+# --- 以前の呼び方 (同時に1つだけの頃)。試験と診断のために残す ---
+def read() -> Optional[RunningTool]:
+    """いちばん新しく起動したツールの記録。無ければ `None`。"""
+    records = read_all()
+    if not records:
+        return None
+    return max(records.values(), key=lambda r: r.started_at)
+
+
+def write(running: Optional[RunningTool]) -> None:
+    """`None` ならすべて消す。そうでなければ1つ書く。"""
+    if running is None:
+        clear()
+    else:
+        put(running)
+
+
+# ------------------------------------------------------------------
+def _write_all(records: dict[str, RunningTool]) -> None:
+    path = state_path()
     try:
-        raw = json.loads(state_path().read_text(encoding="utf-8"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if records:
+            data = {"format": FORMAT,
+                    "tools": {k: asdict(v) for k, v in records.items()}}
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+            os.replace(temporary, path)
+        else:
+            _unlink(path)
+        # 以前の版の記録は、読み込んだ時点でこちらへ移っている
+        _unlink(_legacy_path())
+    except OSError as exc:
+        log.warning("実行中の記録を書けませんでした: %s", exc)
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        log.warning("実行中の記録を読めませんでした: %s", exc)
+        log.warning("実行中の記録を読めませんでした (%s): %s", path.name, exc)
         return None
+
+
+def _from_dict(raw) -> Optional[RunningTool]:
     if not isinstance(raw, dict):
         return None
     known = {k: raw[k] for k in RunningTool.__dataclass_fields__ if k in raw}
@@ -126,7 +211,3 @@ def read() -> Optional[RunningTool]:
     except TypeError as exc:
         log.warning("実行中の記録の形が違います: %s", exc)
         return None
-
-
-def clear() -> None:
-    write(None)

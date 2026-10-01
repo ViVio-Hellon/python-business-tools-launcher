@@ -20,7 +20,17 @@ SCREEN_MARGIN = 40
 #   bottom_left   … 左下。**業務画面が主役のとき**。隅へ寄って邪魔をしない
 #   bottom_center … 画面下部の中央
 #   bottom_right  … 右下
-ANCHORS = ("center", "bottom_left", "bottom_center", "bottom_right")
+#   top_left / top_center / top_right … 上の左・中央・右
+ANCHORS = ("center", "bottom_left", "bottom_center", "bottom_right",
+           "top_left", "top_center", "top_right")
+
+# ツールを起動したあとの置き場所として［設定］で選べるもの (と画面の呼び名)。
+# 起動直後は**いつも画面中央** (探さずに見つかる)
+ACTIVE_ANCHORS = {
+    "top_left": "左上", "top_center": "中央上", "top_right": "右上",
+    "bottom_left": "左下", "bottom_center": "中央下", "bottom_right": "右下",
+}
+DEFAULT_ACTIVE_ANCHOR = "bottom_left"
 
 # 手で動かした位置を覚えておく鍵 (PC別設定の入れ物を借りる)。
 # **値があること自体が「手動」の印**。無ければ状態に合わせて自動で寄る
@@ -109,16 +119,17 @@ def anchor_position(anchor: str, *, width: int, height: int,
     自動表示 (タスクバーやサイドバー) と重なることがある。
     """
     bottom_y = max(0, screen_height - height - max(0, bottom_margin))
+    top_y = max(0, edge_margin)
+    left_x = max(0, edge_margin)
     center_x = max(0, (screen_width - width) // 2)
     right_x = max(0, screen_width - width - max(0, edge_margin))
 
     if anchor == "center":
         return center_x, max(0, (screen_height - height) // 2)
-    if anchor == "bottom_left":
-        return max(0, edge_margin), bottom_y
-    if anchor == "bottom_right":
-        return right_x, bottom_y
-    return center_x, bottom_y                 # bottom_center
+    row, _, column = anchor.partition("_")
+    y = top_y if row == "top" else bottom_y
+    x = {"left": left_x, "right": right_x}.get(column, center_x)
+    return x, y
 
 
 def normalize_anchor(value: str, fallback: str = "bottom_center") -> str:

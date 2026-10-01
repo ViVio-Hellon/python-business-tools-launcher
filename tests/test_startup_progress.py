@@ -23,7 +23,8 @@ class _Clock:
 
 
 def _status(state, phase, name, **kw) -> Status:
-    return Status(state=state, phase=phase, display_name=name,
+    # 試験では表示名をそのままアプリIDにする (ツールの見分けに使う)
+    return Status(state=state, phase=phase, display_name=name, app_id=name,
                   message=kw.pop("message", ""), **kw)
 
 
@@ -55,27 +56,13 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(view.note, "アプリを準備中")
         self.assertEqual(view.elapsed_text, "12秒 (最大90秒まで待ちます)")
 
-    def test_切り替えは前を止める段から(self) -> None:
-        self.tracker.update(_status(State.STOPPING, sp.CLOSE_BROWSER, "日報",
-                                    target_name="看板"))
-        view = self.tracker.update(_status(State.STOPPING, sp.STOP_TOOL, "日報",
-                                           target_name="看板"))
-        self.assertEqual(view.title, "日報 → 看板 に切り替えています")
+    def test_止めるときは画面を閉じる段から(self) -> None:
+        self.tracker.update(_status(State.STOPPING, sp.CLOSE_BROWSER, "日報"))
+        view = self.tracker.update(_status(State.STOPPING, sp.STOP_TOOL, "日報"))
+        self.assertEqual(view.title, "日報を終了しています")
         self.assertEqual(_marks(view), [
             (sp.DONE, "日報の画面を閉じる"),
-            (sp.ACTIVE, "日報を終了する"),
-            (sp.PENDING, "看板の起動ファイルを実行する"),
-            (sp.PENDING, "看板の準備ができるのを待つ"),
-            (sp.PENDING, "看板の画面を開く")])
-
-        view = self.tracker.update(_status(State.STARTING, sp.OPEN_BROWSER, "看板"))
-        self.assertEqual([s.state for s in view.steps],
-                         [sp.DONE] * 4 + [sp.ACTIVE])
-
-    def test_画面が無ければ閉じる段は出さない(self) -> None:
-        view = self.tracker.update(_status(State.STOPPING, sp.STOP_TOOL, "日報",
-                                           target_name="看板"))
-        self.assertEqual(view.steps[0].label, "日報を終了する")
+            (sp.ACTIVE, "日報を終了する")])
 
     def test_止めるだけ(self) -> None:
         view = self.tracker.update(_status(State.STOPPING, sp.STOP_TOOL, "日報"))
@@ -95,12 +82,18 @@ class TrackerTests(unittest.TestCase):
         self.tracker.update(_status(State.STARTING, sp.WAIT, "日報"))
         self.assertIsNone(self.tracker.update(_status(State.ERROR, "", "日報")))
 
-    def test_途中で別のツールを押したら数え直す(self) -> None:
+    def test_ほかのツールの知らせは混ぜない(self) -> None:
+        """ツールは同時に動く。見ている起動が終わるまで、窓は行き来しない。"""
         self.tracker.update(_status(State.STARTING, sp.WAIT, "日報"))
-        self.clock.now += 20
         view = self.tracker.update(_status(State.STARTING, sp.SPAWN, "看板"))
+        self.assertEqual(view.title, "日報を起動しています")
+        # 看板が先に終わっても、日報の窓は閉じない
+        self.assertIsNotNone(self.tracker.update(
+            _status(State.RUNNING, "", "看板")))
+        # 日報が終われば閉じる。次の知らせから看板を見る
+        self.assertIsNone(self.tracker.update(_status(State.RUNNING, "", "日報")))
+        view = self.tracker.update(_status(State.STARTING, sp.WAIT, "看板"))
         self.assertEqual(view.title, "看板を起動しています")
-        self.assertEqual(view.elapsed_text, "0秒")
 
     def test_経過は通知が来なくても進む(self) -> None:
         """終了を待つあいだは通知が来ない。窓の時計で進める。"""
@@ -116,53 +109,56 @@ class TrackerTests(unittest.TestCase):
              app_manager.PHASE_OPEN_BROWSER))
 
 
-class RealSwitchTests(ManagerTestCase):
-    """本物の切り替えで、段が順に届くこと。"""
+class RealStartStopTests(ManagerTestCase):
+    """本物の起動と停止で、段が順に届くこと。"""
 
-    def test_切り替えの段が順に届く(self) -> None:
+    def phases(self, statuses) -> list[str]:
+        found: list[str] = []
+        for status in statuses:
+            if status.busy and (not found or found[-1] != status.phase):
+                found.append(status.phase)
+        return found
+
+    def test_起動の段が順に届く(self) -> None:
         nippou = self.register("fake.nippou", "日報")
         kanban = self.register("fake.kanban", "看板", ready_after=1.0)
         self.start(nippou)
         self.statuses.clear()
 
         self.start(kanban)
-        busy = [s for s in self.statuses if s.busy]
-        phases = []
-        for status in busy:
-            if not phases or phases[-1] != status.phase:
-                phases.append(status.phase)
-        self.assertEqual(phases, [
-            app_manager.PHASE_CLOSE_BROWSER, app_manager.PHASE_STOP_TOOL,
+        # ほかのツールが動いていても、止める段は無い (同時に使える)
+        self.assertEqual(self.phases(self.statuses), [
             app_manager.PHASE_SPAWN, app_manager.PHASE_WAIT,
             app_manager.PHASE_OPEN_BROWSER])
-        # 止めているあいだも、何を起こすために待っているかが分かる
-        stopping = [s for s in busy if s.state == State.STOPPING]
-        self.assertTrue(all(s.target_name == "看板" for s in stopping))
 
         tracker = sp.ProgressTracker()
         views = [tracker.update(s) for s in self.statuses]
         last_busy = [v for v in views if v is not None][-1]
-        self.assertEqual(last_busy.title, "日報 → 看板 に切り替えています")
+        self.assertEqual(last_busy.title, "看板を起動しています")
         self.assertEqual([s.state for s in last_busy.steps],
-                         [sp.DONE] * 4 + [sp.ACTIVE])
+                         [sp.DONE, sp.DONE, sp.ACTIVE])
         self.assertIsNone(views[-1])            # 起動し終われば消す
         self.assertEqual(self.statuses[-1].state, State.RUNNING)
 
-    def test_切り替えで閉じた画面の手がかりを手放す(self) -> None:
+    def test_停止の段が順に届く(self) -> None:
+        nippou = self.register("fake.nippou", "日報")
+        self.start(nippou)
+        self.statuses.clear()
+        self.manager._stop_blocking(nippou.app_id)
+        self.assertEqual(self.phases(self.statuses), [
+            app_manager.PHASE_CLOSE_BROWSER, app_manager.PHASE_STOP_TOOL])
+
+    def test_止めて閉じた画面の手がかりを手放す(self) -> None:
         """止め方の結果に「画面を閉じた」が引き継がれず、閉じた画面の
         手がかりが残り続けていた。"""
         from launcher import browser
         nippou = self.register("fake.nippou", "日報")
-        kanban = self.register("fake.kanban", "看板")
         self.start(nippou)
         old_pid = self.manager.current.browser_pid
         self.assertIn(old_pid, browser.managed_pids())
 
-        self.start(kanban)
+        self.manager._stop_blocking(nippou.app_id)
         self.assertNotIn(old_pid, browser.managed_pids())
-        # 途中で「終了しました」(何も動いていない) を挟まない
-        states = [s.state for s in self.statuses]
-        self.assertNotIn(State.IDLE, states[states.index(State.STOPPING):])
 
 
 if __name__ == "__main__":

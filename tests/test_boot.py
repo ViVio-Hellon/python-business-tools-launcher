@@ -99,8 +99,8 @@ class ParallelProbeTests(LocalAreaTestCase):
         self.assertLess(took, 0.4 * len(tools) * 0.6,
                         f"{len(tools)}ツールで {took:.2f}秒かかりました")
 
-    def test_見つけたものを引き継ぐ順は変わらない(self) -> None:
-        """同時に当たっても、登録順で最初に応答したものを引き継ぐ。"""
+    def test_動いているものをすべて引き継ぐ(self) -> None:
+        """ツールは同時に動く。応答したものはすべて引き継ぐ。"""
         tool_registry.initialize()
         tools = tool_registry.all_tools()
         second, third = tools[1], tools[2]
@@ -113,8 +113,9 @@ class ParallelProbeTests(LocalAreaTestCase):
             return None
 
         with mock.patch.object(health, "probe", side_effect=probe):
-            running = ToolManager().adopt_running()
-        self.assertEqual(running.app_id, second.app_id)
+            adopted = ToolManager().adopt_running()
+        self.assertEqual([r.app_id for r in adopted],
+                         [second.app_id, third.app_id])
 
 
 if __name__ == "__main__":

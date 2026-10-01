@@ -22,7 +22,8 @@ HEADLESS_MODULES = ("process_manager", "launch_guard", "app_manager",
                     "launcher.tool_registry", "launcher.health",
                     "launcher.app_config", "launcher.runtime_state",
                     "launcher.distribution", "launcher.admin_lock",
-                    "launcher.startup_progress", "boot")
+                    "launcher.startup_progress", "boot",
+                    "launcher.ui.geometry", "launcher.ui.texts")
 
 
 class HeadlessImportTests(unittest.TestCase):

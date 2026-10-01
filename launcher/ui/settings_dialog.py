@@ -196,33 +196,42 @@ class SettingsDialog:
     def _build_bar_position(self) -> None:
         """バーの置き場所 (要件定義書 §5.1)。
 
-        ふだんは状態に合わせて自動で寄る (何も選んでいなければ中央、
-        ツールを選んだら左下)。**手で動かすとそちらが優先される**ので、
-        自動に戻す道をここに用意する。
+        起動した直後は**いつも画面中央** (探さずに見つかる)。ツールを
+        起動したら、ここで選んだ場所へ寄る。**手で動かすとそちらが優先
+        される**ので、自動に戻す道もここに用意する。
         """
-        # 鍵は tkinter に触らない `geometry` が持つ。`bar` から取ると、
-        # `bar` → `settings_dialog` → `bar` の輪ができる
-        from .geometry import POSITION_KEY, parse_saved
+        # 鍵と呼び名は tkinter に触らない `geometry` が持つ。`bar` から
+        # 取ると、`bar` → `settings_dialog` → `bar` の輪ができる
+        from .geometry import ACTIVE_ANCHORS, POSITION_KEY, parse_saved
 
         self._position_key = POSITION_KEY
+        self._anchor_names = dict(ACTIVE_ANCHORS)
         saved = parse_saved(tool_registry.get_pc_setting(POSITION_KEY))
         self.reset_position = tk.BooleanVar(value=False)
 
         frame = tk.Frame(self.top, bg=theme.BG)
         frame.pack(fill="x", padx=16, pady=(10, 0))
-        tk.Label(frame, text="バーの位置", bg=theme.BG, fg=theme.FG,
-                 font=theme.FONT_BOLD).pack(side="left")
-        if saved is None:
-            tk.Label(frame,
-                     text="自動（何も選んでいなければ中央、選ぶと左下）",
-                     bg=theme.BG, fg=theme.MUTED,
-                     font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
-            return
+        tk.Label(frame, text="ツールを起動したあとのバーの位置", bg=theme.BG,
+                 fg=theme.FG, font=theme.FONT_BOLD).pack(side="left")
+        current = tool_registry.active_bar_position()
+        self.active_position_var = tk.StringVar(
+            value=self._anchor_names.get(current, "左下"))
+        ttk.Combobox(frame, textvariable=self.active_position_var, width=8,
+                     values=list(self._anchor_names.values()), state="readonly",
+                     font=theme.FONT).pack(side="left", padx=(10, 0))
+        tk.Label(frame, text="(起動した直後はいつも画面中央)", bg=theme.BG,
+                 fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left",
+                                                             padx=(8, 0))
 
-        tk.Label(frame, text=f"手動（{saved[0]}, {saved[1]}）",
+        if saved is None:
+            return
+        manual = tk.Frame(self.top, bg=theme.BG)
+        manual.pack(fill="x", padx=16, pady=(4, 0))
+        tk.Label(manual, text=f"いまは手で置いた場所（{saved[0]}, {saved[1]}）"
+                              "に固定しています",
                  bg=theme.BG, fg=theme.MUTED,
-                 font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
-        tk.Checkbutton(frame, text="自動に戻す", variable=self.reset_position,
+                 font=theme.FONT_SMALL).pack(side="left")
+        tk.Checkbutton(manual, text="自動に戻す", variable=self.reset_position,
                        bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
                        activebackground=theme.BG, activeforeground=theme.FG,
                        font=theme.FONT_SMALL, bd=0,
@@ -430,6 +439,10 @@ class SettingsDialog:
         tool_registry.set_pc_mode(self.mode_var.get().strip())
         if self.reset_position.get():
             tool_registry.clear_pc_setting(self._position_key)
+        chosen = {name: key for key, name in self._anchor_names.items()}.get(
+            self.active_position_var.get())
+        if chosen and chosen != tool_registry.active_bar_position():
+            tool_registry.set_active_bar_position(chosen)
         log.info("設定を保存しました (%d件 / 削除 %d件)", len(updated), len(removed))
         return True
 
@@ -626,7 +639,7 @@ def _delivery_warning(tool: Tool) -> str:
     return (f"{tool.display_name}: 起動引数「{tool.start_args}」は "
             f"{name} が転送しないため届きません。\n"
             "  画面はツール側がふだんのブラウザーに開き、"
-            "切り替えのときランチャーからは閉じられません。")
+            "止めるときランチャーからは閉じられません。")
 
 
 def _label(parent: tk.Widget, text: str) -> None:

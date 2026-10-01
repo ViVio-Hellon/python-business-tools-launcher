@@ -280,6 +280,49 @@ def open_window(app_id: str, url: str) -> BrowserSession:
 FORGET_WAIT_SEC = 3.0
 
 
+def bring_to_front(pid: int) -> bool:
+    """その画面 (ブラウザーのプロセス) の窓を前に出す。出せたら True。
+
+    ツールは同時に複数動くので、動いているツールのボタンを押したときは
+    **起動し直さず、その画面を前に出す**。Windows の窓の一覧から、その
+    プロセスの見えている窓を探す (標準ライブラリの ctypes だけで行う)。
+
+    出せなくても困らない (画面はどこかに出ている)。Windows 以外と、
+    手がかりの無い画面では何もしない。
+    """
+    if not pid or os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                           wintypes.LPARAM)
+
+        def visit(hwnd, _param):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid and user32.GetWindowTextLengthW(hwnd) > 0:
+                found.append(hwnd)
+                return False                  # 見つかったので打ち切る
+            return True
+
+        user32.EnumWindows(callback_type(visit), 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)        # SW_RESTORE: 最小化を戻す
+        return bool(user32.SetForegroundWindow(hwnd))
+    except Exception as exc:                  # noqa: BLE001 - 出せなくても続ける
+        log.debug("画面を前に出せませんでした (pid=%s): %s", pid, exc)
+        return False
+
+
 def forget(pid: int) -> None:
     """閉じた画面のプロセスを引き取る。
 
@@ -380,17 +423,17 @@ def describe() -> str:
     lines = [f"画面の開き方  : {mode()}"]
     if mode() == "default":
         lines.append("  既定のブラウザーへ渡します。"
-                     "切り替えのとき画面は自動で閉じません。")
+                     "止めるとき画面は自動で閉じません。")
         return "\n".join(lines)
 
     name, executable = find_browser(_preferred())
     if executable:
         lines.append(f"使うブラウザー: {name} ({executable})")
         lines.append(f"プロファイル  : {app_config.local_dir('browser')}")
-        lines.append("  切り替えのとき、この画面だけを閉じます。")
+        lines.append("  ツールを止めるとき、この画面だけを閉じます。")
     else:
         lines.append("使うブラウザー: (見つかりません)")
         lines.append("  Edge / Chrome が見つからないため、既定のブラウザーへ"
                      "渡します。")
-        lines.append("  その場合、切り替えのとき画面は自動で閉じません。")
+        lines.append("  その場合、止めるとき画面は自動で閉じません。")
     return "\n".join(lines)

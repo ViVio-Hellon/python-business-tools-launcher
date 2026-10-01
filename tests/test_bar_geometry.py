@@ -285,3 +285,51 @@ class UserMoveTests(unittest.TestCase):
 
     def test_位置が分からなければ覚えない(self) -> None:
         self.assertFalse(geometry.moved_by_user((400, 500), None))
+
+
+class ActivePositionTests(unittest.TestCase):
+    """ツールを起動したあとの置き場所は、上下×左中右の6通りから選べる。"""
+
+    def place(self, anchor: str) -> tuple[int, int]:
+        return geometry.anchor_position(
+            anchor, width=600, height=56, screen_width=1920, screen_height=1080,
+            bottom_margin=48, edge_margin=16)
+
+    def test_6通りが選べる(self) -> None:
+        self.assertEqual(set(geometry.ACTIVE_ANCHORS), {
+            "top_left", "top_center", "top_right",
+            "bottom_left", "bottom_center", "bottom_right"})
+        self.assertEqual(geometry.ACTIVE_ANCHORS["top_right"], "右上")
+
+    def test_上の3つは画面の上に寄る(self) -> None:
+        self.assertEqual(self.place("top_left"), (16, 16))
+        self.assertEqual(self.place("top_center"), (660, 16))
+        self.assertEqual(self.place("top_right"), (1304, 16))
+
+    def test_下の3つはタスクバーを避ける(self) -> None:
+        self.assertEqual(self.place("bottom_left"), (16, 976))
+        self.assertEqual(self.place("bottom_right"), (1304, 976))
+
+
+class TextTests(unittest.TestCase):
+    """状態の文が枠に収まらないとき、途中で切れて読めなくしない。"""
+
+    def test_収まれば切らない(self) -> None:
+        from launcher.ui.texts import fit_text
+        self.assertEqual(fit_text("動作中：日報", 300, lambda t: 12 * len(t)),
+                         "動作中：日報")
+
+    def test_収まらなければ後ろを省いて印を付ける(self) -> None:
+        from launcher.ui.texts import fit_text
+        long = "カレンダーを終了しました（画面は手で閉じてください）"
+        fitted = fit_text(long, 150, lambda t: 12 * len(t))
+        self.assertTrue(fitted.endswith("…"))
+        self.assertLessEqual(12 * len(fitted), 150)
+        self.assertTrue(long.startswith(fitted[:-1]))
+
+    def test_閉じるときは止めずに閉じたらどうなるかまで書く(self) -> None:
+        from launcher.ui.texts import close_question
+        text = close_question("日報、看板")
+        self.assertIn("日報、看板", text)
+        self.assertIn("自分で終了", text)
+        self.assertIn("引き継ぎ", text)

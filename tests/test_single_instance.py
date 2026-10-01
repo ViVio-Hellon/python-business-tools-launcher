@@ -128,10 +128,12 @@ class ToolInstanceTests(LocalAreaTestCase):
         self.addCleanup(opener.stop)
 
     def _cleanup(self) -> None:
-        running = self.manager.current or runtime_state.read()
-        if running is not None:
+        records = dict(runtime_state.read_all())
+        records.update(self.manager.running)
+        for running in records.values():
             process_manager.stop(running, force=True, timeout=5)
-        self.manager._reap_process()
+        for app_id in list(self.manager._processes):
+            self.manager._reap_process(app_id)
 
     def register(self, app_id: str, name: str, **kwargs):
         port = kwargs.pop("port", None) or free_port()
@@ -161,7 +163,7 @@ class ToolInstanceTests(LocalAreaTestCase):
         with self.count_spawns():
             threads = [threading.Thread(
                 target=self.manager._select_blocking,
-                args=(tool, self.manager._generation)) for _ in range(2)]
+                args=(tool,)) for _ in range(2)]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -178,7 +180,7 @@ class ToolInstanceTests(LocalAreaTestCase):
         with self.count_spawns():
             threads = [threading.Thread(
                 target=self.manager._select_blocking,
-                args=(tool, self.manager._generation)) for _ in range(3)]
+                args=(tool,)) for _ in range(3)]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -189,24 +191,24 @@ class ToolInstanceTests(LocalAreaTestCase):
     def test_起動が終われば印は外れる(self) -> None:
         """次の操作が塞がれないこと。"""
         tool = self.register("fake.clear", "日報")
-        self.manager._select_blocking(tool, self.manager._generation)
+        self.manager._select_blocking(tool)
 
-        self.assertIsNone(self.manager._starting)
+        self.assertEqual(self.manager._starting, set())
         self.assertEqual(self.manager.status.state, State.RUNNING)
 
     def test_失敗しても印は外れる(self) -> None:
         tool = self.register("fake.fail", "看板", exit_code=1)
-        self.manager._select_blocking(tool, self.manager._generation)
+        self.manager._select_blocking(tool)
 
-        self.assertIsNone(self.manager._starting,
-                          "失敗したあと、次の起動が塞がれます")
+        self.assertEqual(self.manager._starting, set(),
+                         "失敗したあと、次の起動が塞がれます")
         self.assertEqual(self.manager.status.state, State.ERROR)
 
     def test_動いているツールをもう一度押しても起こさない(self) -> None:
         tool = self.register("fake.again", "日報")
         with self.count_spawns():
-            self.manager._select_blocking(tool, self.manager._generation)
-            self.manager._select_blocking(tool, self.manager._generation)
+            self.manager._select_blocking(tool)
+            self.manager._select_blocking(tool)
 
         self.assertEqual(len(self.spawns), 1)
 
@@ -235,13 +237,14 @@ class ScreenTests(LocalAreaTestCase):
         self.managers: list = []
 
     def _cleanup(self) -> None:
+        records = dict(runtime_state.read_all())
         for manager in self.managers:
-            running = manager.current
-            if running is not None:
-                process_manager.stop(running, force=True, timeout=5)
-            manager._reap_process()
-        if runtime_state.read() is not None:
-            process_manager.stop(runtime_state.read(), force=True, timeout=5)
+            records.update(manager.running)
+        for running in records.values():
+            process_manager.stop(running, force=True, timeout=5)
+        for manager in self.managers:
+            for app_id in list(manager._processes):
+                manager._reap_process(app_id)
         for pid in browser.managed_pids():
             process_manager._terminate(pid, force=True)
             browser.forget(pid)
@@ -281,7 +284,7 @@ class ScreenTests(LocalAreaTestCase):
         """
         tool = self.register("fake.screen", "日報")
         first = self.make_manager()
-        first._select_blocking(tool, first._generation)
+        first._select_blocking(tool)
         self.wait_opened(1)
         first_window = first.current.browser_pid
         self.assertTrue(process_manager._is_alive(first_window))
@@ -294,7 +297,7 @@ class ScreenTests(LocalAreaTestCase):
                          "この試験は手がかりが無い状態を前提にしています")
 
         # 利用者がもう一度ボタンを押す
-        second._select_blocking(tool, second._generation)
+        second._select_blocking(tool)
         time.sleep(0.5)
 
         self.assertEqual(len(self.opened), 1,
@@ -306,14 +309,14 @@ class ScreenTests(LocalAreaTestCase):
         """探し直した画面の手がかりを取り戻し、切り替えで閉じられること。"""
         tool = self.register("fake.recover", "日報")
         first = self.make_manager()
-        first._select_blocking(tool, first._generation)
+        first._select_blocking(tool)
         self.wait_opened(1)
         first_window = first.current.browser_pid
 
         runtime_state.clear()
         second = self.make_manager()
         second.adopt_running()
-        second._select_blocking(tool, second._generation)
+        second._select_blocking(tool)
 
         # 手がかりを取り戻している
         self.assertEqual(second.current.browser_pid, first_window)
@@ -328,7 +331,7 @@ class ScreenTests(LocalAreaTestCase):
         """探し直しが、必要な画面まで開かなくするのでは困る。"""
         tool = self.register("fake.reopen2", "日報")
         manager = self.make_manager()
-        manager._select_blocking(tool, manager._generation)
+        manager._select_blocking(tool)
         self.wait_opened(1)
 
         window = manager.current.browser_pid
@@ -336,7 +339,7 @@ class ScreenTests(LocalAreaTestCase):
         process_manager._wait_pid_gone(window, 5)
         manager.poll_health()
 
-        manager._select_blocking(tool, manager._generation)
+        manager._select_blocking(tool)
         self.wait_opened(2)
 
         self.assertEqual(len(self.opened), 2, "画面を開き直せていません")
@@ -370,21 +373,20 @@ class LockedDownPcTests(ScreenTests):
     def test_自分で開いた画面は閉じられる(self) -> None:
         """**いちばんよく通る道。** 開いたときの手がかりで閉じる。
 
-        閉じられないと、切り替えのたびに画面が2枚になる。
+        閉じられないと、止めたツールの画面が残り「接続できません」になる。
         """
         a = self.register("fake.lock1", "日報")
-        b = self.register("fake.lock2", "看板")
         manager = self.make_manager()
 
-        manager._select_blocking(a, manager._generation)
+        manager._select_blocking(a)
         self.wait_opened(1)
         first = manager.current.browser_pid
         self.assertTrue(process_manager._is_alive(first))
 
-        manager._select_blocking(b, manager._generation)
+        manager._stop_blocking(a.app_id)
 
         self.assertFalse(process_manager._is_alive(first),
-                         "照合できない端末で、切り替え時に画面を閉じられません")
+                         "照合できない端末で、止めたとき画面を閉じられません")
 
     def test_手がかりの無い画面は閉じない(self) -> None:
         """**確かめられないものには触らない**、は変えない。"""

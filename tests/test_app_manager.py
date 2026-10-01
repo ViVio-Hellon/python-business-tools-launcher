@@ -61,12 +61,14 @@ class ManagerTestCase(LocalAreaTestCase):
                 self.browser_log.read_text(encoding="utf-8").splitlines() if line]
 
     def _stop_everything(self) -> None:
-        running = self.manager.current or runtime_state.read()
-        if running is not None:
+        records = dict(runtime_state.read_all())
+        records.update(self.manager.running)
+        for running in records.values():
             process_manager.stop(running, force=True, timeout=5)
         # `start.bat` の受け皿も引き取る。残すと、試験のたびに
         # 引き取られないプロセスが増えていく
-        self.manager._reap_process()
+        for app_id in list(self.manager._processes):
+            self.manager._reap_process(app_id)
         # 残った画面も片付ける。**本番では残ってよい** ── ツールを
         # 動かしたままランチャーだけ閉じたときは、画面も残るのが正しい
         # (要件定義書 §11)。片付けるのは試験の都合
@@ -90,9 +92,9 @@ class ManagerTestCase(LocalAreaTestCase):
     def start(self, tool) -> None:
         """起動を待ち合わせる (試験では別スレッドにしない)。"""
         before = len(self.opened)
-        self.manager._select_blocking(tool, self.manager._generation)
-        running = self.manager.current
-        if running is not None and running.browser_pid:
+        self.manager._select_blocking(tool)
+        running = self.manager.running.get(tool.app_id)
+        if running is not None and running.browser_pid and len(self.opened) <= before:
             # 画面を起こしたところまでは同期で確かめられるが、
             # **記録を書くのは向こうのプロセス**なので、そこは待つ
             self.wait_opened(before + 1)
@@ -131,9 +133,8 @@ class StartTests(ManagerTestCase):
         tool = self.register("fake.record", "日報")
         self.start(tool)
 
-        running = runtime_state.read()
+        running = runtime_state.read_all().get("fake.record")
         self.assertIsNotNone(running)
-        self.assertEqual(running.app_id, "fake.record")
         self.assertEqual(running.port, tool.port)
         # **ツール本体のPID**が入っていること。`start.bat` を起こした
         # プロセスのPIDでは止められない (要件定義書 §10)
@@ -177,68 +178,129 @@ class SameToolTests(ManagerTestCase):
     def test_同じツールを押しても二重起動しない(self) -> None:
         tool = self.register("fake.same", "日報")
         self.start(tool)
-        first = runtime_state.read()
+        first = self.manager.running[tool.app_id]
 
-        self.start(tool)
-        second = runtime_state.read()
+        with mock.patch.object(browser, "bring_to_front",
+                               return_value=True) as front:
+            self.start(tool)
+        second = self.manager.running[tool.app_id]
 
         self.assertEqual(first.pid, second.pid, "二重に起動しています")
-        # 画面が出ているのにもう1枚開かない。同じツールの窓が2つ並ぶ
-        # ほうが分かりにくい (要件定義書 §8.3.1)
+        # 画面が出ているのにもう1枚開かない。**前に出すだけ**
         self.assertEqual(self.opened, [tool.home_url],
                          "画面を二重に開いています")
+        front.assert_called_once_with(first.browser_pid)
 
 
-class SwitchTests(ManagerTestCase):
-    """要件定義書 §8 ツール切り替え。"""
+class ConcurrentTests(ManagerTestCase):
+    """ツールを**同時に**使う。
 
-    def test_AからBへ切り替える(self) -> None:
+    以前は切り替えるたびに前のツールを止めていた。ツールが自分の画面を
+    ふだんのブラウザーに開く形だと、その画面が残り、どれも「バックエンドに
+    接続できません」になっていた。
+    """
+
+    def alive(self, tool) -> bool:
+        return health.is_tool(health.probe(tool.health_url), tool.app_id)
+
+    def test_2つ目を起動しても1つ目は止めない(self) -> None:
         a = self.register("fake.a", "日報")
         b = self.register("fake.b", "看板")
-
         self.start(a)
-        a_running = runtime_state.read()
-        self.assertTrue(process_manager.is_running(a_running))
-
         self.start(b)
 
-        # Aは止まっていること (要件定義書 §8.1「日報を停止」)
-        self.assertFalse(health.is_tool(health.probe(a.health_url), a.app_id),
-                         "切り替え後も前のツールが動いています")
-        # Bが動いていること
-        self.assertEqual(self.manager.status.state, State.RUNNING)
-        self.assertEqual(runtime_state.read().app_id, "fake.b")
-        self.assertIn("看板", self.manager.status.message)
+        self.assertTrue(self.alive(a), "2つ目の起動で1つ目を止めています")
+        self.assertTrue(self.alive(b))
+        self.assertEqual(set(self.manager.running), {"fake.a", "fake.b"})
+        self.assertEqual(set(runtime_state.read_all()), {"fake.a", "fake.b"})
+        # 画面は2つとも出ている
+        self.assertEqual(self.opened, [a.home_url, b.home_url])
 
-    def test_切り替え中の表示が順に出る(self) -> None:
-        a = self.register("fake.s1", "日報")
-        b = self.register("fake.s2", "看板")
+    def test_動いているツールがバーに分かる(self) -> None:
+        a = self.register("fake.r1", "日報")
+        b = self.register("fake.r2", "看板")
         self.start(a)
-        self.statuses.clear()
         self.start(b)
+        status = self.manager.status
+        self.assertEqual(set(status.running_ids), {"fake.r1", "fake.r2"})
+        self.assertEqual(status.focus_id, "fake.r2")
+        self.assertEqual(status.message, "動作中：日報、看板")
 
-        states = [s.state for s in self.statuses]
-        self.assertIn(State.STOPPING, states)
-        self.assertIn(State.STARTING, states)
-        self.assertLess(states.index(State.STOPPING), states.index(State.STARTING),
-                        "終了より先に起動しています (要件定義書 §8.1)")
-        stopping = next(s for s in self.statuses if s.state is State.STOPPING)
-        self.assertIn("日報", stopping.message)
+    def test_終わった知らせではもう最中に数えない(self) -> None:
+        """動いているのにボタンが「…」(最中) のまま残っていた。"""
+        a = self.register("fake.done", "日報")
+        self.start(a)
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING)
+        self.assertNotIn("fake.done", status.starting_ids)
+        self.assertIn("fake.done", status.running_ids)
 
-    def test_連続して切り替えられる(self) -> None:
-        """要件定義書 §20「A→B→C→Dのように連続して切り替えられる」。"""
+        self.manager._stop_blocking("fake.done")
+        status = self.manager.status
+        self.assertNotIn("fake.done", status.stopping_ids)
+        self.assertNotIn("fake.done", status.running_ids)
+
+    def test_4つ同時に動かせる(self) -> None:
         tools = [self.register(f"fake.c{i}", name) for i, name in
                  enumerate(("日報", "カレンダー", "看板", "総合"))]
         for tool in tools:
             self.start(tool)
             self.assertEqual(self.manager.status.state, State.RUNNING,
                              f"{tool.display_name} で止まりました")
-            self.assertEqual(runtime_state.read().app_id, tool.app_id)
+        self.assertTrue(all(self.alive(t) for t in tools))
 
-        # 最後の1つだけが動いていること
-        alive = [t.app_id for t in tools
-                 if health.is_tool(health.probe(t.health_url), t.app_id)]
-        self.assertEqual(alive, [tools[-1].app_id])
+    def test_1つ止めてもほかは動き続ける(self) -> None:
+        """報告のあった不具合: 1つ閉じると全部「接続できません」になる。"""
+        a = self.register("fake.k1", "日報")
+        b = self.register("fake.k2", "看板")
+        c = self.register("fake.k3", "カレンダー")
+        for tool in (a, b, c):
+            self.start(tool)
+
+        self.assertTrue(self.manager._stop_blocking("fake.k2"))
+        self.assertFalse(self.alive(b))
+        self.assertTrue(self.alive(a), "ほかのツールまで止まりました")
+        self.assertTrue(self.alive(c), "ほかのツールまで止まりました")
+        self.assertEqual(set(self.manager.running), {"fake.k1", "fake.k3"})
+        self.assertEqual(self.manager.status.state, State.RUNNING)
+        self.assertIn("看板を終了しました", self.manager.status.message)
+
+    def test_画面を閉じて終わったツールだけ外れる(self) -> None:
+        """画面を閉じると、そのツールは自分で終わる。ほかには触らない。"""
+        from launcher import app_config
+
+        a = self.register("fake.e1", "日報")
+        b = self.register("fake.e2", "看板")
+        self.start(a)
+        self.start(b)
+        a_running = self.manager.running["fake.e1"]
+
+        # 利用者が日報の画面を閉じ、日報は「誰も見ていない」ので終わった
+        process_manager._terminate(a_running.browser_pid, force=True)
+        process_manager._wait_pid_gone(a_running.browser_pid, 5)
+        self.manager.poll_health()
+        process_manager._stop_by_api(a_running, force=True, timeout=10)
+
+        limit = int(app_config.ui_setting("health_failures_before_dead"))
+        for _ in range(limit):
+            self.manager.poll_health()
+
+        self.assertEqual(set(self.manager.running), {"fake.e2"})
+        self.assertTrue(self.alive(b))
+        status = self.manager.status
+        # 画面を閉じて終わったのはふつうのこと。エラーにしない
+        self.assertNotEqual(status.state, State.ERROR)
+        self.assertIn("日報は終了しました", status.message)
+
+    def test_すべて止める(self) -> None:
+        a = self.register("fake.all1", "日報")
+        b = self.register("fake.all2", "看板")
+        self.start(a)
+        self.start(b)
+        self.assertTrue(self.manager._stop_all_blocking())
+        self.assertEqual(self.manager.running, {})
+        self.assertEqual(runtime_state.read_all(), {})
+        self.assertEqual(self.manager.status.state, State.IDLE)
 
 
 class StopTests(ManagerTestCase):
@@ -247,40 +309,58 @@ class StopTests(ManagerTestCase):
     def test_正常終了できる(self) -> None:
         tool = self.register("fake.stop", "日報")
         self.start(tool)
-        self.manager._stop_current(self.manager._generation)
+        self.assertTrue(self.manager._stop_blocking(tool.app_id))
 
         self.assertEqual(self.manager.status.state, State.IDLE)
-        self.assertIsNone(runtime_state.read())
+        self.assertEqual(runtime_state.read_all(), {})
         self.assertIsNone(self.manager.current)
 
     def test_実行中の処理があれば止めずに知らせる(self) -> None:
         """基盤仕様書 2.8「実行中の終了確認」。"""
         tool = self.register("fake.busy", "看板", busy=True)
         self.start(tool)
-        stopped = self.manager._stop_current(self.manager._generation)
+        stopped = self.manager._stop_blocking(tool.app_id)
 
         self.assertFalse(stopped)
         self.assertIn("実行中の処理", self.manager.status.detail)
         # まだ動いていること。黙って落としていない
-        self.assertTrue(process_manager.is_running(runtime_state.read()))
+        self.assertTrue(process_manager.is_running(
+            runtime_state.read_all()[tool.app_id]))
 
     def test_強制指定なら実行中でも止める(self) -> None:
         tool = self.register("fake.busy2", "看板", busy=True)
         self.start(tool)
-        stopped = self.manager._stop_current(self.manager._generation, force=True)
-
-        self.assertTrue(stopped)
-        self.assertIsNone(runtime_state.read())
+        self.assertTrue(self.manager._stop_blocking(tool.app_id, force=True))
+        self.assertEqual(runtime_state.read_all(), {})
 
     def test_stopbatが無くても停止APIで止まる(self) -> None:
         tool = self.register("fake.nobat", "日報", with_stop_bat=False)
         self.start(tool)
-        running = runtime_state.read()
+        running = runtime_state.read_all()[tool.app_id]
         self.assertIsNone(process_manager.resolve_stop_bat(running))
 
         result = process_manager.stop(running, timeout=10)
         self.assertTrue(result.stopped, result.message)
         self.assertEqual(result.method, "shutdown-api")
+
+    def test_起動中なら起動をやめられる(self) -> None:
+        """遅いツールを押してしまった。待たずにやめられる。"""
+        import threading
+
+        tool = self.register("fake.cancel", "日報", ready_after=30)
+        worker = threading.Thread(target=self.manager._select_blocking,
+                                  args=(tool,))
+        worker.start()
+        deadline = time.monotonic() + 10
+        while not self.manager.is_busy(tool.app_id) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.manager.stop(tool.app_id)
+        worker.join(30)
+
+        self.assertFalse(worker.is_alive(), "起動待ちが終わりません")
+        self.assertNotIn(tool.app_id, self.manager.running)
+        self.assertIn("起動をやめました", self.manager.status.message)
+        self.assertEqual(self.opened, [])
 
 
 class BrowserTests(ManagerTestCase):
@@ -300,31 +380,27 @@ class BrowserTests(ManagerTestCase):
                          browser.profile_dir("fake.win"))
         self.assertTrue(process_manager.is_browser_open(running))
 
-    def test_切り替えで前の画面が閉じる(self) -> None:
-        """§8.3.2 切り替え時に現在のツールの画面を閉じる。"""
+    def test_止めると画面が閉じる(self) -> None:
+        """§8.3.2 ツールを止めるとき、そのツールの画面を閉じる。"""
         a = self.register("fake.w1", "日報")
         b = self.register("fake.w2", "看板")
-
         self.start(a)
-        a_running = runtime_state.read()
-        a_browser_pid = a_running.browser_pid
-        self.assertTrue(process_manager.is_browser_open(a_running))
-
         self.start(b)
+        a_running = self.manager.running["fake.w1"]
+        b_running = self.manager.running["fake.w2"]
 
-        self.assertFalse(process_manager._is_alive(a_browser_pid),
-                         "切り替え後も日報の画面が残っています")
-        b_running = runtime_state.read()
-        self.assertEqual(b_running.app_id, "fake.w2")
+        self.manager._stop_blocking("fake.w1")
+
+        self.assertFalse(process_manager._is_alive(a_running.browser_pid),
+                         "止めた日報の画面が残っています")
+        # ほかのツールの画面には触らない
         self.assertTrue(process_manager.is_browser_open(b_running))
-        self.assertEqual(self.opened, [a.home_url, b.home_url])
 
     def test_画面を閉じてからバックエンドを止める(self) -> None:
         """§8.3.2 の処理順序。逆だと利用者に接続エラーが見える。"""
         a = self.register("fake.order1", "日報")
-        b = self.register("fake.order2", "看板")
         self.start(a)
-        running = runtime_state.read()
+        running = self.manager.running["fake.order1"]
 
         order: list[str] = []
         real_close = process_manager.close_browser
@@ -346,7 +422,7 @@ class BrowserTests(ManagerTestCase):
         with mock.patch.object(process_manager, "close_browser", spy_close), \
              mock.patch.object(process_manager, "_stop_by_api", spy_api), \
              mock.patch.object(process_manager, "_stop_by_bat", spy_bat):
-            self.start(b)
+            self.manager._stop_blocking("fake.order1")
 
         self.assertEqual(order[:2], ["画面を閉じる", "バックエンドを止める"],
                          f"順序が違います: {order}")
@@ -362,7 +438,7 @@ class BrowserTests(ManagerTestCase):
 
         tool = self.register("fake.other", "日報")
         self.start(tool)
-        running = runtime_state.read()
+        running = self.manager.running[tool.app_id]
 
         # 利用者がふだん使っているブラウザーのつもり
         other = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)",
@@ -391,7 +467,8 @@ class BrowserTests(ManagerTestCase):
         """§8.3.4 画面とバックエンドを別々に把握する。"""
         tool = self.register("fake.manual", "日報")
         self.start(tool)
-        running = runtime_state.read()
+        running = self.manager.running[tool.app_id]
+        self.manager.poll_health()              # 画面が出ていることを見ておく
 
         # 利用者が画面だけ手で閉じた
         process_manager._terminate(running.browser_pid, force=True)
@@ -404,23 +481,25 @@ class BrowserTests(ManagerTestCase):
         self.assertTrue(status.responding, "バックエンドを落ちた扱いにしています")
         self.assertFalse(status.browser_open)
         self.assertTrue(status.browser_managed)
+        self.assertIn("まもなく終了します", status.message)
 
     def test_同じボタンで画面だけ開き直せる(self) -> None:
         tool = self.register("fake.reopen", "日報")
         self.start(tool)
-        first = runtime_state.read()
+        first = runtime_state.read_all()[tool.app_id]
+        first_window = first.browser_pid
 
         process_manager._terminate(first.browser_pid, force=True)
         process_manager._wait_pid_gone(first.browser_pid, 5)
         self.manager.poll_health()
 
         self.start(tool)
-        second = runtime_state.read()
+        second = runtime_state.read_all()[tool.app_id]
 
         # バックエンドは起動し直していない
         self.assertEqual(first.pid, second.pid, "バックエンドを起動し直しました")
         # 画面は開き直されている
-        self.assertNotEqual(first.browser_pid, second.browser_pid)
+        self.assertNotEqual(first_window, second.browser_pid)
         self.assertTrue(process_manager.is_browser_open(second))
         self.assertEqual(self.opened, [tool.home_url, tool.home_url])
 
@@ -432,7 +511,7 @@ class BrowserTests(ManagerTestCase):
             self.start(tool)
 
         opened.assert_called_once_with(tool.home_url)
-        running = runtime_state.read()
+        running = runtime_state.read_all()[tool.app_id]
         self.assertFalse(running.browser_managed)
         self.assertEqual(running.browser_pid, 0)
         # 手で閉じてもらう必要があることを画面に出す
@@ -444,28 +523,33 @@ class ShutdownTests(ManagerTestCase):
 
     def test_ツールを残したまま閉じられる(self) -> None:
         """ブラウザーを閉じることとバックエンドを止めることは別。"""
-        tool = self.register("fake.keep", "日報")
-        self.start(tool)
-        running = runtime_state.read()
+        a = self.register("fake.keep1", "日報")
+        b = self.register("fake.keep2", "看板")
+        self.start(a)
+        self.start(b)
+        records = runtime_state.read_all()
 
         self.assertTrue(self.manager.shutdown(stop_tools=False))
         # ツールはまだ動いている
-        self.assertTrue(process_manager.is_running(running))
+        for running in records.values():
+            self.assertTrue(process_manager.is_running(running))
         # 記録も残る。次にランチャーを開いたとき引き継げる
-        self.assertIsNotNone(runtime_state.read())
+        self.assertEqual(set(runtime_state.read_all()), {"fake.keep1", "fake.keep2"})
 
     def test_ツールごと閉じられる(self) -> None:
-        tool = self.register("fake.both", "日報")
-        self.start(tool)
+        a = self.register("fake.both1", "日報")
+        b = self.register("fake.both2", "看板")
+        self.start(a)
+        self.start(b)
 
         self.assertTrue(self.manager.shutdown(stop_tools=True))
-        self.assertIsNone(runtime_state.read())
+        self.assertEqual(runtime_state.read_all(), {})
 
     def test_止まらなければ偽を返す(self) -> None:
         """**黙って閉じない。** 止めたつもりで残るのがいちばん困る。"""
         tool = self.register("fake.stuck", "看板", busy=True)
         self.start(tool)
-        running = runtime_state.read()
+        running = runtime_state.read_all()[tool.app_id]
 
         self.assertFalse(self.manager.shutdown(stop_tools=True))
         self.assertTrue(process_manager.is_running(running),
@@ -474,49 +558,68 @@ class ShutdownTests(ManagerTestCase):
 
         # 中断してよいと言われたら止める
         self.assertTrue(self.manager.shutdown(stop_tools=True, force=True))
-        self.assertIsNone(runtime_state.read())
+        self.assertEqual(runtime_state.read_all(), {})
 
 
 class MonitorTests(ManagerTestCase):
     """基盤仕様書 2.9 ブラウザーとバックエンドの状態監視。"""
 
-    def test_ツールが落ちたら気づく(self) -> None:
+    def test_画面が出ているのに落ちたら知らせる(self) -> None:
         from launcher import app_config
 
         tool = self.register("fake.die", "日報")
         self.start(tool)
         self.assertTrue(self.manager.poll_health())
 
-        # ツールだけを落とす (ランチャーは知らない)
-        process_manager.stop(runtime_state.read(), force=True, timeout=10)
+        # ツールだけを落とす (画面は出たまま。思わぬ停止)
+        running = self.manager.running[tool.app_id]
+        process_manager._stop_by_api(running, force=True, timeout=10)
 
         # **1回では断じない。** スリープ復帰や重い処理中に、動いている
         # ツールを落ちた扱いにしないため (tests/test_resilience.py)
         limit = int(app_config.ui_setting("health_failures_before_dead"))
         for _ in range(limit - 1):
-            self.assertTrue(self.manager.poll_health())
-            self.assertEqual(self.manager.status.state, State.RUNNING)
+            self.manager.poll_health()
+            self.assertIn(tool.app_id, self.manager.running)
 
         self.assertFalse(self.manager.poll_health())
         self.assertEqual(self.manager.status.state, State.ERROR)
         self.assertIn("終了しました", self.manager.status.message)
 
-    def test_ランチャー外で動いているツールを引き継ぐ(self) -> None:
+    def test_ランチャー外で動いているツールをすべて引き継ぐ(self) -> None:
         """要件定義書 §9。記録が無くても二重起動させない。"""
-        tool = self.register("fake.adopt", "日報")
-        self.start(tool)
-        # ランチャーを再起動したことにする
-        fresh = ToolManager()
+        a = self.register("fake.adopt1", "日報")
+        b = self.register("fake.adopt2", "看板")
+        self.start(a)
+        self.start(b)
+        # ランチャーを再起動したことにする (記録も失った)
         runtime_state.clear()
+        fresh = ToolManager()
 
         adopted = fresh.adopt_running()
-        self.assertIsNotNone(adopted, "動いているツールを見つけられていません")
-        self.assertEqual(adopted.app_id, "fake.adopt")
+        self.assertEqual({r.app_id for r in adopted}, {"fake.adopt1", "fake.adopt2"})
         self.assertEqual(fresh.status.state, State.RUNNING)
+        self.assertEqual(set(fresh.status.running_ids),
+                         {"fake.adopt1", "fake.adopt2"})
 
+    def test_以前の版の記録も引き継ぐ(self) -> None:
+        """同時に1つだけの頃の `current.json` が残っていても読む。"""
+        import json
+        from dataclasses import asdict
 
-if __name__ == "__main__":
-    unittest.main()
+        tool = self.register("fake.legacy", "日報")
+        self.start(tool)
+        running = self.manager.running[tool.app_id]
+        runtime_state.clear()
+        legacy = runtime_state.state_path().with_name("current.json")
+        legacy.write_text(json.dumps(asdict(running)), encoding="utf-8")
+
+        fresh = ToolManager()
+        adopted = fresh.adopt_running()
+        self.assertEqual([r.app_id for r in adopted], ["fake.legacy"])
+        # 画面の手がかりも引き継いでいる (止めるとき画面を閉じられる)
+        self.assertEqual(adopted[0].browser_pid, running.browser_pid)
+        self.assertFalse(legacy.exists(), "古い記録が残っています")
 
 
 class LeftoverScreenTests(ManagerTestCase):
@@ -531,9 +634,9 @@ class LeftoverScreenTests(ManagerTestCase):
     def test_ランチャーが閉じられない画面は手で閉じてと出す(self) -> None:
         tool = self.register_self_opening("fake.self", "日報")
         self.start(tool)
-        self.assertFalse(self.manager.current.browser_managed)
+        self.assertFalse(self.manager.running[tool.app_id].browser_managed)
 
-        self.manager._stop_current(self.manager._generation)
+        self.manager._stop_blocking(tool.app_id)
         status = self.manager.status
         self.assertEqual(status.state, State.IDLE)
         self.assertIn("手で閉じて", status.message)
@@ -542,18 +645,12 @@ class LeftoverScreenTests(ManagerTestCase):
     def test_ランチャーが閉じた画面なら何も足さない(self) -> None:
         tool = self.register("fake.managed", "日報")
         self.start(tool)
-        self.assertTrue(self.manager.current.browser_managed)
+        self.assertTrue(self.manager.running[tool.app_id].browser_managed)
 
-        self.manager._stop_current(self.manager._generation)
+        self.manager._stop_blocking(tool.app_id)
         self.assertEqual(self.manager.status.message, "日報を終了しました")
         self.assertEqual(self.manager.status.detail, "")
 
-    def test_切り替えで残った前の画面は次の起動のあとに伝える(self) -> None:
-        first = self.register_self_opening("fake.self", "日報")
-        second = self.register("fake.next", "看板")
-        self.start(first)
-        self.start(second)
-        status = self.manager.status
-        self.assertEqual(status.state, State.RUNNING)
-        self.assertIn("日報の画面", status.detail)
-        self.assertIn("手で閉じて", status.detail)
+
+if __name__ == "__main__":
+    unittest.main()

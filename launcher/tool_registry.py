@@ -575,7 +575,8 @@ def _fill_blank_paths(conn: sqlite3.Connection) -> None:
 def export_distribution(*, relative: bool = True) -> Path:
     """この端末の設定から配布先フォルダを作る (作り直す)。"""
     return distribution.export_tools(all_tools(include_disabled=True),
-                                     relative=relative)
+                                     relative=relative,
+                                     bar_position_active=active_bar_position())
 
 
 def reload_from_distribution() -> list[str]:
@@ -831,7 +832,7 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
         return "", ("ツールの中に --no-browser が見つからないため、空にしました。"
                     "画面はツールが自分で開きます")
     return NO_BROWSER_ARG, ("ツールが --no-browser を受け付けるので入れました。"
-                            "画面はランチャーが開き、切り替えのとき閉じます")
+                            "画面はランチャーが開き、止めるとき閉じます")
 
 
 def _bat_forwards_args(path: Path) -> bool:
@@ -945,6 +946,34 @@ def clear_pc_setting(key: str) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM pc_settings WHERE key = ?", (key,))
     log.info("PC設定を消しました: %s", key)
+
+
+# ツールを起動したあとのバーの位置 (［設定］で選ぶ)
+BAR_POSITION_ACTIVE_KEY = "bar_position_active"
+
+
+def active_bar_position() -> str:
+    """ツールを起動したあと、バーをどこへ寄せるか。
+
+    その端末の［設定］ → 配布先フォルダ → 製品の既定値、の順に見る
+    (**その端末で決めたものが優先**)。知らない値は飛ばす。
+    """
+    from .ui.geometry import ACTIVE_ANCHORS, DEFAULT_ACTIVE_ANCHOR
+
+    for value in (get_pc_setting(BAR_POSITION_ACTIVE_KEY),
+                  distribution.bar_position_active(),
+                  str(app_config.ui_setting("position_active"))):
+        if value in ACTIVE_ANCHORS:
+            return value
+    return DEFAULT_ACTIVE_ANCHOR
+
+
+def set_active_bar_position(value: str) -> None:
+    from .ui.geometry import ACTIVE_ANCHORS
+
+    if value not in ACTIVE_ANCHORS:
+        raise ValueError(f"知らない位置です: {value}")
+    set_pc_setting(BAR_POSITION_ACTIVE_KEY, value)
 
 
 def pc_mode() -> str:
