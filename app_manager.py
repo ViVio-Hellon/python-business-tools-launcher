@@ -21,6 +21,10 @@
 ツールは「誰も見ていない」と判断して自分で終わる。ランチャーはそれに
 気づいて、そのツールを一覧から外す。
 
+起動・停止・思わぬ停止は、**あとから追えるように** `trace` へ残す
+(出来事の一覧と、失敗したときの障害記録)。障害記録には、ランチャーが
+確かめられた「なぜ」を並べておく。
+
 画面 (tkinter) はこのモジュールを読み込むが、**このモジュールは画面を
 読み込まない**。起動・停止の判断だけを持つので、画面が無い環境でも
 試験できる (基盤仕様書 2.5「起動制御と業務ロジックを分ける」)。
@@ -43,7 +47,7 @@ if str(APP_ROOT) not in sys.path:
 
 import process_manager  # noqa: E402
 from launcher import (app_config, browser, health, logging_utils,  # noqa: E402
-                      runtime_state, tool_registry)
+                      runtime_state, tool_registry, trace)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
@@ -113,6 +117,8 @@ class Status:
     stopping_ids: tuple[str, ...] = ()
     # 最後に選ばれたツール。バーで少し強めに目立たせる
     focus_id: str = ""
+    # 障害記録を残したときの場所。［詳細］から開けるように
+    incident: str = ""
 
     @property
     def busy(self) -> bool:
@@ -159,6 +165,9 @@ class ToolManager:
         self._browser_seen: dict[str, bool] = {}
         # 最後に選ばれたツール
         self._focus = ""
+        # 起こしている最中のツールの操作 (後追いの記録)。「やめる」が
+        # 押されたとき、同じ操作IDで残すため
+        self._ops: dict[str, trace.Operation] = {}
 
     # --------------------------------------------------------------
     # 状態
@@ -207,7 +216,8 @@ class ToolManager:
     def _set(self, state: State, message: str, who=None, *, detail: str = "",
              elapsed: float = 0.0, responding: bool = False,
              browser_open: Optional[bool] = None, phase: str = "",
-             stage: str = "", timeout: float = 0.0) -> None:
+             stage: str = "", timeout: float = 0.0,
+             incident: str = "") -> None:
         """知らせを出す。`who` は `Tool` か `RunningTool` (どのツールのことか)。"""
         app_id = getattr(who, "app_id", "") if who is not None else ""
         name = getattr(who, "display_name", "") if who is not None else ""
@@ -234,7 +244,8 @@ class ToolManager:
             browser_managed=bool(running and running.browser_managed),
             phase=phase, stage=stage, timeout=timeout,
             running_ids=running_ids, starting_ids=starting_ids,
-            stopping_ids=stopping_ids, focus_id=self._focus))
+            stopping_ids=stopping_ids, focus_id=self._focus,
+            incident=incident))
 
     def summary(self) -> str:
         """「動作中：日報、看板」。何も動いていなければ「起動していません」。"""
@@ -289,6 +300,10 @@ class ToolManager:
         runtime_state.replace_all(adopted)
         for running in adopted.values():
             log.info("動いているツールを引き継ぎました: %s", running.summary())
+            outside_tool = running.display_name in outside
+            trace.event("引き継ぎ", trace.INFO, tool=running,
+                        cause=("ランチャーの外で起動されていた" if outside_tool
+                               else "前回のランチャーが起動したもの"))
 
         detail = ""
         if outside:
@@ -314,32 +329,52 @@ class ToolManager:
                       detail=f"アプリID: {app_id}")
             return
         self._focus = app_id
-        threading.Thread(target=self._run_select, args=(tool,),
+        op = trace.operation("ボタン", tool)
+        threading.Thread(target=self._run_select, args=(tool, op),
                          name=f"select-{tool.app_id}", daemon=True).start()
 
-    def _run_select(self, tool: Tool) -> None:
+    def _run_select(self, tool: Tool,
+                    op: Optional[trace.Operation] = None) -> None:
+        op = op or trace.operation("ボタン", tool)
         try:
-            self._select_blocking(tool)
+            self._select_blocking(tool, op)
         except Exception as exc:                  # noqa: BLE001 - 画面に出して継続
             log.exception("起動処理で予期しない失敗: %s", tool.app_id)
+            cause = f"{type(exc).__name__}: {exc}"
+            path = trace.incident(
+                f"{tool.display_name}の起動処理で想定外の失敗", tool=tool, op=op,
+                whys=[f"ランチャーの中で想定外の例外が起きた ({cause})"],
+                observed=[("起動ファイル", tool.start_command or "(未設定)"),
+                          ("作業フォルダー", tool.resolved_work_dir or "-")],
+                hints=["ランチャーの不具合の可能性があります。"
+                       "この記録を開発担当へ渡してください。"],
+                tool_log=tool_log_path(tool.app_id), exc=exc)
+            trace.event("想定外の例外", trace.FAILED, tool=tool, op=op,
+                        cause=cause, incident=path)
             self._set(State.ERROR, f"{tool.display_name}を起動できませんでした",
-                      tool, detail=f"{exc}\nログ: {app_config.local_dir('logs')}")
+                      tool, detail=f"{exc}\n" + _records_note(path),
+                      incident=path)
 
-    def _select_blocking(self, tool: Tool) -> None:
+    def _select_blocking(self, tool: Tool,
+                         op: Optional[trace.Operation] = None) -> None:
         """起動の本体。試験からはこちらを直接呼ぶ。"""
+        op = op or trace.operation("ボタン", tool)
         self._focus = tool.app_id
         with self._lock:
             running = self._running.get(tool.app_id)
         if running is not None:
             if process_manager.is_running(running):
-                self._show(tool, running)
+                self._show(tool, running, op)
                 return
             # 記録はあるが応答しない。落ちている。起動し直す
             log.info("%s は応答しないので起動し直します", tool.display_name)
+            trace.event("応答なし", trace.WARNING, tool=running, op=op,
+                        cause="動いている記録はあるが応答しないので起動し直す")
             self._forget(tool.app_id)
-        self._start(tool)
+        self._start(tool, op)
 
-    def _show(self, tool: Tool, running: RunningTool) -> None:
+    def _show(self, tool: Tool, running: RunningTool,
+              op: Optional[trace.Operation] = None) -> None:
         """動いているツールの画面を出す。**起動し直さない** (§9)。"""
         if process_manager.is_browser_open(running):
             # もう出ている。**もう1枚開かない** ── 同じツールの窓が2つ
@@ -347,14 +382,20 @@ class ToolManager:
             brought = browser.bring_to_front(running.browser_pid)
             log.info("すでに動いていて画面も出ています: %s (前へ=%s)",
                      tool.display_name, brought)
+            trace.event("画面を前へ", trace.OK if brought else trace.INFO,
+                        tool=running, op=op,
+                        detail="" if brought else "前に出せなかった")
             detail = ""
         elif running.browser_managed or tool.suppresses_browser:
             # 利用者が画面だけ手で閉じていた。バックエンドは動いたまま
             # なので、起動し直さず画面だけ開く (§11)
             log.info("画面だけ開き直します: %s", tool.display_name)
             self._open_browser(running, running.url or tool.home_url)
+            trace.event("画面を開き直す", trace.INFO, tool=running, op=op)
             detail = ""
         else:
+            trace.event("動作中", trace.INFO, tool=running, op=op,
+                        cause="画面はツールがふだんのブラウザーに開いている")
             detail = (f"{tool.display_name}は動いています。画面はツールが"
                       "ふだんのブラウザーに開いているので、そちらを見てください。")
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
@@ -368,6 +409,10 @@ class ToolManager:
         with self._lock:
             if app_id in self._starting:
                 self._cancelled.add(app_id)
+                op = self._ops.get(app_id)
+                trace.event("起動をやめる", trace.INFO,
+                            tool=tool_registry.get(app_id), op=op,
+                            cause="起動を待っているあいだに［止める］が押された")
                 return
         threading.Thread(target=self._stop_blocking, args=(app_id,),
                          kwargs={"force": force}, name=f"stop-{app_id}",
@@ -388,10 +433,13 @@ class ToolManager:
         with self._lock:
             self._cancelled.update(self._starting)
             targets = list(self._running)
-        results = [self._stop_blocking(app_id, force=force) for app_id in targets]
+        op = trace.operation("すべて停止")
+        results = [self._stop_blocking(app_id, force=force, op=op)
+                   for app_id in targets]
         return all(results)
 
-    def _stop_blocking(self, app_id: str, *, force: bool = False) -> bool:
+    def _stop_blocking(self, app_id: str, *, force: bool = False,
+                       op: Optional[trace.Operation] = None) -> bool:
         """1つのツールを止めて、**終了を確認する** (要件定義書 §8.1)。"""
         with self._lock:
             running = self._running.get(app_id)
@@ -401,13 +449,18 @@ class ToolManager:
                 return False                  # すでに止めている最中
             self._stopping.add(app_id)
         try:
-            return self._stop_locked(running, force=force)
+            return self._stop_locked(running, force=force,
+                                     op=op or trace.operation("停止", running))
         finally:
             with self._lock:
                 self._stopping.discard(app_id)
 
-    def _stop_locked(self, running: RunningTool, *, force: bool) -> bool:
+    def _stop_locked(self, running: RunningTool, *, force: bool,
+                     op: Optional[trace.Operation] = None) -> bool:
         name = running.display_name or running.app_id
+        began = time.monotonic()
+        trace.event("停止要求", trace.INFO, tool=running, op=op,
+                    detail="強制終了" if force else "")
         # 画面を閉じることから始まるので、そう伝える (要件定義書 §8.2)
         if running.browser_managed and process_manager.is_browser_open(running):
             self._set(State.STOPPING, f"{name}の画面を閉じています...", running,
@@ -438,18 +491,29 @@ class ToolManager:
             if result.browser_closed:
                 detail += ("\n画面は閉じましたが、処理は続いています。"
                            "同じボタンを押すと画面を開き直せます。")
+            trace.event("停止を見送り", trace.WARNING, tool=running, op=op,
+                        cause="実行中の処理がある: " + "、".join(result.busy_jobs),
+                        elapsed=time.monotonic() - began)
             self._set(State.RUNNING, self.summary(), running, detail=detail,
                       responding=True)
             return False
 
         if not result.stopped:
+            path = self._record_stop_failure(running, result, force=force, op=op)
+            trace.event("停止失敗", trace.FAILED, tool=running, op=op,
+                        cause=result.message, detail=result.method,
+                        elapsed=time.monotonic() - began, incident=path)
             self._set(State.ERROR, f"{name}を終了できませんでした", running,
-                      detail=(f"{result.message}\n"
-                              f"ログ: {app_config.local_dir('logs')}"))
+                      detail=f"{result.message}\n" + _records_note(path),
+                      incident=path)
             return False
 
         self._forget(running.app_id)
         log.info("停止完了: %s (%s)", name, result.method)
+        trace.event("停止完了", trace.OK, tool=running, op=op,
+                    detail=f"止め方: {result.method}"
+                    + ("" if result.browser_closed else " / 画面は閉じていない"),
+                    elapsed=time.monotonic() - began)
         # **ランチャーが閉じられない画面が残るなら、そう伝える。**
         # 「終了しました」とだけ出ると、残ったタブを見た利用者は
         # 止まっていないのかと思う
@@ -502,14 +566,19 @@ class ToolManager:
     # --------------------------------------------------------------
     # 起動
     # --------------------------------------------------------------
-    def _start(self, tool: Tool) -> None:
+    def _start(self, tool: Tool, op: Optional[trace.Operation] = None) -> None:
+        op = op or trace.operation("起動", tool)
         problem = tool_registry.validate_start_command(tool.start_command)
         if not tool.start_command.strip():
+            trace.event("起動できない", trace.FAILED, tool=tool, op=op,
+                        cause="起動ファイル (start.bat) が設定されていない")
             self._set(State.ERROR, f"{tool.display_name}が設定されていません", tool,
                       detail=("設定画面で start.bat の場所を指定してください。\n"
                               "(ランチャーバーの「設定」ボタン)"))
             return
         if problem:
+            trace.event("起動できない", trace.FAILED, tool=tool, op=op,
+                        cause=problem, detail=tool.start_command)
             self._set(State.ERROR, f"{tool.display_name}を起動できません", tool,
                       detail=f"{problem}\n設定画面で指定し直してください。")
             return
@@ -526,20 +595,24 @@ class ToolManager:
                 return
             self._starting.add(tool.app_id)
             self._cancelled.discard(tool.app_id)
+            self._ops[tool.app_id] = op
 
         try:
-            self._start_locked(tool)
+            self._start_locked(tool, op)
         finally:
             with self._lock:
                 self._starting.discard(tool.app_id)
                 self._cancelled.discard(tool.app_id)
+                self._ops.pop(tool.app_id, None)
 
-    def _start_locked(self, tool: Tool) -> None:
+    def _start_locked(self, tool: Tool,
+                      op: Optional[trace.Operation] = None) -> None:
         """起動の本体。**同じツールでは1つしか走らない**ことが前提。"""
+        op = op or trace.operation("起動", tool)
         timeout = float(app_config.ui_setting("start_timeout_seconds"))
         self._set(State.STARTING, f"{tool.display_name}を起動しています...", tool,
                   phase=PHASE_SPAWN, timeout=timeout)
-        proc = self._spawn(tool)
+        proc = self._spawn(tool, op)
         if proc is None:
             return
         with self._lock:
@@ -550,6 +623,9 @@ class ToolManager:
         # 「90秒待った末に時間切れ」より「start.bat が3秒で終了した
         # (戻り値 1)」のほうが、次に何を見ればよいか分かる
         early_exit: dict[str, int] = {}
+        # 待っているあいだに最後に返った応答。**時間切れの理由を分ける
+        # 手がかり** (別のアプリが答えていた・準備が終わらなかった)
+        seen: dict[str, dict] = {}
 
         def should_stop() -> bool:
             if tool.app_id in self._cancelled:
@@ -561,6 +637,11 @@ class ToolManager:
             return False
 
         def on_progress(elapsed: float, payload: Optional[dict]) -> None:
+            if payload:
+                if "payload" not in seen:
+                    op.step(f"初めて応答あり ({elapsed:.1f}秒): "
+                            f"app_id={payload.get('app_id', '?')}")
+                seen["payload"] = payload
             stage = health.stage_text(payload)
             message = f"{tool.display_name}を起動しています..."
             if stage:
@@ -579,6 +660,9 @@ class ToolManager:
             with self._lock:
                 self._processes.pop(tool.app_id, None)
             self._abandon(tool, proc)
+            trace.event("起動中止", trace.CANCELLED, tool=tool, op=op,
+                        cause="利用者がやめた",
+                        elapsed=time.monotonic() - started)
             self._set(self._settled_state(), f"{tool.display_name}の起動をやめました",
                       tool)
             return
@@ -587,7 +671,9 @@ class ToolManager:
             with self._lock:
                 self._processes.pop(tool.app_id, None)
             self._report_start_failure(tool, proc, early_exit,
-                                       time.monotonic() - started)
+                                       time.monotonic() - started, op=op,
+                                       last_payload=seen.get("payload"),
+                                       timeout=timeout)
             return
 
         running = _running_from_health(tool, payload, launch_pid=proc.pid)
@@ -598,6 +684,9 @@ class ToolManager:
         # 調べるとき、ログにこの1行があるかどうかで手間が変わる
         log.info("起動完了: %s (版 %s)", running.summary(),
                  payload.get("version") or "不明")
+        trace.event("起動完了", trace.OK, tool=running, op=op,
+                    version=str(payload.get("version") or ""),
+                    elapsed=time.monotonic() - started)
 
         # **ここで初めて画面を開く** (要件定義書 §7.1 / §20)。
         #
@@ -608,7 +697,7 @@ class ToolManager:
             self._set(State.STARTING, f"{tool.display_name}の画面を開いています...",
                       tool, elapsed=time.monotonic() - started,
                       phase=PHASE_OPEN_BROWSER, timeout=timeout)
-            self._open_browser(running, running.url or tool.home_url)
+            self._open_browser(running, running.url or tool.home_url, op)
         else:
             log.info("画面はツール側が開きます: %s", tool.display_name)
         # 画面のPIDまで入った状態で記録する。`stop.bat` は別プロセス
@@ -625,17 +714,19 @@ class ToolManager:
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
                   elapsed=time.monotonic() - started, responding=True)
 
-    def _spawn(self, tool: Tool) -> Optional[subprocess.Popen]:
+    def _spawn(self, tool: Tool,
+               op: Optional[trace.Operation] = None) -> Optional[subprocess.Popen]:
         """起動入口を実行する (要件定義書 §12.2)。
 
         ランチャーはツールの起動方法を知らない。入口を呼ぶだけにして、
         Pythonの起こし方は各リポジトリ側に残す。
         """
         command = _entry_command(tool)
-        out_path = (app_config.local_dir("logs")
-                    / f"tool_{_safe_name(tool.app_id)}.out.log")
+        out_path = tool_log_path(tool.app_id)
         log.info("起動開始: %s — %s (cwd=%s)",
                  tool.display_name, " ".join(command), tool.resolved_work_dir)
+        trace.event("起動開始", trace.INFO, tool=tool, op=op,
+                    detail=f"{' '.join(command)} (作業フォルダー {tool.resolved_work_dir or '-'})")
         if tool.start_args.strip() and not tool.forwards_args:
             # **届かない引数を、届いたつもりで扱わない。**
             # `.vbs` は引数を転送するとは限らない (4ツールの Start.vbs は
@@ -673,9 +764,30 @@ class ToolManager:
                 shell=False)
         except (OSError, subprocess.SubprocessError) as exc:
             log.exception("start.bat を実行できませんでした: %s", tool.start_command)
+            cause = f"start.bat を実行できなかった ({type(exc).__name__}: {exc})"
+            work_dir = tool.resolved_work_dir
+            path = trace.incident(
+                f"{tool.display_name}を起動できなかった", tool=tool, op=op,
+                whys=["ツールのバックエンドが立ち上がらなかった",
+                      cause],
+                observed=[("実行したコマンド", " ".join(command)),
+                          ("起動ファイル", tool.start_command),
+                          ("ファイルがあるか",
+                           "ある" if Path(tool.start_command.strip().strip('"')).exists()
+                           else "無い"),
+                          ("作業フォルダー", work_dir or "-"),
+                          ("フォルダーがあるか",
+                           "-" if not work_dir else
+                           ("ある" if Path(work_dir).is_dir() else "無い"))],
+                hints=["ファイルの場所が変わっていないか (設定画面の［参照］で指定し直す)",
+                       "ウイルス対策ソフトなどに実行を止められていないか"],
+                exc=exc)
+            trace.event("起動失敗", trace.FAILED, tool=tool, op=op, cause=cause,
+                        incident=path)
             self._set(State.ERROR, f"{tool.display_name}を起動できませんでした", tool,
                       detail=(f"start.bat を実行できませんでした: {exc}\n"
-                              f"パス: {tool.start_command}"))
+                              f"パス: {tool.start_command}\n" + _records_note(path)),
+                      incident=path)
             return None
         finally:
             if out is not subprocess.DEVNULL:
@@ -702,39 +814,149 @@ class ToolManager:
             pass
 
     def _report_start_failure(self, tool: Tool, proc: subprocess.Popen,
-                              early_exit: dict, elapsed: float) -> None:
-        """起動できなかったことを、**次に何を見ればよいか**まで含めて出す。"""
-        out_path = (app_config.local_dir("logs")
-                    / f"tool_{_safe_name(tool.app_id)}.out.log")
+                              early_exit: dict, elapsed: float, *,
+                              op: Optional[trace.Operation] = None,
+                              last_payload: Optional[dict] = None,
+                              timeout: float = 0.0) -> None:
+        """起動できなかったことを、**次に何を見ればよいか**まで含めて出す。
+
+        画面には短い案内を、障害記録には**ランチャーが確かめた事実**を
+        「なぜ」の形で並べる。どこまで進んで止まったか (入口が落ちた・
+        ポートが開かない・別のアプリが答えた・準備が終わらない) で、
+        次に調べるところがまったく違うので、ここで分けておく。
+        """
+        out_path = tool_log_path(tool.app_id)
+        tail = trace.tail_lines(out_path)
+        error = trace.error_line(tail)
         lines: list[str] = []
+        whys = [f"起動確認 ({tool.health_url}) から準備完了の応答が無かった"
+                f" (待った時間 {elapsed:.1f}秒)"]
+        hints: list[str] = []
 
         code = early_exit.get("code")
+        exit_now = proc.poll() if code is None else code
+        port_open = health.is_port_accepting(tool.port)
+        payload = health.probe(tool.health_url) if port_open else None
+        answer = payload or last_payload
+        other = (str(answer.get("app_id") or "(アプリIDなし)")
+                 if answer and not health.is_tool(answer, tool.app_id) else "")
+
         if code is not None:
+            cause = f"start.bat が戻り値 {code} で終了した"
+            whys.append(f"ツールが立ち上がる前に、起動ファイルが終了した (戻り値 {code})")
             lines.append(f"start.bat が終了しました (戻り値 {code})。")
+            if error:
+                whys.append(f"ツールの出力にエラーが出ている: {error}")
+            if other:
+                # 入口が落ちた理由として、確かめられた事実を並べておく
+                whys.append(f"ポート {tool.port} では、別のアプリ (アプリID {other})"
+                            " が応答している")
+                lines.append(f"ポート {tool.port} は別のアプリ ({other}) が"
+                             "使っています。")
+                hints.append("設定画面で、ほかのツールと同じポートになっていないか")
             if tool.start_args.strip():
                 lines.append(f"起動引数「{tool.start_args}」を受け付けない"
                              "ツールかもしれません。設定画面で空にして"
                              "試してください。")
-        elif health.is_port_accepting(tool.port):
-            # 待ち受けてはいるが応答が返らない。原因はたいていこれ
+                hints.append(f"起動引数「{tool.start_args}」を受け付けないツールでは"
+                             "ないか (設定画面で空にして試す)")
+            hints.append("start.bat をダブルクリックして、出るエラーを読む")
+        elif other:
+            cause = f"ポート {tool.port} で別のアプリ ({other}) が応答している"
+            whys.append(f"ポート {tool.port} では、別のアプリ (アプリID {other}) が"
+                        "応答している")
+            lines.append(f"ポート {tool.port} は別のアプリ ({other}) が使っています。")
+            hints.append("設定画面で、ほかのツールと同じポートになっていないか")
+            hints.append(f"{other} を止めてから、もう一度押してみる")
+        elif answer and health.is_tool(answer, tool.app_id):
+            stage = health.stage_text(answer) or "不明"
+            cause = f"準備が {elapsed:.0f}秒で終わらなかった (段階: {stage})"
+            whys.append(f"ツールは応答しているが、準備が終わらなかった (段階: {stage})")
+            lines.append(f"{tool.display_name}は応答していますが、"
+                         f"準備が終わりませんでした (段階: {stage})。")
+            hints.append("データの読み込みに時間がかかっていないか "
+                         "(待つ上限は launcher.json の start_timeout_seconds)")
+            hints.append("ツールの出力に、準備の途中で止まった跡がないか")
+        elif port_open:
+            cause = f"ポート {tool.port} は待ち受けているが、起動確認に応答しない"
+            whys.append(f"ポート {tool.port} は待ち受けているが、"
+                        "起動確認に応答しない")
             lines.append(f"ポート {tool.port} は待ち受けていますが、"
                          "起動確認の応答がありません。")
             proxies = health.proxy_settings()
             if proxies:
-                lines.append("プロキシ設定があります ("
-                             + "、".join(f"{k}={v}" for k, v in sorted(proxies.items()))
-                             + ")。127.0.0.1 が除外されているか確認してください。")
+                proxy_text = "、".join(f"{k}={v}" for k, v in sorted(proxies.items()))
+                lines.append(f"プロキシ設定があります ({proxy_text})。"
+                             "127.0.0.1 が除外されているか確認してください。")
+                hints.append(f"プロキシ ({proxy_text}) が 127.0.0.1 への接続を"
+                             "横取りしていないか")
+            hints.append("セキュリティ製品が通信を止めていないか")
             lines.append(f"起動確認URL: {tool.health_url}")
         else:
+            cause = f"ポート {tool.port} で待ち受けていない"
+            whys.append(f"ポート {tool.port} で待ち受けていない "
+                        "(ツールのサーバーが立ち上がっていない)")
+            if error:
+                whys.append(f"ツールの出力にエラーが出ている: {error}")
             lines.append(f"{elapsed:.0f}秒 待ちましたが応答がありませんでした。")
             lines.append(f"起動確認URL: {tool.health_url}")
+            hints.append("start.bat をダブルクリックして、出るエラーを読む")
+            hints.append(f"ツール側のポートが設定 ({tool.port}) と同じか")
+
+        if error and code is None and not other:
+            lines.append(f"ツールの出力のエラー: {error}")
+
+        observed = [
+            ("起動ファイル", tool.start_command),
+            ("起動引数", tool.start_args or "(なし)"),
+            ("作業フォルダー", tool.resolved_work_dir or "-"),
+            ("起動ファイルの状態",
+             "動いたまま" if exit_now is None else f"終了 (戻り値 {exit_now})"),
+            ("待った時間", f"{elapsed:.1f}秒" + (f" (上限 {timeout:.0f}秒)"
+                                                if timeout else "")),
+            ("ポート", f"{tool.port} は"
+                       + ("待ち受けている" if port_open else "待ち受けていない")),
+            ("起動確認の応答", _describe_payload(answer)),
+            ("プロキシ", "、".join(f"{k}={v}" for k, v in
+                                  sorted(health.proxy_settings().items())) or "なし"),
+        ]
+        path = trace.incident(f"{tool.display_name}を起動できなかった", tool=tool,
+                              op=op, whys=whys, observed=observed, hints=hints,
+                              tool_log=out_path)
+        trace.event("起動失敗", trace.FAILED, tool=tool, op=op, cause=cause,
+                    detail=error, elapsed=elapsed, incident=path)
 
         lines.append(f"ツールの出力: {out_path}")
-        lines.append(f"ランチャーのログ: {app_config.local_dir('logs')}")
-
+        lines.append(_records_note(path))
         log.error("起動失敗: %s — %s", tool.display_name, " / ".join(lines))
         self._set(State.ERROR, f"{tool.display_name}を起動できませんでした", tool,
-                  detail="\n".join(lines), elapsed=elapsed)
+                  detail="\n".join(lines), elapsed=elapsed, incident=path)
+
+    def _record_stop_failure(self, running: RunningTool, result,
+                             *, force: bool,
+                             op: Optional[trace.Operation] = None) -> str:
+        """止められなかったときの障害記録。場所を返す。"""
+        pid_alive = bool(running.pid and process_manager.is_pid_alive(running.pid))
+        still = process_manager.is_running(running)
+        whys = [f"終了を確認できなかった ({result.message})"]
+        if still:
+            whys.append("ツールはまだ起動確認に応答している (止める指示が効いていない)")
+        elif pid_alive:
+            whys.append(f"起動確認には応答しないが、プロセス (PID {running.pid}) は残っている")
+        return trace.incident(
+            f"{running.display_name or running.app_id}を終了できなかった",
+            tool=running, op=op, whys=whys,
+            observed=[("止め方の設定", running.stop_method or "auto"),
+                      ("最後に試した方法", result.method or "-"),
+                      ("強制終了", "はい" if force else "いいえ"),
+                      ("停止ファイル", running.stop_command or "-"),
+                      ("PID", f"{running.pid or '-'} ("
+                              + ("残っている" if pid_alive else "残っていない") + ")"),
+                      ("起動確認", "応答あり" if still else "応答なし"),
+                      ("ポート", f"{running.port}")],
+            hints=["タスクマネージャーで、PID のプロセスが固まっていないか",
+                   "ツールの stop.bat を手で実行して、出るエラーを読む"],
+            tool_log=tool_log_path(running.app_id))
 
     # --------------------------------------------------------------
     # 生存監視 (基盤仕様書 2.9)
@@ -791,6 +1013,8 @@ class ToolManager:
         name = running.display_name or running.app_id
         log.info("画面が閉じられました。ツールはまもなく終了します: %s",
                  running.app_id)
+        trace.event("画面を閉じた", trace.INFO, tool=running,
+                    cause="利用者が画面を閉じた (ツールはまもなく自分で終わる)")
         self._set(State.RUNNING, f"{name}の画面を閉じました（まもなく終了します）",
                   running, responding=True, browser_open=False,
                   detail=(f"{name}のブラウザー画面を閉じました。\n"
@@ -804,19 +1028,74 @@ class ToolManager:
         log.warning("応答が途切れました: %s (%d回連続)", running.summary(), count)
         was_open = (running.browser_managed
                     and process_manager.is_browser_open(running))
-        self._forget(running.app_id)
         if was_open:
-            # 画面は出ているのにツールが答えない。**思わぬ停止**
+            # 画面は出ているのにツールが答えない。**思わぬ停止**。
+            # 一覧から外す前に手がかりを集める (外すとPIDを引き取って
+            # しまい、残っていたかどうか分からなくなる)
+            path = self._record_lost(running, count)
+            self._forget(running.app_id)
             self._set(State.ERROR, f"{name}が終了しました", running,
                       detail=("ツール側が停止したか、応答しなくなりました。\n"
-                              "もう一度ボタンを押すと起動し直します。"))
+                              "もう一度ボタンを押すと起動し直します。\n"
+                              + _records_note(path)),
+                      incident=path)
             return
+        self._forget(running.app_id)
+        trace.event("自動終了", trace.INFO, tool=running,
+                    cause="画面が閉じていて、ツールが自分で終わった"
+                    if running.browser_managed else
+                    "ツールが応答しなくなった (画面はツール側の管理)",
+                    detail=f"応答なし {count}回")
         # 画面を閉じたので、ツールが自分で終わった。ふつうのこと
         self._set(self._settled_state(), f"{name}は終了しました", running,
                   detail=("画面を閉じると、ツールは自分で終了します。\n"
                           "続けて使うときは、もう一度ボタンを押してください。"
                           + ("" if running.browser_managed else
                              "\n画面 (タブ) が残っていれば、手で閉じてください。")))
+
+    def _record_lost(self, running: RunningTool, count: int) -> str:
+        """思わぬ停止の障害記録。「落ちた」か「固まった」かを分けておく。"""
+        interval = app_config.ui_setting("health_poll_seconds")
+        pid_alive = bool(running.pid and process_manager.is_pid_alive(running.pid))
+        port_open = health.is_port_accepting(running.port)
+        whys = [f"起動確認 ({running.health_url}) に {count}回続けて応答しなかった"]
+        if pid_alive and port_open:
+            whys.append(f"プロセス (PID {running.pid}) もポート {running.port} も"
+                        "残っているのに応答しない (固まっている)")
+            hints = ["重い処理の途中で固まっていないか (ツールの出力の最後を見る)",
+                     "タスクマネージャーで CPU・メモリを使い切っていないか"]
+        elif pid_alive:
+            whys.append(f"プロセス (PID {running.pid}) は残っているが、"
+                        f"ポート {running.port} を閉じている")
+            hints = ["終了の途中で止まっていないか (ツールの出力の最後を見る)"]
+        else:
+            whys.append(f"ツールのプロセス (PID {running.pid or '?'}) が無くなっている"
+                        " (落ちた・誰かが止めた)")
+            hints = ["ツールの出力の最後に、エラーや Traceback が無いか",
+                     "ほかの人・ほかの手段 (stop.bat、タスクマネージャー) で"
+                     "止めていないか",
+                     "パソコンがスリープから戻った直後ではないか"]
+        error = trace.error_line(trace.tail_lines(tool_log_path(running.app_id)))
+        if error:
+            whys.append(f"ツールの出力にエラーが出ている: {error}")
+        started = time.strftime("%Y/%m/%d %H:%M:%S",
+                                time.localtime(running.started_at)) \
+            if running.started_at else "-"
+        path = trace.incident(
+            f"{running.display_name or running.app_id}が思わず止まった",
+            tool=running, whys=whys, hints=hints,
+            observed=[("起動した時刻", started),
+                      ("PID", f"{running.pid or '-'} ("
+                              + ("残っている" if pid_alive else "残っていない") + ")"),
+                      ("ポート", f"{running.port} は"
+                                 + ("待ち受けている" if port_open else "待ち受けていない")),
+                      ("画面", "出たまま"),
+                      ("見回りの間隔", f"{interval}秒 × {count}回")],
+            tool_log=tool_log_path(running.app_id))
+        trace.event("思わぬ停止", trace.FAILED, tool=running,
+                    cause=whys[1] if len(whys) > 1 else whys[0],
+                    detail=error, incident=path)
+        return path
 
     # --------------------------------------------------------------
     # 後始末
@@ -845,7 +1124,8 @@ class ToolManager:
         return True
 
     # --------------------------------------------------------------
-    def _open_browser(self, running: RunningTool, url: str) -> None:
+    def _open_browser(self, running: RunningTool, url: str,
+                      op: Optional[trace.Operation] = None) -> None:
         """画面を開き、閉じるための手がかりを記録に残す。
 
         専用プロファイルのアプリウィンドウとして開けたときだけ、PIDと
@@ -858,6 +1138,8 @@ class ToolManager:
             session = browser.open_window(running.app_id, url)
         except Exception as exc:              # noqa: BLE001 - 開けなくても続ける
             log.warning("画面を開けませんでした (%s): %s", url, exc)
+            trace.event("画面を開けない", trace.WARNING, tool=running, op=op,
+                        cause=f"{type(exc).__name__}: {exc}", detail=url)
             return
         running.browser_pid = session.pid
         running.browser_profile = session.profile_dir
@@ -970,6 +1252,32 @@ def _tool_opens_browser_note(tool: Tool) -> str:
                  "不要になった画面は手で閉じてください。"
                  "(画面を閉じると、ツールは自分で終了します)")
     return "\n".join(lines)
+
+
+def tool_log_path(app_id: str) -> Path:
+    """ツールの出力 (`start.bat` の標準出力) の置き場所。
+
+    **いつも端末の中。** ツールが書き続けるファイルなので、共有フォルダー
+    に置くとネットワークが切れたときにツールの書き込みが失敗しかねない。
+    障害記録には末尾を写す (`trace`)。
+    """
+    return app_config.local_dir("logs") / f"tool_{_safe_name(app_id)}.out.log"
+
+
+def _records_note(incident: str) -> str:
+    """案内の末尾に付ける「記録の場所」。"""
+    if incident:
+        return f"障害記録: {incident}"
+    return f"ランチャーのログ: {trace.destination().path}"
+
+
+def _describe_payload(payload: Optional[dict]) -> str:
+    """起動確認の応答を1行で。"""
+    if not payload:
+        return "無し"
+    keys = ("app_id", "ready", "stage", "version", "pid", "port")
+    parts = [f"{k}={payload[k]}" for k in keys if k in payload]
+    return ", ".join(parts) or "(中身なし)"
 
 
 def _safe_name(app_id: str) -> str:

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from . import distribution
+from . import distribution, trace
 from .logging_utils import get_logger
 
 log = get_logger("admin_lock")
@@ -57,8 +57,12 @@ def unlock(ask: Ask, tell: Tell) -> bool:
             return False
         if distribution.verify_password(text):
             log.info("管理者パスワードを確認しました")
+            # 誰がいつ設定を開いたか。「いつから設定が変わったか」を追う起点
+            trace.event("設定を開く", trace.OK)
             return True
         log.warning("管理者パスワードが違います (%d回目)", attempt)
+        trace.event("設定を開く", trace.WARNING if attempt < MAX_ATTEMPTS
+                    else trace.FAILED, cause=f"パスワード違い ({attempt}回目)")
         left = MAX_ATTEMPTS - attempt
         tell("error", TITLE,
              "パスワードが違います。"
@@ -97,5 +101,6 @@ def choose(ask: Ask, tell: Tell) -> bool:
              f"保存先: {distribution.password_path()}\n"
              "ランチャーのフォルダーに書き込めるか確かめてください。")
         return False
+    trace.event("パスワード変更", trace.OK, detail=str(target))
     tell("info", TITLE, f"管理者パスワードを保存しました。\n{target}")
     return True

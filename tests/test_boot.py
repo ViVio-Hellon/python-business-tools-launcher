@@ -35,6 +35,17 @@ class BootTests(LocalAreaTestCase):
         # ロックを持ったまま返す (外すのはバーを閉じたとき)
         self.assertTrue(launch_guard.lock_path().exists())
 
+    def test_起動したことを記録に残す(self) -> None:
+        """「いつランチャーを起動し直したか」も、後追いの手がかりになる。"""
+        from launcher import trace
+
+        boot.run()
+        rows = [r for r in trace.read_events() if r["種類"] == "ランチャー起動"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["結果"], "成功")
+        self.assertIn("引き継いだツール 0件", rows[0]["詳細"])
+        self.assertIn("記録の置き場所", rows[0]["詳細"])
+
     def test_二重起動なら最初の段で止まる(self) -> None:
         refused = launch_guard.GuardResult(should_start=False,
                                            reason="すでに動いています")

@@ -13,6 +13,7 @@
     │   (Start.vbs も指定できます)                  │
     │ ポート [8733] 起動引数 [--no-browser]         │
     │                                              │
+    │ ログの出力先 [ 共有フォルダー ] [参照][既定][開く] │
     │ 配布先フォルダ [作る] [置き換える] [パスワード] │
     │                    [保存] [キャンセル]        │
     └──────────────────────────────────────────────┘
@@ -24,7 +25,7 @@ from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .. import app_config, distribution, tool_registry
+from .. import app_config, distribution, tool_registry, trace
 from ..logging_utils import get_logger
 from ..tool_registry import STOP_METHODS, Tool
 from . import password, theme
@@ -72,6 +73,8 @@ class SettingsDialog:
 
         self.body = self._scrollable_body()
         tools = tool_registry.all_tools(include_disabled=True)
+        # 開いたときの設定。保存したとき**何が変わったか**を記録に残す
+        self._before_tools = list(tools)
         for tool in tools:
             self.rows.append(_ToolRow(self.body, tool))
         if not tools:
@@ -90,6 +93,7 @@ class SettingsDialog:
         self._build_add_button()
         self._build_pc_mode()
         self._build_bar_position()
+        self._build_log_dir()
         self._build_distribution()
         self._build_buttons()
 
@@ -237,6 +241,75 @@ class SettingsDialog:
                        font=theme.FONT_SMALL, bd=0,
                        highlightthickness=0).pack(side="left", padx=(10, 0))
 
+    def _build_log_dir(self) -> None:
+        """ログの出力先 (後追い・なぜなぜ分析の記録)。
+
+        共有フォルダーを指定すると、全端末の記録が1か所に集まる (端末名の
+        フォルダーに分けて書く)。**書けない場所でもランチャーは止めない**
+        ── 書けるようになるまで端末の中に書く。
+        """
+        self._log_dir_before = tool_registry.get_pc_setting(trace.LOG_DIR_KEY)
+        self.log_dir_var = tk.StringVar(value=self._log_dir_before)
+
+        frame = tk.Frame(self.top, bg=theme.BG)
+        frame.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(frame, text="ログの出力先", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD).pack(side="left")
+        tk.Entry(frame, textvariable=self.log_dir_var, width=40,
+                 font=theme.FONT).pack(side="left", padx=(10, 0))
+        for text, command in (("参照", self.browse_log_dir),
+                              ("既定に戻す", lambda: self.log_dir_var.set("")),
+                              ("開く", self.open_log_dir)):
+            self._action_button(frame, text, command).pack(side="left",
+                                                           padx=(6, 0))
+
+        shared = distribution.log_dir()
+        blank = (f"配布先フォルダの指定 ({shared})" if shared
+                 else f"この端末の中 ({trace.local_dir()})")
+        for text in (f"空欄のとき: {blank}",
+                     "共有フォルダーを指定すると、端末名のフォルダー "
+                     f"({trace.computer_name()}) に分けて書きます"
+                     " (全端末の記録が1か所に集まります)"):
+            tk.Label(self.top, text=text, bg=theme.BG, fg=theme.MUTED,
+                     font=theme.FONT_SMALL, anchor="w", justify="left",
+                     wraplength=640).pack(fill="x", padx=16, pady=(4, 0))
+        dest = trace.destination()
+        tk.Label(self.top, text=f"いまの書き先: {dest.describe()}",
+                 bg=theme.BG,
+                 fg=theme.STATE_COLORS["error"] if dest.problem else theme.MUTED,
+                 font=theme.FONT_SMALL, anchor="w", justify="left",
+                 wraplength=640).pack(fill="x", padx=16, pady=(2, 0))
+
+    def browse_log_dir(self) -> None:
+        current = self.log_dir_var.get().strip()
+        start = trace.expand_dir(current) if current else trace.local_dir()
+        chosen = filedialog.askdirectory(
+            parent=self.top, title="ログの出力先",
+            initialdir=str(start if start.exists() else Path.home()))
+        if chosen:
+            self.log_dir_var.set(str(Path(chosen)))
+
+    def open_log_dir(self) -> None:
+        path = trace.destination().path
+        if not trace.open_path(path):
+            messagebox.showinfo("ログの出力先", f"開けませんでした。\n{path}",
+                                parent=self.top)
+
+    def _check_log_dir(self) -> bool:
+        """ログの出力先に書けるか。書けなくても、利用者が良ければ保存する。"""
+        text = self.log_dir_var.get().strip()
+        if not text or text == self._log_dir_before.strip():
+            return True
+        target = trace.folder_for(text)
+        problem = trace.check_writable(target)
+        if not problem:
+            return True
+        return messagebox.askyesno(
+            "ログの出力先",
+            f"指定した場所に書けません。\n{target}\n({problem})\n\n"
+            "書けるようになるまで、この端末の中に書きます:\n"
+            f"{trace.local_dir()}\n\nこのまま保存しますか?", parent=self.top)
+
     def _build_distribution(self) -> None:
         """配布先フォルダ (`distribution/`)。
 
@@ -306,6 +379,8 @@ class SettingsDialog:
                 relative=bool(self.relative_var.get()))
         except OSError as exc:
             log.warning("配布先フォルダを作れません: %s", exc)
+            trace.event("配布先フォルダを作る", trace.FAILED, cause=str(exc),
+                        detail=str(distribution.folder()))
             messagebox.showerror(
                 "配布先フォルダ",
                 f"設定は保存しましたが、配布先フォルダを作れませんでした。\n{exc}\n\n"
@@ -314,6 +389,9 @@ class SettingsDialog:
             self.top.destroy()
             return
 
+        trace.event("配布先フォルダを作る", trace.OK,
+                    detail=f"{distribution.folder()} "
+                           f"({len(distribution.tools())}件)")
         message = (f"配布先フォルダを作りました。\n{distribution.folder()}\n\n"
                    "ランチャーのフォルダーごと配ってください。\n"
                    "配った先では、起動したときに読み込まれます。")
@@ -349,6 +427,8 @@ class SettingsDialog:
         tool_registry.backup()
         replaced = tool_registry.reload_from_distribution()
         self.saved = True
+        trace.event("配布先フォルダで置き換え", trace.OK,
+                    detail="、".join(replaced) or "(なし)")
         messagebox.showinfo(
             "配布先フォルダ",
             f"{len(replaced)}件のツールを、配布先フォルダの内容で置き換えました。",
@@ -416,6 +496,8 @@ class SettingsDialog:
             messagebox.showerror("設定を保存できません",
                                  "\n".join(problems), parent=self.top)
             return False
+        if not self._check_log_dir():
+            return False
 
         warnings = [_delivery_warning(tool) for tool in updated]
         warnings = [text for text in warnings if text]
@@ -436,14 +518,31 @@ class SettingsDialog:
         for app_id in removed:
             tool_registry.delete_tool(app_id)
         tool_registry.save_all(updated)
+        mode_before = tool_registry.pc_mode()
         tool_registry.set_pc_mode(self.mode_var.get().strip())
         if self.reset_position.get():
             tool_registry.clear_pc_setting(self._position_key)
         chosen = {name: key for key, name in self._anchor_names.items()}.get(
             self.active_position_var.get())
+        changes = tool_registry.describe_changes(
+            self._before_tools, tool_registry.all_tools(include_disabled=True))
         if chosen and chosen != tool_registry.active_bar_position():
+            changes.append(f"起動後のバーの位置「{self.active_position_var.get()}」")
             tool_registry.set_active_bar_position(chosen)
+        if self.reset_position.get():
+            changes.append("バーの位置を自動に戻す")
+        if tool_registry.pc_mode() != mode_before:
+            changes.append(f"このPCのモード「{mode_before or '(空)'}」→"
+                           f"「{tool_registry.pc_mode() or '(空)'}」")
+        log_dir = self.log_dir_var.get().strip()
+        if log_dir != self._log_dir_before.strip():
+            changes.append(f"ログの出力先「{self._log_dir_before or '(既定)'}」→"
+                           f"「{log_dir or '(既定)'}」")
+            trace.set_log_dir(log_dir)
         log.info("設定を保存しました (%d件 / 削除 %d件)", len(updated), len(removed))
+        # 「昨日まで動いていたのに」を追うとき、**いつ何を変えたか**が要る
+        if changes:
+            trace.event("設定変更", trace.OK, detail="\n".join(changes))
         return True
 
     def cancel(self) -> None:

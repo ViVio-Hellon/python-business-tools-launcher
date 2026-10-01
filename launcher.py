@@ -144,6 +144,11 @@ def log_environment() -> None:
     log.info("アプリ本体: %s", app_config.APP_ROOT)
     log.info("ローカル領域: %s", app_config.local_root())
     log.info("版: %s", app_config.version_label())
+    try:
+        from launcher import trace
+        log.info("記録の置き場所: %s", trace.destination().describe())
+    except Exception:                         # noqa: BLE001 - 記録で止めない
+        log.warning("記録の置き場所を決められませんでした", exc_info=True)
 
 
 def start() -> int:
@@ -181,11 +186,29 @@ def start() -> int:
         for title, body in result.warnings:
             _show_message(title, body)
 
+        from launcher import trace
         from launcher.ui import bar
 
+        # 裏の処理で拾われなかった例外も、障害記録に残す
+        trace.install_thread_hook()
         log.info("ランチャーバーを出します (%.2f秒)", time.monotonic() - _BOOT_AT)
         bar.run(result.manager)
         return 0
+    except Exception as exc:
+        # バーが落ちた。**黙って消えない** ── 利用者には「急に消えた」と
+        # しか見えないので、障害記録を残す
+        from launcher import trace
+        log.exception("ランチャーが想定外の失敗で終了します")
+        path = trace.incident(
+            "ランチャーが想定外の失敗で終了した",
+            whys=[f"ランチャーの中で想定外の例外が起きた "
+                  f"({type(exc).__name__}: {exc})"],
+            hints=["ランチャーの不具合の可能性があります。"
+                   "この記録を開発担当へ渡してください。"],
+            exc=exc)
+        trace.event("ランチャー終了", trace.FAILED,
+                    cause=f"{type(exc).__name__}: {exc}", incident=path)
+        raise
     finally:
         launch_guard.remove_lock()
         log.info("ランチャーを終了しました")
@@ -221,15 +244,31 @@ def report_failure(error: StartupError) -> None:
         print(error.hint, file=sys.stderr)
 
     try:
-        log_dir = str(app_config.local_dir("logs"))
+        from launcher import trace
+        log_dir = str(trace.destination().path)
     except Exception:                         # noqa: BLE001
-        log_dir = "(ローカル領域を特定できませんでした)"
+        try:
+            log_dir = str(app_config.local_dir("logs"))
+        except Exception:                     # noqa: BLE001
+            log_dir = "(ローカル領域を特定できませんでした)"
     try:
         get_logger("launcher").error("起動に失敗: %s / %s", error, error.hint)
     except Exception:                         # noqa: BLE001
         pass
+    incident = ""
+    try:
+        from launcher import trace
+        incident = trace.incident(
+            "ランチャーを起動できなかった",
+            whys=[str(error)], hints=[error.hint] if error.hint else [])
+        trace.event("ランチャー起動", trace.FAILED, cause=str(error),
+                    detail=error.hint, incident=incident)
+    except Exception:                         # noqa: BLE001 - 伝え方で落ちない
+        pass
 
     body = f"{error}\n\n{error.hint}\n\nログ: {log_dir}"
+    if incident:
+        body += f"\n障害記録: {incident}"
     if _show_message("起動できませんでした", body):
         return
     try:
@@ -359,6 +398,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない
             print(f"設定を読めませんでした: {exc}")
         print()
+        # 記録の置き場所と最近の障害。**調査はここから始まる**
+        try:
+            print(_describe_records())
+        except Exception as exc:              # noqa: BLE001 - 診断で落ちない
+            print(f"記録の置き場所を確かめられませんでした: {exc}")
+        print()
         if problems:
             for problem in problems:
                 print(f"[エラー] {problem}")
@@ -382,6 +427,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\n中断しました")
         return 0
+
+
+def _describe_records() -> str:
+    """診断に出す「記録」の段。置き場所と、最近の障害記録。"""
+    from launcher import logging_utils, trace
+
+    dest = trace.destination()
+    lines = ["[記録 (後追い・なぜなぜ用)]",
+             f"  置き場所         : {dest.describe()}",
+             f"  ランチャーのログ : {logging_utils.log_file_path()}",
+             f"  出来事の一覧     : {trace.events_path()}",
+             f"  障害記録         : {dest.path / 'incidents'}",
+             f"  ツールの出力     : {trace.local_dir()}"
+             " (tool_<アプリID>.out.log。いつも端末の中)"]
+    if dest.problem:
+        lines.append(f"  [注意] 指定された出力先に書けません: {dest.problem}")
+    recent = trace.recent_incidents(days=7)
+    if recent:
+        lines.append(f"  この7日の障害記録: {len(recent)}件")
+        lines.extend(f"    {path}" for path in recent[:5])
+        if len(recent) > 5:
+            lines.append(f"    ほか {len(recent) - 5}件")
+    else:
+        lines.append("  この7日の障害記録: ありません")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

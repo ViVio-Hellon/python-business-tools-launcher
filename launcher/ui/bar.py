@@ -21,7 +21,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox
 from typing import Optional
 
-from .. import app_config, tool_registry
+from .. import app_config, logging_utils, tool_registry, trace
 from ..logging_utils import get_logger
 from . import geometry, password, theme
 from .geometry import POSITION_KEY
@@ -60,6 +60,9 @@ class LauncherBar:
         manager.set_status_callback(self.queue.put)
 
         self.root = tk.Tk()
+        # 画面の処理で拾われなかった例外を、障害記録にする。既定では
+        # 標準エラーへ出るだけで、pythonw では**誰にも見えない**
+        self.root.report_callback_exception = self._on_ui_error
         # 起動・切り替えの進み具合は別の窓に出す。バーの1行だけでは、
         # ツールが立ち上がるまでの数十秒が「何も起きていない」ように見える
         self.progress = ProgressWindow(self.root)
@@ -78,6 +81,8 @@ class LauncherBar:
         # 並び順。あふれ判定は番号で行うので、対応を持っておく
         self._order: list[str] = []
         self._last_detail = ""
+        # ［詳細］から開ける障害記録
+        self._last_incident = ""
         # 最後に選ばれたツール。［▼］に隠さない
         self._focus_id = ""
         # 状態の全文 (バーには「…」で切って出すことがある)
@@ -582,6 +587,8 @@ class LauncherBar:
             return
         dialog = SettingsDialog(self.root)
         if dialog.saved:
+            # ログの出力先が変わっていれば、書き先を移す
+            logging_utils.reconfigure()
             self._build_tool_buttons()
             # ツールが増えたぶん、窓を広げないとボタンが切れる
             self._resize_to_content()
@@ -594,8 +601,42 @@ class LauncherBar:
     def show_detail(self) -> None:
         if not self._last_detail:
             return
-        messagebox.showinfo(app_config.display_name(), self._last_detail,
-                            parent=self.root)
+        if not self._last_incident:
+            messagebox.showinfo(app_config.display_name(), self._last_detail,
+                                parent=self.root)
+            return
+        # 障害記録がある。**その場で開ける**ようにする ── 場所を書き写して
+        # エクスプローラで探す手間があると、記録は読まれない
+        if messagebox.askyesno(
+                app_config.display_name(),
+                f"{self._last_detail}\n\n"
+                "障害記録 (なぜなぜ分析の下書き) を開きますか?",
+                parent=self.root):
+            if not trace.open_path(self._last_incident):
+                messagebox.showinfo(app_config.display_name(),
+                                    f"開けませんでした。\n{self._last_incident}",
+                                    parent=self.root)
+
+    def _on_ui_error(self, exc_type, exc, tb) -> None:
+        """画面の処理で想定外の例外が起きた。**記録して、画面は動かし続ける。**"""
+        log.error("画面の処理で想定外の失敗", exc_info=(exc_type, exc, tb))
+        if exc is None:
+            return
+        if exc.__traceback__ is None:
+            exc = exc.with_traceback(tb)
+        path = trace.unexpected("ランチャーの画面", exc)
+        if not path:
+            return                            # 同じ失敗はもう記録してある
+        try:
+            self._set_status_text("error", "ランチャーで想定外の失敗がありました")
+            self._last_detail = (f"{exc_type.__name__}: {exc}\n"
+                                 f"障害記録: {path}")
+            self._last_incident = path
+            self.detail_button.configure(text="詳細 ！", bg=theme.ATTENTION_BG,
+                                         fg=theme.FG)
+            self.detail_button.pack(side="right", padx=(4, 0))
+        except Exception:                     # noqa: BLE001 - 知らせで重ねて落ちない
+            pass
 
     def on_close(self) -> None:
         """「終了」またはウィンドウを閉じたとき。
@@ -621,6 +662,11 @@ class LauncherBar:
             stop_tools = bool(answer)
 
         log.info("ランチャーを終了します (ツールも停止=%s)", stop_tools)
+        names = "、".join(r.display_name or a for a, r in running.items())
+        trace.event("ランチャー終了", trace.INFO,
+                    cause=("ツールも止める" if stop_tools else
+                           "ツールは動かしたまま" if running else ""),
+                    detail=names)
         if stop_tools:
             self._set_status_text("stopping", "ツールを終了しています...")
             self.root.update_idletasks()
@@ -673,6 +719,7 @@ class LauncherBar:
         self._set_status_text(status.state.value, message)
 
         self._last_detail = status.detail
+        self._last_incident = status.incident
         if status.detail:
             # 読んでほしい案内がある。**目立たせる**
             self.detail_button.configure(text="詳細 ！", bg=theme.ATTENTION_BG,
@@ -782,8 +829,9 @@ class LauncherBar:
     def _poll_worker(self) -> None:
         try:
             self.manager.poll_health()
-        except Exception:                     # noqa: BLE001 - 監視で画面を止めない
+        except Exception as exc:              # noqa: BLE001 - 監視で画面を止めない
             log.exception("生存監視で失敗しました")
+            trace.unexpected("生存監視", exc)
         finally:
             self._polling = False
 

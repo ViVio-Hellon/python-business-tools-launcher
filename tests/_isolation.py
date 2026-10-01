@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from launcher import app_config, distribution  # noqa: E402
+from launcher import app_config, distribution, trace  # noqa: E402
 
 # 本来の置き場所 (ランチャーのフォルダーの中)。フォルダーごと運ぶ
 # 試験ではこちらに戻す
@@ -57,6 +57,12 @@ class LocalAreaTestCase(unittest.TestCase):
                                     lambda: self.distribution_folder)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+        # 記録の置き場所は一度決めると覚えておく作り。前の試験が決めた
+        # 場所 (消えた一時フォルダー) を引きずらないよう、試験ごとに忘れる
+        trace._destination = None
+        self.addCleanup(setattr, trace, "_destination", None)
+        trace._seen_unexpected.clear()
 
     def tearDown(self) -> None:
         if self._orig is None:

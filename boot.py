@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from launcher import app_config
+from launcher import app_config, trace
 from launcher.logging_utils import get_logger
 
 log = get_logger("boot")
@@ -80,6 +80,8 @@ def run(report: Report = lambda step: None, *,
     if not guard.should_start:
         result.reason = guard.reason
         log.info("多重起動のため終了します: %s", guard.reason)
+        trace.event("ランチャー起動", trace.CANCELLED, cause="すでに起動している",
+                    detail=guard.reason)
         return result
     log.info("多重起動の判定: %s", guard.reason)
     result.started = True
@@ -110,9 +112,14 @@ def run(report: Report = lambda step: None, *,
         launch_guard.remove_lock()
         raise
 
-    log.info("起動の内訳: %s (合計 %.2f秒)",
-             " / ".join(f"{name} {sec:.2f}秒" for name, sec in result.timings),
-             clock() - started_at)
+    breakdown = " / ".join(f"{name} {sec:.2f}秒" for name, sec in result.timings)
+    log.info("起動の内訳: %s (合計 %.2f秒)", breakdown, clock() - started_at)
+    running = list(result.manager.running.values()) if result.manager else []
+    trace.event("ランチャー起動", trace.WARNING if result.warnings else trace.OK,
+                cause="、".join(title for title, _ in result.warnings),
+                detail=(f"引き継いだツール {len(running)}件 / {breakdown}"
+                        f" / 記録の置き場所 {trace.destination().describe()}"),
+                elapsed=clock() - started_at)
     return result
 
 

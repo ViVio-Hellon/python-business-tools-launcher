@@ -26,7 +26,8 @@ from _isolation import LocalAreaTestCase  # noqa: E402
 import app_manager  # noqa: E402
 import process_manager  # noqa: E402
 from app_manager import State, ToolManager  # noqa: E402
-from launcher import browser, health, runtime_state, tool_registry  # noqa: E402
+from launcher import (browser, health, runtime_state, tool_registry,  # noqa: E402
+                      trace)
 
 _FAKE_BROWSER = Path(__file__).resolve().parent / "_fake_browser.py"
 
@@ -650,6 +651,165 @@ class LeftoverScreenTests(ManagerTestCase):
         self.manager._stop_blocking(tool.app_id)
         self.assertEqual(self.manager.status.message, "日報を終了しました")
         self.assertEqual(self.manager.status.detail, "")
+
+
+class RecordTests(ManagerTestCase):
+    """後追いの記録。**起動しなかった理由を、あとから順に追えるか。**"""
+
+    def events(self, kind: str = "") -> list[dict]:
+        rows = trace.read_events()
+        return [r for r in rows if not kind or r["種類"] == kind]
+
+    def incident_text(self) -> str:
+        path = self.manager.status.incident
+        self.assertTrue(path, "障害記録がありません")
+        return Path(path).read_text(encoding="utf-8-sig")
+
+    def test_起動できたら版とPIDとかかった秒を残す(self) -> None:
+        tool = self.register("fake.rec", "日報", ready_after=0.5)
+        self.start(tool)
+
+        started = self.events("起動開始")
+        done = self.events("起動完了")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]["結果"], "成功")
+        self.assertEqual(done[0]["ツール版"], "1.0.0")
+        self.assertEqual(done[0]["PID"], str(self.manager.running[tool.app_id].pid))
+        self.assertGreaterEqual(float(done[0]["経過秒"]), 0.5)
+        # ボタンを押してから起動できるまでが、同じ操作IDで追える
+        self.assertEqual(started[0]["操作ID"], done[0]["操作ID"])
+        self.assertEqual(self.manager.status.incident, "")
+
+    def test_起動ファイルが落ちたらなぜなぜを書く(self) -> None:
+        tool = self.register("fake.crash", "看板", exit_code=3)
+        Path(tool.start_command).write_text(
+            "#!/bin/sh\necho 'Traceback (most recent call last):'\n"
+            "echo \"ModuleNotFoundError: No module named 'foo'\"\nexit 3\n",
+            encoding="utf-8")
+        self.start(tool)
+
+        text = self.incident_text()
+        self.assertIn("なぜ2  ツールが立ち上がる前に、起動ファイルが終了した (戻り値 3)",
+                      text)
+        self.assertIn("なぜ3  ツールの出力にエラーが出ている: "
+                      "ModuleNotFoundError: No module named 'foo'", text)
+        # ツールの出力の写し。ツールのログを探しに行かなくても読める
+        self.assertIn("| Traceback (most recent call last):", text)
+        # 画面の［詳細］からも場所が分かる
+        self.assertIn(self.manager.status.incident, self.manager.status.detail)
+
+        failed = self.events("起動失敗")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["原因"], "start.bat が戻り値 3 で終了した")
+        self.assertEqual(failed[0]["障害記録"], self.manager.status.incident)
+        self.assertEqual(failed[0]["操作ID"], self.events("起動開始")[0]["操作ID"])
+
+    def test_ポートを別のアプリが使っていたらそう書く(self) -> None:
+        other = self.register("fake.squatter", "看板")
+        self.start(other)
+        victim = self.register("fake.victim", "日報", port=other.port)
+        self.start(victim)
+
+        self.assertEqual(self.manager.status.state, State.ERROR)
+        text = self.incident_text()
+        self.assertIn(f"ポート {other.port} では、別のアプリ (アプリID fake.squatter)",
+                      text)
+        self.assertIn("別のアプリ (fake.squatter)", self.manager.status.detail)
+
+    def test_待ち受けていなければそう書く(self) -> None:
+        """BAT は動いたまま、ツールが立ち上がらない (時間切れ)。"""
+        tool = self.register("fake.hang", "日報")
+        Path(tool.start_command).write_text("#!/bin/sh\nsleep 30\n",
+                                            encoding="utf-8")
+        spawned = []
+        real_spawn = self.manager._spawn
+
+        def spawn(*args, **kwargs):
+            proc = real_spawn(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        def reap() -> None:
+            # 時間切れのあとも BAT は動いたまま (ランチャーは手放す)。
+            # 試験の後始末として止める
+            for proc in spawned:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.addCleanup(reap)
+
+        ui = app_manager.app_config.load()["ui"]
+        with mock.patch.dict(ui, {"start_timeout_seconds": 1}), \
+                mock.patch.object(self.manager, "_spawn", spawn):
+            self.start(tool)
+
+        text = self.incident_text()
+        self.assertIn(f"ポート {tool.port} で待ち受けていない", text)
+        self.assertIn("起動ファイルの状態 : 動いたまま", text)
+        self.assertEqual(self.events("起動失敗")[0]["原因"],
+                         f"ポート {tool.port} で待ち受けていない")
+
+    def test_思わぬ停止は落ちたのか固まったのかを書く(self) -> None:
+        from launcher import app_config
+
+        tool = self.register("fake.lost", "日報")
+        self.start(tool)
+        running = self.manager.running[tool.app_id]
+        process_manager._stop_by_api(running, force=True, timeout=10)
+        for _ in range(int(app_config.ui_setting("health_failures_before_dead"))):
+            self.manager.poll_health()
+
+        text = self.incident_text()
+        self.assertIn(f"ツールのプロセス (PID {running.pid}) が無くなっている", text)
+        lost = self.events("思わぬ停止")
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(lost[0]["結果"], "失敗")
+
+    def test_止められなかったら記録する(self) -> None:
+        tool = self.register("fake.stuck", "日報")
+        self.start(tool)
+        result = process_manager.StopResult(app_id=tool.app_id, stopped=False,
+                                            method="pid",
+                                            message="終了を確認できませんでした")
+        with mock.patch.object(process_manager, "stop", return_value=result):
+            self.assertFalse(self.manager._stop_blocking(tool.app_id))
+
+        text = self.incident_text()
+        self.assertIn("なぜ1  終了を確認できなかった (終了を確認できませんでした)", text)
+        self.assertIn("ツールはまだ起動確認に応答している", text)
+        kinds = [r["種類"] for r in self.events()]
+        self.assertIn("停止要求", kinds)
+        self.assertIn("停止失敗", kinds)
+
+    def test_止めたら止め方を残す(self) -> None:
+        tool = self.register("fake.bye", "日報")
+        self.start(tool)
+        self.manager._stop_blocking(tool.app_id)
+        done = self.events("停止完了")
+        self.assertEqual(len(done), 1)
+        self.assertIn("止め方", done[0]["詳細"])
+
+    def test_想定外の例外も記録して画面に場所を出す(self) -> None:
+        tool = self.register("fake.boom", "日報")
+        with mock.patch.object(self.manager, "_select_blocking",
+                               side_effect=RuntimeError("試しの失敗")):
+            self.manager._run_select(tool)
+
+        status = self.manager.status
+        self.assertEqual(status.state, State.ERROR)
+        text = self.incident_text()
+        self.assertIn("RuntimeError: 試しの失敗", text)
+        self.assertIn("■ 想定外の例外", text)
+        self.assertEqual(self.events("想定外の例外")[0]["障害記録"], status.incident)
+
+    def test_設定が無ければ理由だけ残す(self) -> None:
+        """原因がはっきりしているものは、障害記録までは要らない。"""
+        tool_registry.save(tool_registry.Tool(
+            app_id="fake.blank", display_name="カレンダー", port=free_port()))
+        self.start(tool_registry.get("fake.blank"))
+        row = self.events("起動できない")[0]
+        self.assertIn("設定されていない", row["原因"])
+        self.assertEqual(self.manager.status.incident, "")
+        self.assertEqual(trace.recent_incidents(), [])
 
 
 if __name__ == "__main__":

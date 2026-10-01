@@ -587,6 +587,15 @@ def _is_alive(pid: int) -> bool:
     return not _is_zombie(pid)
 
 
+def is_pid_alive(pid: int) -> bool:
+    """そのPIDのプロセスが残っているか。
+
+    障害記録の手がかり ── 「応答しない」が「落ちた」のか「固まった」
+    のかで、次に調べるところが違う。
+    """
+    return _is_alive(pid)
+
+
 def _is_zombie(pid: int) -> bool:
     """終了済みで、親に引き取られるのを待っているだけの状態か。
 

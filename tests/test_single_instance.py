@@ -147,9 +147,9 @@ class ToolInstanceTests(LocalAreaTestCase):
     def count_spawns(self):
         real = self.manager._spawn
 
-        def counting(tool):
+        def counting(tool, *args, **kwargs):
             self.spawns.append(tool.app_id)
-            return real(tool)
+            return real(tool, *args, **kwargs)
 
         return mock.patch.object(self.manager, "_spawn", counting)
 

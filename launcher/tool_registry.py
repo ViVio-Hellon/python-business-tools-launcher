@@ -574,9 +574,12 @@ def _fill_blank_paths(conn: sqlite3.Connection) -> None:
 # ------------------------------------------------------------------
 def export_distribution(*, relative: bool = True) -> Path:
     """この端末の設定から配布先フォルダを作る (作り直す)。"""
+    from .trace import LOG_DIR_KEY
+
     return distribution.export_tools(all_tools(include_disabled=True),
                                      relative=relative,
-                                     bar_position_active=active_bar_position())
+                                     bar_position_active=active_bar_position(),
+                                     log_dir=get_pc_setting(LOG_DIR_KEY))
 
 
 def reload_from_distribution() -> list[str]:
@@ -913,7 +916,76 @@ def set_start_command(app_id: str, path: str) -> Tool:
 # 利用者に毎回PC名を選ばせないための保存場所。**ランチャーは値を
 # 預かるだけ**で、モードの中身 (中板・小板…) は各業務ツール側の
 # 要件なので、ここでは解釈しない (要件定義書 §15)
+# 設定の変わり目を記録するときの呼び名 (`describe_changes`)
+_CHANGE_LABELS = (
+    ("display_name", "表示名"),
+    ("start_command", "起動ファイル"),
+    ("start_args", "起動引数"),
+    ("port", "ポート"),
+    ("stop_method", "止め方"),
+    ("stop_command", "停止ファイル"),
+    ("work_dir", "作業フォルダー"),
+    ("health_path", "起動確認のパス"),
+    ("enabled", "使う"),
+)
+
+
+def describe_changes(before: list[Tool], after: list[Tool]) -> list[str]:
+    """設定の変わり目を、人が読める行にする (後追いの記録用)。
+
+    「昨日まで動いていたのに」を調べるとき、**いつ・何が変わったか**が
+    分かれば半分は済む。値まで残す (パスは個人情報ではない)。
+    """
+    old = {t.app_id: t for t in before}
+    new = {t.app_id: t for t in after}
+    lines: list[str] = []
+    for app_id, tool in new.items():
+        if app_id not in old:
+            lines.append(f"追加: {tool.display_name} ({app_id}) "
+                         f"起動ファイル={tool.start_command or '(未設定)'}")
+            continue
+        was = old[app_id]
+        for name, label in _CHANGE_LABELS:
+            a, b = getattr(was, name), getattr(tool, name)
+            if a != b:
+                lines.append(f"{tool.display_name}: {label} "
+                             f"「{_show(a)}」→「{_show(b)}」")
+    for app_id, tool in old.items():
+        if app_id not in new:
+            lines.append(f"削除: {tool.display_name} ({app_id})")
+    return lines
+
+
+def _show(value) -> str:
+    if isinstance(value, bool):
+        return "はい" if value else "いいえ"
+    return str(value) if value not in ("", None) else "(空)"
+
+
 PC_MODE_KEY = "pc_mode"
+
+
+def peek_pc_setting(key: str, default: str = "") -> str:
+    """設定DBを**作らず・直さずに** 1つ読む。
+
+    ログの出力先のように、起動のいちばん最初 (設定DBの用意より前) に
+    要るもの向け。DBが無い・読めないときは既定値。
+    """
+    path = app_config.settings_db_path()
+    if not path.exists():
+        return default
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return default
+    try:
+        row = conn.execute("SELECT value FROM pc_settings WHERE key = ?",
+                           (key,)).fetchone()
+    except sqlite3.Error:
+        return default
+    finally:
+        conn.close()
+    return row[0] if row else default
 
 
 def get_pc_setting(key: str, default: str = "") -> str:

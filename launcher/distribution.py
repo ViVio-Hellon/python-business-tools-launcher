@@ -277,8 +277,16 @@ def bar_position_active() -> str:
     return value if isinstance(value, str) else ""
 
 
+def log_dir() -> str:
+    """配布先フォルダに書かれた「ログの出力先」。無ければ空。"""
+    data, _ = load()
+    logs = (data or {}).get("logs")
+    value = logs.get("dir") if isinstance(logs, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
 def export_tools(registry_tools, *, relative: bool = True,
-                 bar_position_active: str = "") -> Path:
+                 bar_position_active: str = "", log_dir: str = "") -> Path:
     """端末の設定から配布先フォルダを作る (作り直す)。
 
     **パスワードには触らない** (別のファイル)。作り直すたびに鍵が
@@ -312,6 +320,10 @@ def export_tools(registry_tools, *, relative: bool = True,
         # 端末ごとの位置 (手で動かした場所) ではなく、**ツールを起動した
         # あとにどこへ寄るか**の決まりだけを配る
         data["bar"] = {"position_active": bar_position_active}
+    if log_dir:
+        # 共有フォルダーを書いておけば、配った全端末の記録が1か所に集まる
+        # (端末ごとに、端末名のフォルダーに分けて書く)
+        data["logs"] = {"dir": log_dir}
     target = _write_json(settings_path(), data)
     _write_readme()
     log.info("配布先フォルダを作りました: %s (%d件)", folder(), len(items))
