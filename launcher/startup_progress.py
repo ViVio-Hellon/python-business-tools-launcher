@@ -68,6 +68,8 @@ class ProgressTracker:
         self._name = ""
         self._kind = ""           # "start" か "stop"
         self._closes_browser = False
+        # 自分の窓を出すアプリか。ブラウザーを開く段が無い
+        self._app = False
         self._last = None
 
     def update(self, status) -> Optional[ProgressView]:
@@ -95,6 +97,7 @@ class ProgressTracker:
             self._app_id = app_id
             self._name = getattr(status, "display_name", "") or app_id
             self._kind = kind
+            self._app = getattr(status, "ui_mode", "") == "app"
         if phase == CLOSE_BROWSER:
             self._closes_browser = True
         self._last = status
@@ -112,8 +115,14 @@ class ProgressTracker:
         if self._kind == "stop":
             if self._closes_browser:
                 plan.append((CLOSE_BROWSER, f"{name}の画面を閉じる"))
-            plan.append((STOP_TOOL, f"{name}を終了する"))
+            plan.append((STOP_TOOL, f"{name}を閉じる" if self._app
+                         else f"{name}を終了する"))
             title = f"{name}を終了しています"
+        elif self._kind == "start" and self._app:
+            # アプリの窓が画面。ブラウザーは開かない
+            plan.append((SPAWN, f"{name}を起動する"))
+            plan.append((WAIT, f"{name}の起動を確かめる"))
+            title = f"{name}を起動しています"
         elif self._kind == "start":
             plan.append((SPAWN, f"{name}の起動ファイルを実行する"))
             plan.append((WAIT, f"{name}の準備ができるのを待つ"))

@@ -80,7 +80,7 @@ REPLACE_WAIT_SEC = 0.2
 # ディレクトリの上書き、起動確認URLの差し替え) は入れない**
 EXPORT_FIELDS = ("app_id", "display_name", "order_no", "repository",
                  "start_command", "start_args", "port", "health_path",
-                 "stop_method", "enabled")
+                 "stop_method", "enabled", "ui_mode")
 
 
 def folder() -> Path:
@@ -306,6 +306,7 @@ def export_tools(registry_tools, *, relative: bool = True,
             "health_path": tool.health_path,
             "stop_method": tool.stop_method,
             "enabled": bool(tool.enabled),
+            "ui_mode": getattr(tool, "ui_mode", ""),
         }
         items.append({k: item[k] for k in EXPORT_FIELDS})
 

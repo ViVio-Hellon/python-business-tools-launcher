@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 import unittest
@@ -20,14 +21,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from _fake_tool_support import free_port, make_tool_dir  # noqa: E402
+from _fake_tool_support import free_port, make_app_dir, make_tool_dir  # noqa: E402
 from _isolation import LocalAreaTestCase  # noqa: E402
 
 import app_manager  # noqa: E402
 import process_manager  # noqa: E402
 from app_manager import State, ToolManager  # noqa: E402
-from launcher import (browser, health, runtime_state, tool_registry,  # noqa: E402
-                      trace)
+from launcher import (browser, desktop, health, runtime_state,  # noqa: E402
+                      tool_registry, trace)
 
 _FAKE_BROWSER = Path(__file__).resolve().parent / "_fake_browser.py"
 
@@ -810,6 +811,226 @@ class RecordTests(ManagerTestCase):
         self.assertIn("設定されていない", row["原因"])
         self.assertEqual(self.manager.status.incident, "")
         self.assertEqual(trace.recent_incidents(), [])
+
+
+@unittest.skipIf(os.name == "nt", "偽の exe (名前だけ .exe のスクリプト) は Windows 以外で動かす")
+class AppWindowTests(ManagerTestCase):
+    """自分の窓を出すアプリ (Tauri などの exe)。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 待ち時間を縮める (確認を出して終わらないアプリを待つところ)
+        for name, value in (("APP_CLOSE_WAIT_SEC", 1.0),
+                            ("APP_CLOSE_WAIT_FORCE_SEC", 0.5),
+                            ("TERMINATE_WAIT_SEC", 1.0)):
+            patcher = mock.patch.object(process_manager, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.spawned = []
+        real = self.manager._spawn
+
+        def spawn(*args, **kwargs):
+            proc = real(*args, **kwargs)
+            self.spawned.append(proc)
+            return proc
+        patcher = mock.patch.object(self.manager, "_spawn", spawn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def register_app(self, app_id: str, name: str, *, port: int = 0,
+                     ui_mode: str = "", start_args: str = "", **options):
+        exe = make_app_dir(self.work_root, app_id=app_id, port=port or None,
+                           **options)
+        tool_registry.save(tool_registry.Tool(
+            app_id=app_id, display_name=name, port=port, start_command=str(exe),
+            ui_mode=ui_mode, start_args=start_args))
+        return tool_registry.get(app_id)
+
+    def wait_exit(self, pid: int, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while process_manager.is_pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # 子なら引き取る (引き取るまでは終わっていても残って見える)
+        for proc in self.spawned:
+            if proc.pid == pid:
+                proc.wait(timeout=timeout)
+
+    def test_exeを起動してもブラウザーは開かない(self) -> None:
+        tool = self.register_app("fake.tauri", "日報App")
+        self.assertTrue(tool.watches_window)
+        self.start(tool)
+
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING)
+        self.assertEqual(status.ui_mode, "app")
+        self.assertEqual(self.opened, [], "アプリなのにブラウザーを開いています")
+        running = self.manager.running[tool.app_id]
+        self.assertTrue(running.is_app)
+        # **exe をそのまま実行した** (cmd.exe を挟まない) ので、起こした
+        # プロセスがアプリそのもの
+        self.assertEqual(running.pid, self.spawned[0].pid)
+        self.assertEqual(runtime_state.read_all()[tool.app_id].ui_mode, "app")
+        self.assertIn("起動完了", [r["種類"] for r in trace.read_events()])
+
+    def test_動いているアプリを押しても2つ目を起こさず前に出す(self) -> None:
+        tool = self.register_app("fake.front", "看板App")
+        self.start(tool)
+        with mock.patch.object(desktop, "bring_to_front",
+                               return_value=True) as front:
+            self.manager._select_blocking(tool)
+        self.assertEqual(len(self.spawned), 1)
+        front.assert_called_once_with(self.manager.running[tool.app_id].window_pid)
+
+    def test_止めると窓を閉じてもらう(self) -> None:
+        tool = self.register_app("fake.close", "日報App")
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+
+        self.assertTrue(self.manager._stop_blocking(tool.app_id))
+        self.wait_exit(pid)
+        self.assertFalse(process_manager.is_pid_alive(pid))
+        self.assertEqual(self.manager.status.message, "日報Appを終了しました")
+        self.assertEqual(self.manager.status.detail, "")
+        done = [r for r in trace.read_events() if r["種類"] == "停止完了"]
+        self.assertIn("close-window", done[0]["詳細"])
+
+    def test_保存の確認を出していれば落とさずに強制終了を選ばせる(self) -> None:
+        tool = self.register_app("fake.ask", "日報App", ask_on_close=True)
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+
+        self.assertFalse(self.manager._stop_blocking(tool.app_id))
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING)
+        self.assertIn("終了の確認", status.detail)
+        self.assertIn("強制終了", status.detail)
+        self.assertTrue(process_manager.is_pid_alive(pid), "確認中のアプリを落としました")
+        self.assertTrue(self.manager.stop_refused(tool.app_id))
+
+        self.assertTrue(self.manager._stop_blocking(tool.app_id, force=True))
+        self.wait_exit(pid)
+        self.assertFalse(process_manager.is_pid_alive(pid))
+        self.assertFalse(self.manager.stop_refused(tool.app_id))
+
+    def test_利用者が窓を閉じたら閉じたと出す(self) -> None:
+        tool = self.register_app("fake.user", "日報App")
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+        os.kill(pid, 15)                          # ×ボタンの代わり
+        self.wait_exit(pid)
+
+        self.manager.poll_health()                # 1回で気づく
+        status = self.manager.status
+        self.assertEqual(status.state, State.IDLE)
+        self.assertEqual(status.message, "日報Appを閉じました")
+        self.assertEqual(status.incident, "")
+        self.assertNotIn(tool.app_id, self.manager.running)
+        self.assertIn("アプリを閉じた", [r["種類"] for r in trace.read_events()])
+
+    def test_落ちたら戻り値つきで異常終了と出す(self) -> None:
+        tool = self.register_app("fake.crash", "日報App", crash_after=1.5)
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+        self.wait_exit(pid)
+
+        self.manager.poll_health()
+        status = self.manager.status
+        self.assertEqual(status.state, State.ERROR)
+        self.assertIn("異常終了", status.message)
+        text = Path(status.incident).read_text(encoding="utf-8-sig")
+        self.assertIn("戻り値 101 (Rust の panic", text)
+        self.assertIn("panicked at", text)
+
+    def test_窓を出す前に落ちたら障害記録を残す(self) -> None:
+        tool = self.register_app("fake.early", "日報App", exit_code=3)
+        self.start(tool)
+
+        status = self.manager.status
+        self.assertEqual(status.state, State.ERROR)
+        self.assertIn("FakeApp.exe が窓を出す前に終了しました (戻り値 3)", status.detail)
+        text = Path(status.incident).read_text(encoding="utf-8-sig")
+        self.assertIn("窓が出る前に、FakeApp.exe が終了した", text)
+        self.assertIn("アプリの出力にエラーが出ている: Error: WebView2", text)
+        failed = [r for r in trace.read_events() if r["種類"] == "起動失敗"]
+        self.assertEqual(len(failed), 1)
+
+    def test_ランチャーの外で動いているアプリは起こさず前に出す(self) -> None:
+        tool = self.register_app("fake.outside", "日報App")
+        outside = subprocess.Popen([tool.start_command])
+        self.addCleanup(outside.wait, 5)
+        self.addCleanup(outside.terminate)
+        deadline = time.monotonic() + 5
+        while not desktop.find_by_exe(tool.start_command) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        with mock.patch.object(desktop, "bring_to_front", return_value=True):
+            self.manager._select_blocking(tool)
+        self.assertEqual(self.spawned, [], "外で動いているのに2つ目を起こしました")
+        self.assertEqual(self.manager.running[tool.app_id].pid, outside.pid)
+
+    def test_ランチャーを起動し直しても引き継ぐ(self) -> None:
+        tool = self.register_app("fake.adopt", "日報App")
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+
+        adopted = ToolManager().adopt_running()
+        self.assertEqual([r.pid for r in adopted], [pid])
+        # 記録を失っても、exe の道でプロセスを探して見つける
+        runtime_state.clear()
+        adopted = ToolManager().adopt_running()
+        self.assertEqual([r.pid for r in adopted], [pid])
+        self.assertTrue(adopted[0].is_app)
+
+    def test_Webサーバーを持つアプリは応答を待つがブラウザーは開かない(self) -> None:
+        port = free_port()
+        tool = self.register_app("fake.sidecar", "Tauri+Python", port=port,
+                                 ui_mode="app", ready_after=0.6)
+        self.assertFalse(tool.watches_window)
+        began = time.monotonic()
+        self.start(tool)
+        self.assertGreaterEqual(time.monotonic() - began, 0.6)
+        self.assertEqual(self.manager.status.state, State.RUNNING)
+        self.assertEqual(self.opened, [])
+        running = self.manager.running[tool.app_id]
+        self.assertEqual(running.launch_pid, self.spawned[0].pid)
+        self.assertTrue(running.is_app)
+
+        self.assertTrue(self.manager._stop_blocking(tool.app_id))
+        self.wait_exit(running.launch_pid)
+        self.assertFalse(health.is_port_accepting(port))
+
+    def test_サーバーのexeはブラウザーで開く(self) -> None:
+        """Python から作った Web サーバーの exe (ポートあり)。"""
+        port = free_port()
+        tool = self.register_app("fake.server-exe", "日報", port=port,
+                                 start_args="--no-browser")
+        self.assertEqual(tool.resolved_ui_mode, "browser")
+        self.start(tool)
+        self.assertEqual(self.manager.status.state, State.RUNNING)
+        self.assertEqual(self.opened, [tool.home_url])
+
+    def test_ランチャーを閉じてもexeのツールは落とさない(self) -> None:
+        tool = self.register_app("fake.keep", "日報App")
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+        self.assertTrue(self.manager.shutdown(stop_tools=False))
+        time.sleep(0.3)
+        self.assertTrue(process_manager.is_pid_alive(pid),
+                        "動かしたままにしたはずのアプリが消えました")
+        # 後始末 (手放したプロセスも引き取る)
+        process_manager.stop(runtime_state.read_all()[tool.app_id], force=True)
+        for proc in list(app_manager._DETACHED):
+            app_manager._DETACHED.remove(proc)
+            proc.wait(timeout=5)
+
+    def test_Webサーバーを持たないアプリにbatは使えない(self) -> None:
+        tool = self.register("fake.batapp", "日報")
+        tool_registry.save(replace(tool, port=0, ui_mode="app"))
+        self.start(tool_registry.get("fake.batapp"))
+        self.assertEqual(self.manager.status.state, State.ERROR)
+        self.assertIn("exe を直接指定", self.manager.status.detail)
+        self.assertEqual(self.spawned, [])
 
 
 if __name__ == "__main__":

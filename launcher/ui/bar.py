@@ -538,6 +538,9 @@ class LauncherBar:
         starting = [a for a in status.starting_ids if a not in running]
         if len(running) == 1 and not starting:
             only = next(iter(running.values()))
+            if self.manager.stop_refused(only.app_id):
+                self._force_stop(only.app_id, only.display_name)
+                return
             if messagebox.askyesno(
                     app_config.display_name(),
                     f"{only.display_name} を終了しますか?\n\n"
@@ -550,7 +553,15 @@ class LauncherBar:
                        activebackground=theme.TOOL_ACTIVE,
                        activeforeground=theme.FG, font=theme.FONT)
         for app_id, item in running.items():
-            menu.add_command(label=f"{item.display_name or app_id} を止める",
+            name = item.display_name or app_id
+            if self.manager.stop_refused(app_id):
+                # 止めようとして断られた (保存の確認・実行中の処理)
+                menu.add_command(
+                    label=f"{name} を強制終了する",
+                    command=lambda target=app_id, label=name:
+                        self._force_stop(target, label))
+                continue
+            menu.add_command(label=f"{name} を止める",
                              command=lambda target=app_id: self.manager.stop(target))
         for app_id in starting:
             name = self._names.get(app_id, app_id)
@@ -565,6 +576,17 @@ class LauncherBar:
                           + self.stop_button.winfo_height())
         finally:
             menu.grab_release()
+
+    def _force_stop(self, app_id: str, name: str) -> None:
+        """断られたツールを強制終了する。**確かめてから。**"""
+        if messagebox.askyesno(
+                app_config.display_name(),
+                f"{name} は終了の確認を出しているか、実行中の処理があります。\n\n"
+                "強制終了しますか?\n(保存していない内容や、途中の処理は失われます)",
+                icon="warning", default="no", parent=self.root):
+            trace.event("強制終了を選んだ", trace.WARNING,
+                        tool=self.manager.running.get(app_id))
+            self.manager.stop(app_id, force=True)
 
     def _stop_all(self) -> None:
         names = "、".join(r.display_name for r in self.manager.running.values())

@@ -66,6 +66,9 @@ class RunningTool:
     # 「いつのランチャーが起動したものか」が分かると、記録だけ残って
     # いる場面の切り分けが早い
     owner_pid: int = field(default_factory=os.getpid)
+    # 画面の出し方。"browser" (ランチャーがブラウザーで開く) か
+    # "app" (Tauri などの exe が自分の窓を出す)
+    ui_mode: str = "browser"
 
     @property
     def started_text(self) -> str:
@@ -76,10 +79,33 @@ class RunningTool:
         """ランチャーが閉じられる画面か。"""
         return bool(self.browser_pid and self.browser_profile)
 
+    @property
+    def is_app(self) -> bool:
+        """自分の窓を出すアプリか。"""
+        return self.ui_mode == "app"
+
+    @property
+    def window_pid(self) -> int:
+        """アプリの窓を持つプロセス (exe そのもの)。
+
+        Web サーバーを中に持つアプリでは、`pid` は `/api/health` が返した
+        サーバー部分のPIDで、窓は**ランチャーが起こした exe** が持つ。
+        """
+        return self.launch_pid or self.pid
+
+    @property
+    def watches_window(self) -> bool:
+        """生死を窓とプロセスで見るか (/api/health が無い)。"""
+        return self.is_app and not self.health_url
+
     def summary(self) -> str:
         window = f" / 画面 PID {self.browser_pid}" if self.browser_pid else ""
+        if self.is_app:
+            window = " / アプリの窓"
+        port = f"ポート {self.port}" if self.port else (
+            "Web サーバーなし" if self.is_app else "ポート ?")
         return (f"{self.display_name or self.app_id} "
-                f"(PID {self.pid or '?'} / ポート {self.port or '?'}{window} / "
+                f"(PID {self.pid or '?'} / {port}{window} / "
                 f"{self.started_text})")
 
 

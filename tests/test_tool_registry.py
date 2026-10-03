@@ -198,10 +198,15 @@ class ValidationTests(LocalAreaTestCase):
         self.assertIn("見つかりません", problem)
 
     def test_bat以外は弾く(self) -> None:
-        path = self.work_root / "start.exe"
+        path = self.work_root / "start.ps1"
         path.write_text("x", encoding="utf-8")
         problem = tool_registry.validate_start_command(str(path))
         self.assertIn(".bat", problem)
+
+    def test_exeも指定できる(self) -> None:
+        path = self.work_root / "業務アプリ.exe"
+        path.write_bytes(b"MZ")
+        self.assertEqual(tool_registry.validate_start_command(str(path)), "")
 
     def test_相対パスは弾く(self) -> None:
         """端末や起動元によって指す先が変わってしまうため。"""
@@ -319,11 +324,18 @@ class EntryKindTests(LocalAreaTestCase):
                     tool_registry.validate_start_command(str(path)), "")
 
     def test_それ以外は弾く(self) -> None:
-        path = self.work_root / "start.exe"
+        path = self.work_root / "start.ps1"
         path.write_text("", encoding="cp932")
         problem = tool_registry.validate_start_command(str(path))
         self.assertIn(".bat", problem)
         self.assertIn(".vbs", problem)
+        self.assertIn(".exe", problem)
+
+    def test_exeはそのまま実行し引数も届く(self) -> None:
+        tool = self.make("App.exe", "MZ")
+        self.assertEqual(tool_registry.validate_start_command(tool.start_command), "")
+        self.assertEqual(tool.entry_kind, "exe")
+        self.assertTrue(tool.forwards_args)
 
     def test_batは引数を転送する扱い(self) -> None:
         tool = self.make("start.bat", "@echo off\npython start_app.py %*\n")

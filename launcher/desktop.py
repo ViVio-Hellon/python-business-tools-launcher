@@ -1,0 +1,476 @@
+"""自分の窓を持つアプリ (exe) の窓とプロセス
+
+Tauri (Rust) などで作ったツールは、ブラウザーではなく**自分の窓**を出す。
+Webサーバーを持たないアプリには `/api/health` も無い。ランチャーは
+そうしたツールを、窓とプロセスで扱う:
+
+    起動の確認   … 窓が出たか
+    前に出す     … 動いているツールのボタンを押したとき
+    閉じる       … 止めるとき。**まず窓を閉じてもらう** (アプリが保存の
+                   確認を出せる。いきなりプロセスを落とさない)
+    見つける     … ランチャーの外で起動されていたアプリを探す (二重起動しない)
+    見分ける     … そのPIDが本当にそのアプリか (PIDは使い回される)
+
+Windows の API を**標準ライブラリの ctypes だけ**で呼ぶ。外部コマンド
+(PowerShell・wmic・tasklist) を使わないので、それらを禁じている端末でも
+動き、5秒ごとの見回りでも重くならない。
+
+Windows 以外 (開発機・試験) には窓が無い。答えられないものは `None` を
+返し、呼び出し側が「プロセスが生きているか」で代える。プロセスの親子と
+コマンドラインは `/proc` から読む。
+
+**画面の部品 (tkinter) は読み込まない。**
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+from .logging_utils import get_logger
+
+log = get_logger("desktop")
+
+IS_WINDOWS = os.name == "nt"
+
+# 実行ファイルの中を探すときの上限。Tauri の exe は数MB〜数十MB
+_SCAN_LIMIT = 256 * 1024 * 1024
+_SCAN_CHUNK = 4 * 1024 * 1024
+
+# Windows の値
+_TH32CS_SNAPPROCESS = 0x00000002
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_WM_CLOSE = 0x0010
+_SW_RESTORE = 9
+_GW_OWNER = 4
+
+
+# ------------------------------------------------------------------
+# 戻り値の読み方
+# ------------------------------------------------------------------
+# アプリが落ちたときの戻り値。**数字だけでは次に何を見ればよいか分からない**
+# ので、よく出るものに意味を添える (なぜなぜの「なぜ」に入る)
+_EXIT_MEANINGS = {
+    1: "一般的なエラー",
+    2: "起動引数の誤り (受け付けない引数を渡した)",
+    101: "Rust の panic (Tauri・Rust 製アプリの想定外のエラー)",
+    0xC0000005: "アクセス違反 (アプリの不具合・壊れたファイル)",
+    0xC0000017: "メモリ不足",
+    0xC0000135: "必要な DLL が見つからない (ランタイムが入っていない・ファイルが欠けている)",
+    0xC0000142: "DLL の初期化に失敗した",
+    0xC000013A: "Ctrl+C などで中断された",
+    0xC0000409: "致命的なエラーで即時終了した (スタック破壊・FailFast)",
+    0xC0000374: "ヒープ破損",
+    0xE0434352: ".NET の想定外の例外",
+}
+
+
+def describe_exit_code(code: Optional[int]) -> str:
+    """戻り値を人が読める形に。`3221225477 (0xC0000005: アクセス違反…)`。"""
+    if code is None:
+        return "不明"
+    if -255 <= code < 0 and not IS_WINDOWS:
+        # Windows 以外: シグナルで止まった (-15 = SIGTERM、-9 = SIGKILL)
+        return f"{code} (シグナル {-code} で終了)"
+    value = code & 0xFFFFFFFF
+    meaning = _EXIT_MEANINGS.get(value, "")
+    if value >= 0x80000000:
+        text = f"{code} (0x{value:08X}"
+        return text + (f": {meaning})" if meaning else ")")
+    return f"{code} ({meaning})" if meaning else str(code)
+
+
+# ------------------------------------------------------------------
+# 実行ファイルを見る
+# ------------------------------------------------------------------
+def looks_like_tauri(path: str | Path) -> bool:
+    """Tauri で作った exe か。
+
+    Tauri の exe には、Rust のクレート名 `tauri` が文字列として多数
+    埋め込まれている (`tauri://`・`__TAURI__`・エラー時のソースの道)。
+    中を探して見分ける。**外れても困らない** ── 設定画面で「アプリの窓」を
+    選び直せる。
+    """
+    target = Path(str(path).strip().strip('"'))
+    if target.suffix.lower() != ".exe":
+        return False
+    mark = b"tauri"
+    tail = b""
+    read = 0
+    try:
+        with open(target, "rb") as handle:
+            while read < _SCAN_LIMIT:
+                chunk = handle.read(_SCAN_CHUNK)
+                if not chunk:
+                    return False
+                read += len(chunk)
+                if mark in (tail + chunk).lower():
+                    return True
+                tail = chunk[-(len(mark) - 1):]
+    except OSError:
+        return False
+    return False
+
+
+def file_description(path: str | Path) -> str:
+    """exe の版情報にある名前 (「ファイルの説明」→「製品名」)。無ければ空。
+
+    Tauri は `productName` をここへ入れる。［＋ ツールを追加］で exe を
+    選んだとき、表示名の候補にする。
+    """
+    if not IS_WINDOWS:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version = ctypes.WinDLL("version", use_last_error=True)
+        version.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+        version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        version.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                                wintypes.DWORD, ctypes.c_void_p]
+        version.GetFileVersionInfoW.restype = wintypes.BOOL
+        version.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                           ctypes.POINTER(ctypes.c_void_p),
+                                           ctypes.POINTER(wintypes.UINT)]
+        version.VerQueryValueW.restype = wintypes.BOOL
+
+        name = str(path).strip().strip('"')
+        handle = wintypes.DWORD()
+        size = version.GetFileVersionInfoSizeW(name, ctypes.byref(handle))
+        if not size:
+            return ""
+        data = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(name, 0, size, data):
+            return ""
+
+        pointer = ctypes.c_void_p()
+        length = wintypes.UINT()
+        if not version.VerQueryValueW(data, "\\VarFileInfo\\Translation",
+                                      ctypes.byref(pointer), ctypes.byref(length)):
+            return ""
+        if length.value < 4 or not pointer.value:
+            return ""
+        words = ctypes.cast(pointer, ctypes.POINTER(wintypes.WORD))
+        language, codepage = words[0], words[1]
+        for key in ("FileDescription", "ProductName"):
+            query = f"\\StringFileInfo\\{language:04x}{codepage:04x}\\{key}"
+            if version.VerQueryValueW(data, query, ctypes.byref(pointer),
+                                      ctypes.byref(length)) \
+                    and pointer.value and length.value > 1:
+                text = ctypes.wstring_at(pointer, length.value - 1).strip()
+                if text:
+                    return text
+    except Exception as exc:                  # noqa: BLE001 - 名前が取れなくても続ける
+        log.debug("版情報を読めませんでした (%s): %s", path, exc)
+    return ""
+
+
+# ------------------------------------------------------------------
+# プロセス
+# ------------------------------------------------------------------
+def _normalize(path: str) -> str:
+    return (path or "").strip().strip('"').replace("\\", "/").rstrip("/").lower()
+
+
+def _processes() -> list[tuple[int, int, str]]:
+    """いま動いているプロセスの (PID, 親のPID, 実行ファイル名) の一覧。"""
+    if IS_WINDOWS:
+        return _processes_windows()
+    found = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        name, _, rest = stat.rpartition(")")
+        fields = rest.split()
+        if len(fields) < 2 or fields[0] == "Z":
+            continue                          # 終わって引き取りを待つだけのもの
+        found.append((int(entry.name), int(fields[1]),
+                      name.partition("(")[2]))
+    return found
+
+
+def _processes_windows() -> list[tuple[int, int, str]]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+            return []
+        found = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                found.append((int(entry.th32ProcessID),
+                              int(entry.th32ParentProcessID), entry.szExeFile))
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return found
+    except Exception as exc:                  # noqa: BLE001 - 一覧が取れなくても続ける
+        log.debug("プロセスの一覧を取れませんでした: %s", exc)
+        return []
+
+
+def process_tree(pid: int) -> set[int]:
+    """そのプロセスと、その子・孫。
+
+    窓は本体ではなく子プロセスが出すことがある (PyInstaller で1ファイルに
+    まとめた exe は、本体が子を起こして、窓は子が出す)。前に出す・閉じる
+    ときは子まで見る。
+    """
+    if pid <= 0:
+        return set()
+    children: dict[int, list[int]] = {}
+    for child, parent, _ in _processes():
+        if child != parent:
+            children.setdefault(parent, []).append(child)
+    tree = {pid}
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in tree:
+                tree.add(child)
+                stack.append(child)
+    return tree
+
+
+def process_image(pid: int) -> str:
+    """そのPIDの実行ファイルのフルパス。動いていない・取れなければ空。"""
+    if pid <= 0:
+        return ""
+    if not IS_WINDOWS:
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                                ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                      False, pid)
+        if not handle:
+            return ""
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) \
+                    or code.value != _STILL_ACTIVE:
+                return ""                     # 終わっている
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer,
+                                                       ctypes.byref(size)):
+                return ""
+            return buffer.value
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("PID %s の実行ファイルを取れませんでした: %s", pid, exc)
+        return ""
+
+
+def runs_exe(pid: int, exe_path: str) -> bool:
+    """そのPIDが**その exe を実行しているか**。動いていなければ偽。
+
+    PIDは使い回される。記録したPIDが、いまは別のプロセスになっている
+    ことがあるので、止める・前に出す・「動いている」と答える前に確かめる。
+    Windows では実行ファイルのフルパスで、ほかでは `/proc` のコマンド
+    ラインで照合する (試験ではスクリプトを exe に見立てるため)。
+    """
+    wanted = _normalize(exe_path)
+    if pid <= 0 or not wanted:
+        return False
+    if IS_WINDOWS:
+        image = process_image(pid)
+        if not image:
+            return False
+        if _normalize(image) == wanted:
+            return True
+        # 書き方が違うだけで同じファイルのことがある (ネットワークドライブの
+        # Z:\ と \\server\share、短い名前 PROGRA~1 など)。**ファイルそのもの**
+        # で比べる
+        try:
+            return os.path.samefile(image, exe_path.strip().strip('"'))
+        except OSError:
+            return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8",
+                                                   errors="replace")
+        if stat.rpartition(")")[2].split()[:1] == ["Z"]:
+            return False
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return wanted in _normalize(raw.replace(b"\0", b" ").decode("utf-8", "replace"))
+
+
+def find_by_exe(exe_path: str) -> list[int]:
+    """その exe を実行しているプロセス (いちばん上の親だけ)。
+
+    ランチャーの外 (デスクトップのショートカットなど) で起動されていた
+    アプリを見つけ、**もう1つ起動しない**ために使う。同じ exe が親子で
+    動いている (1ファイルにまとめた exe) ときは、親だけを返す。
+    """
+    wanted = _normalize(exe_path)
+    if not wanted:
+        return []
+    name = wanted.rsplit("/", 1)[-1]
+    rows = _processes()
+    if IS_WINDOWS:
+        candidates = [pid for pid, _, exe in rows if exe.lower() == name]
+    else:
+        candidates = [pid for pid, _, _ in rows]
+    matched = {pid for pid in candidates if runs_exe(pid, exe_path)}
+    parents = {pid: parent for pid, parent, _ in rows}
+    return sorted(pid for pid in matched if parents.get(pid) not in matched)
+
+
+# ------------------------------------------------------------------
+# 窓
+# ------------------------------------------------------------------
+def _windows_of(pids: set[int]) -> Optional[list[int]]:
+    """それらのプロセスが持つ、見えている最上位の窓。Windows 以外は None。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                           wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+
+        found: list[int] = []
+
+        def visit(hwnd, _param):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetWindow(hwnd, _GW_OWNER):
+                return True                   # ダイアログなど、持ち主のいる窓
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value in pids:
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(callback_type(visit), 0)
+        return found
+    except Exception as exc:                  # noqa: BLE001 - 窓が分からなくても続ける
+        log.debug("窓の一覧を取れませんでした: %s", exc)
+        return None
+
+
+def has_window(pid: int) -> Optional[bool]:
+    """そのアプリ (子も含む) の窓が出ているか。分からなければ None。"""
+    windows = _windows_of(process_tree(pid))
+    return None if windows is None else bool(windows)
+
+
+def bring_to_front(pid: int) -> bool:
+    """そのアプリの窓を前に出す。出せたら True。
+
+    最小化されていれば戻す。押したのはランチャーのボタンなので、
+    前に出すことを Windows が許す (ランチャーが手前にいる)。
+    """
+    windows = _windows_of(process_tree(pid))
+    if not windows:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        hwnd = windows[0]
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, _SW_RESTORE)
+        return bool(user32.SetForegroundWindow(hwnd))
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("窓を前に出せませんでした (pid=%s): %s", pid, exc)
+        return False
+
+
+def close_windows(pid: int) -> Optional[int]:
+    """そのアプリの窓に「閉じて」と頼む (×ボタンと同じ)。頼んだ窓の数。
+
+    **落とすのではなく頼む。** アプリは保存の確認を出したり、後片付けを
+    してから終われる。窓が出ていなければ 0、Windows 以外は None。
+    """
+    windows = _windows_of(process_tree(pid))
+    if windows is None:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        sent = 0
+        for hwnd in windows:
+            if user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0):
+                sent += 1
+        return sent
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("窓を閉じられませんでした (pid=%s): %s", pid, exc)
+        return 0

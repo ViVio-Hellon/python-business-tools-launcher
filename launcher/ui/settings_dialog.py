@@ -1,8 +1,8 @@
 """ランチャー設定画面 (要件定義書 §13 / §14)
 
 **必須要件**。端末ごとにリポジトリの置き場所が違うので、起動ファイルの
-場所をここで変えられるようにする。`start.bat` と `Start.vbs` のどちらも
-指定できる。コードを書き換えずに済ませることが
+場所をここで変えられるようにする。`start.bat`・`Start.vbs`・exe (Tauri の
+アプリ、Python から作った exe) のどれも指定できる。コードを書き換えずに済ませることが
 目的 (要件定義書 §13.3)。
 
     ┌──────────────────────────────────────────────┐
@@ -27,7 +27,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .. import app_config, distribution, tool_registry, trace
 from ..logging_utils import get_logger
-from ..tool_registry import STOP_METHODS, Tool
+from ..tool_registry import STOP_METHODS, UI_LABELS, Tool
 from . import password, theme
 
 log = get_logger("ui.settings")
@@ -35,6 +35,13 @@ log = get_logger("ui.settings")
 # ダイアログの高さの上限。ツールが増えても画面からはみ出さないよう、
 # ここを超えたら中身を巻物にする
 MAX_BODY_HEIGHT = 460
+
+# 起動ファイルを選ぶダイアログの種類
+ENTRY_FILETYPES = [("起動ファイル", "*.bat *.vbs *.exe"),
+                   ("バッチファイル", "*.bat"),
+                   ("VBScript", "*.vbs"),
+                   ("アプリ (exe)", "*.exe"),
+                   ("すべてのファイル", "*.*")]
 
 
 class SettingsDialog:
@@ -61,7 +68,7 @@ class SettingsDialog:
     # --------------------------------------------------------------
     def _build(self) -> None:
         header = tk.Label(
-            self.top, text="各ツールの起動ファイル (start.bat / Start.vbs) "
+            self.top, text="各ツールの起動ファイル (start.bat / Start.vbs / exe) "
                             "の場所を指定してください",
             bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD, anchor="w")
         header.pack(fill="x", padx=16, pady=(14, 2))
@@ -133,7 +140,8 @@ class SettingsDialog:
                   bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
                   padx=14, pady=5, font=theme.FONT_SMALL,
                   cursor="hand2").pack(side="left")
-        tk.Label(frame, text="起動ファイルを選ぶと、アプリIDと表示名を読み取ります",
+        tk.Label(frame, text="起動ファイル (bat / vbs / exe) を選ぶと、"
+                              "アプリIDと表示名を読み取ります",
                  bg=theme.BG, fg=theme.MUTED,
                  font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
 
@@ -146,12 +154,9 @@ class SettingsDialog:
         読めなければ空のまま出すので、手で入れてもらう。
         """
         chosen = filedialog.askopenfilename(
-            title="追加するツールの起動ファイルを選んでください",
-            filetypes=[("起動ファイル", "*.bat *.vbs"),
-                       ("バッチファイル", "*.bat"),
-                       ("VBScript", "*.vbs"),
-                       ("すべてのファイル", "*.*")],
-            parent=self.top)
+            title="追加するツールの起動ファイル (start.bat / Start.vbs / exe) を"
+                  "選んでください",
+            filetypes=ENTRY_FILETYPES, parent=self.top)
         if not chosen:
             return
 
@@ -163,7 +168,10 @@ class SettingsDialog:
                     port=int(found.get("port", 0)),
                     order_no=tool_registry.next_order_no(),
                     start_command=chosen,
-                    start_args=args)
+                    start_args=args,
+                    ui_mode=found.get("ui_mode", ""))
+        if found.get("kind") == "tauri":
+            reason = "Tauri のアプリと見分けました。" + reason
         hint = getattr(self, "_empty_hint", None)
         if hint is not None:
             hint.destroy()
@@ -617,6 +625,9 @@ class _ToolRow:
         self.port_var = tk.StringVar(value=str(tool.port or ""))
         self.args_var = tk.StringVar(value=tool.start_args)
         self.stop_var = tk.StringVar(value=tool.stop_method)
+        # 画面の出し方。「自動」は exe でポートが無ければアプリの窓
+        self._ui_keys = {label: key for key, label in UI_LABELS.items()}
+        self.ui_var = tk.StringVar(value=UI_LABELS.get(tool.ui_mode, "自動"))
 
         _label(detail, "ポート")
         tk.Entry(detail, textvariable=self.port_var, width=7,
@@ -631,8 +642,13 @@ class _ToolRow:
                   padx=8, pady=1, font=theme.FONT_SMALL,
                   cursor="hand2").pack(side="left", padx=(0, 12))
         _label(detail, "停止方法")
-        ttk.Combobox(detail, textvariable=self.stop_var, width=13,
+        ttk.Combobox(detail, textvariable=self.stop_var, width=12,
                      values=list(STOP_METHODS), state="readonly",
+                     font=theme.FONT_SMALL).pack(side="left", padx=(0, 12))
+        # ブラウザーで開くか、アプリが自分の窓を出すか (Tauri などの exe)
+        _label(detail, "画面")
+        ttk.Combobox(detail, textvariable=self.ui_var, width=9,
+                     values=list(UI_LABELS.values()), state="readonly",
                      font=theme.FONT_SMALL).pack(side="left")
 
         # 起動引数を決めた理由など、1行の案内。ふだんは出さない
@@ -670,13 +686,13 @@ class _ToolRow:
         initial = str(Path(current).parent) if current else ""
         chosen = filedialog.askopenfilename(
             title=f"{self.tool.display_name} の起動ファイルを選んでください",
-            initialdir=initial or None,
-            filetypes=[("起動ファイル", "*.bat *.vbs"),
-                       ("バッチファイル", "*.bat"),
-                       ("VBScript", "*.vbs"),
-                       ("すべてのファイル", "*.*")])
+            initialdir=initial or None, filetypes=ENTRY_FILETYPES)
         if chosen:
             self.path_var.set(chosen)
+            if chosen.lower().endswith(".exe") and self.ui_var.get() == "自動":
+                found = tool_registry.probe_tool_folder(chosen)
+                if found.get("ui_mode"):
+                    self.ui_var.set(UI_LABELS[found["ui_mode"]])
             # 起動ファイルが変われば、渡せる引数も変わる
             self.recommend_args()
 
@@ -715,14 +731,21 @@ class _ToolRow:
         if problem:
             return self.tool, problem
 
-        return replace(self.tool,
+        tool = replace(self.tool,
                        app_id=app_id,
                        display_name=name,
                        start_command=path,
                        start_args=self.args_var.get().strip(),
                        port=port,
                        stop_method=self.stop_var.get().strip() or "auto",
-                       enabled=bool(self.enabled_var.get())), ""
+                       enabled=bool(self.enabled_var.get()),
+                       ui_mode=self._ui_keys.get(self.ui_var.get(), ""))
+        # 画面の出し方と起動ファイル・ポートが噛み合わなければ、押してから
+        # 待たせる前に、ここで言う
+        problem = tool.ui_problem()
+        if problem:
+            return self.tool, problem
+        return tool, ""
 
 
 def _delivery_warning(tool: Tool) -> str:

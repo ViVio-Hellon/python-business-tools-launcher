@@ -15,6 +15,10 @@
     3. 記録したPIDで止める                   … 応答しないときだけ
        ただし落とす前に、そのPIDが**本当にそのツールか**を確かめる
 
+自分の窓を出すアプリ (Tauri などの exe) は、まず**窓を閉じてもらう**
+(×ボタンと同じ)。アプリが「保存しますか」を出したら、そこで待つ ──
+落とさずに利用者へ返し、強制終了するかを選んでもらう。
+
 3で確かめるのは、PIDが使い回されるから。記録した時点では日報だったPIDが、
 止めるころには無関係なプロセスになっていることがある。コマンドラインに
 そのツールの置き場所が入っていることまで見て、取れないときは**止めない**
@@ -44,7 +48,7 @@ APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from launcher import app_config, health, runtime_state  # noqa: E402
+from launcher import app_config, desktop, health, runtime_state  # noqa: E402
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 
@@ -58,6 +62,11 @@ TERMINATE_WAIT_SEC = 8.0
 BROWSER_WAIT_SEC = 10.0
 # 外部コマンド (tasklist / taskkill / wmic) の待ち時間
 COMMAND_TIMEOUT_SEC = 8.0
+# アプリの窓に「閉じて」と頼んだあと、終わるのを待つ上限 (秒)。
+# 過ぎても終わらなければ、保存の確認などを出していると見て利用者に返す
+APP_CLOSE_WAIT_SEC = 10.0
+# 強制終了のときに、先に窓を閉じてもらう猶予 (秒)
+APP_CLOSE_WAIT_FORCE_SEC = 3.0
 
 # Windowsで子プロセスのコンソールを出さないための旗。
 # 他のOSでは 0 になり、`creationflags=0` は何もしないのと同じ
@@ -104,10 +113,17 @@ def status(running: Optional[RunningTool] = None) -> Optional[dict]:
     if running is None:
         return None
 
-    payload = health.probe(running.health_url)
-    if not health.is_tool(payload, running.app_id):
-        return None
-    payload = dict(payload or {})
+    if running.watches_window:
+        # Web サーバーを持たないアプリ。プロセスで見る
+        if not app_alive(running):
+            return None
+        payload = {"app_id": running.app_id,
+                   "display_name": running.display_name}
+    else:
+        payload = health.probe(running.health_url)
+        if not health.is_tool(payload, running.app_id):
+            return None
+        payload = dict(payload or {})
     payload["_record"] = {
         "pid": running.pid, "launch_pid": running.launch_pid,
         "port": running.port, "started": running.started_text,
@@ -117,7 +133,37 @@ def status(running: Optional[RunningTool] = None) -> Optional[dict]:
 
 
 def is_running(running: RunningTool) -> bool:
+    """そのツールが動いているか。
+
+    ブラウザー画面のツールは `/api/health` で見る。アプリの窓のツールは
+    **窓を持つプロセス (exe) が生きているか**を先に見る ── 窓を閉じれば
+    アプリは終わる。中に Web サーバーを持つアプリは、さらに応答も見る。
+    """
+    alive = app_alive(running)
+    if alive is False:
+        return False
+    if not running.health_url:
+        return bool(alive)
     return health.is_tool(health.probe(running.health_url), running.app_id)
+
+
+def app_exe(running: RunningTool) -> str:
+    """アプリの窓のツールの exe。exe で起動していなければ空。"""
+    path = (running.start_command or "").strip().strip('"')
+    return path if path.lower().endswith(".exe") else ""
+
+
+def app_alive(running: RunningTool) -> Optional[bool]:
+    """アプリの窓を持つプロセスが動いているか。
+
+    アプリの窓のツールでない・exe でない・PIDが分からないときは
+    `None` (分からない)。**PIDだけでなく実行ファイルまで確かめる** ──
+    PIDは使い回される。
+    """
+    exe = app_exe(running)
+    if not running.is_app or not exe or not running.window_pid:
+        return None
+    return desktop.runs_exe(running.window_pid, exe)
 
 
 # ------------------------------------------------------------------
@@ -151,6 +197,9 @@ def stop(running: RunningTool, *, force: bool = False,
     attempts: list[str] = []
     if method == "auto":
         attempts = ["stop_bat", "shutdown_api", "pid"]
+        if running.is_app:
+            # 自分の窓を出すアプリは、まず窓を閉じてもらう (×ボタンと同じ)
+            attempts.insert(0, "close_window")
     else:
         # 指定されたやり方で駄目なら、最後はPIDに落とす。
         # 「止まらないまま放置」がいちばん困る
@@ -159,6 +208,8 @@ def stop(running: RunningTool, *, force: bool = False,
     for attempt in attempts:
         if attempt == "stop_bat":
             outcome = _stop_by_bat(running, force=force, timeout=timeout)
+        elif attempt == "close_window":
+            outcome = _stop_by_closing(running, force=force)
         elif attempt == "shutdown_api":
             outcome = _stop_by_api(running, force=force, timeout=timeout)
         else:
@@ -265,13 +316,81 @@ def _stop_by_bat(running: RunningTool, *, force: bool,
         log.info("stop.bat の戻り値は %s でした: %s",
                  completed.returncode, output.strip()[:400])
 
-    if health.wait_gone(running.health_url, running.app_id, timeout=timeout):
+    if _wait_stopped(running, timeout):
         result.stopped = True
         result.method = "stop.bat"
         result.message = "正常に終了しました"
         return result
 
     result.message = "stop.bat を実行しましたが、まだ応答しています"
+    return result
+
+
+def _wait_stopped(running: RunningTool, timeout: float) -> bool:
+    """止まったことを確かめる。
+
+    ブラウザー画面のツールは `/api/health` が答えなくなるまで。アプリの
+    窓のツールは**窓を持つプロセスが消えるまで**も待つ (Web サーバーを
+    持たなければ、それだけが手がかり)。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        alive = app_alive(running)
+        server = (bool(running.health_url)
+                  and health.is_tool(health.probe(running.health_url),
+                                     running.app_id))
+        if not alive and not server:
+            if alive is None and not running.health_url:
+                return False                  # 何も確かめられない
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.3)
+
+
+# --- 0. アプリの窓を閉じてもらう ------------------------------------
+def _stop_by_closing(running: RunningTool, *,
+                     force: bool) -> Optional[StopResult]:
+    """アプリの窓に「閉じて」と頼む (×ボタンと同じ)。使えなければ `None`。
+
+    アプリは保存の確認を出したり、後片付けをしてから終われる。待っても
+    終わらなければ、**確認を出して待っているもの**とみなし、落とさずに
+    「実行中」として返す (強制終了するかは利用者が決める)。強制のときは
+    少しだけ待って、次の手 (PID で止める) へ回す。
+    """
+    exe = app_exe(running)
+    pid = running.window_pid
+    if not exe or not desktop.runs_exe(pid, exe):
+        return None
+    result = StopResult(app_id=running.app_id,
+                        display_name=running.display_name)
+
+    asked = desktop.close_windows(pid)
+    if asked is None:
+        # 窓の無い環境 (Windows 以外)。終了の要求で代える
+        if not _terminate(pid, force=False):
+            return None
+    elif asked == 0:
+        log.info("%s は窓を出していないので、ほかの手で止めます",
+                 running.app_id)
+        return None
+    else:
+        # 確認を出すなら、それが利用者に見えるように前へ
+        desktop.bring_to_front(pid)
+    log.info("アプリの窓を閉じるよう頼みました: %s (pid=%s)", running.app_id, pid)
+
+    wait = APP_CLOSE_WAIT_FORCE_SEC if force else APP_CLOSE_WAIT_SEC
+    if _wait_stopped(running, wait):
+        result.stopped = True
+        result.method = "close-window"
+        result.message = "アプリの窓を閉じて終了しました"
+        return result
+    if force:
+        result.message = "窓を閉じても終わらないので、強制終了します"
+        return result
+    result.busy_jobs = ["終了の確認 (アプリの窓を見てください)"]
+    result.message = ("窓を閉じるよう頼みましたが、まだ終わっていません。"
+                      "アプリが保存の確認などを出していないか見てください")
     return result
 
 
@@ -372,7 +491,7 @@ def _stop_by_api(running: RunningTool, *, force: bool,
         result.message = str(payload.get("message") or "停止要求は受理されませんでした")
         return result
 
-    if health.wait_gone(running.health_url, running.app_id, timeout=timeout):
+    if _wait_stopped(running, timeout):
         result.stopped = True
         result.method = "shutdown-api"
         result.message = "正常に終了しました"
@@ -397,6 +516,7 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
         return result
 
     stopped_any = False
+    refused = False
     for pid in targets:
         verdict = verify_process(pid, running)
         if not verdict.ok:
@@ -414,6 +534,7 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
         if not force:
             result.message = (f"PID {pid} が終了要求に応じません。"
                               "中断してでも止めるには --force を付けてください")
+            refused = True
             continue
         if _terminate(pid, force=True) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
             stopped_any = True
@@ -426,6 +547,10 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
         result.method = result.method or "terminate"
         result.message = ("強制終了しました" if result.method == "kill"
                           else "終了しました")
+    elif refused and running.is_app:
+        # 窓の無いアプリ (通知領域だけ) は、頼んでも終わらないことがある。
+        # **落とさずに返し**、強制終了するかは利用者に選んでもらう
+        result.busy_jobs = ["終了の要求に応じない"]
     return result
 
 
@@ -448,6 +573,11 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
     気づいて手で対処できるが、他人の処理を落とすと気づかれないまま
     データが失われる。
     """
+    exe = app_exe(running)
+    if running.is_app and exe and desktop.runs_exe(pid, exe):
+        # 実行ファイルのフルパスで確かめられる (外部コマンドを使わない)
+        return Verdict(True, f"実行ファイルが {exe} です")
+
     command = process_command_line(pid)
     if not command:
         return Verdict(False, "コマンドラインを取得できませんでした")
@@ -830,7 +960,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             continue
 
         result = stop(running, force=args.force)
-        if running.browser_managed:
+        if running.is_app:
+            pass                              # 画面はアプリ自身の窓
+        elif running.browser_managed:
             print("[済] 画面を閉じました" if result.browser_closed
                   else "[--] 画面を閉じられませんでした")
         elif running.browser_pid or running.url:

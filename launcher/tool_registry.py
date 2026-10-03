@@ -13,6 +13,14 @@
 
 新しいツールが5個目・6個目と増えても、行を足すだけで済む形にする
 (要件定義書 §14「将来5個目、6個目のツールを追加しやすい構造」)。
+
+ツールには2種類ある (`ui_mode`):
+
+    ブラウザー画面   Python/Flask などの Web サーバー。ランチャーが
+                     /api/health を待ってから画面 (ブラウザー) を開く
+    アプリの窓       Tauri (Rust) などの exe。**自分で窓を出す**ので
+                     ランチャーはブラウザーを開かない。Web サーバーを
+                     持たなければ、窓が出たことで起動を確かめる
 """
 from __future__ import annotations
 
@@ -40,14 +48,22 @@ SCHEMA_VERSION = 2
 DEFAULT_HEALTH_PATH = "/api/health"
 
 # 停止のやり方。詳しくは `process_manager` を参照
-STOP_METHODS = ("auto", "stop_bat", "shutdown_api", "pid")
+STOP_METHODS = ("auto", "stop_bat", "shutdown_api", "close_window", "pid")
 
 # 起動に使える入口。
 #
 #   .bat … `%*` で引数をそのまま渡す。出力も戻り値も取れる (推奨)
 #   .vbs … 利用者がふだん押す入口。**引数を転送するとは限らない**ので、
 #          中身を見て確かめる (`forwards_args`)
-ENTRY_SUFFIXES = (".bat", ".vbs")
+#   .exe … そのまま実行する。Tauri (Rust) のアプリや、Python から作った
+#          exe。引数はそのまま届き、戻り値も取れる
+ENTRY_SUFFIXES = (".bat", ".vbs", ".exe")
+
+# 画面の出し方。空は「自動」(`Tool.resolved_ui_mode`)
+UI_BROWSER = "browser"
+UI_APP = "app"
+UI_MODES = ("", UI_BROWSER, UI_APP)
+UI_LABELS = {"": "自動", UI_BROWSER: "ブラウザー", UI_APP: "アプリの窓"}
 
 # ツール側にブラウザーを開かせないための指定
 NO_BROWSER_ARG = "--no-browser"
@@ -70,7 +86,8 @@ CREATE TABLE IF NOT EXISTS tools (
     health_url_override TEXT NOT NULL DEFAULT '',
     stop_method         TEXT NOT NULL DEFAULT 'auto',
     enabled             INTEGER NOT NULL DEFAULT 1,
-    updated_at          TEXT NOT NULL DEFAULT ''
+    updated_at          TEXT NOT NULL DEFAULT '',
+    ui_mode             TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS pc_settings (
@@ -120,6 +137,34 @@ class Tool:
     stop_method: str = "auto"
     enabled: bool = True
     updated_at: str = ""
+    # 画面の出し方。"browser" / "app" / 空 (自動)
+    ui_mode: str = ""
+
+    @property
+    def resolved_ui_mode(self) -> str:
+        """画面の出し方を決める。設定が「自動」なら起動ファイルとポートから。
+
+        **exe でポートが無ければアプリの窓。** Web サーバーを持たない exe
+        には開く画面 (URL) が無いので、ブラウザーではありえない。
+        exe でもポートがあれば、Python から作ったサーバーの exe として
+        ブラウザーで開く (Tauri で、中に Web サーバーを持つものは
+        ［＋ ツールを追加］が見分けて「アプリの窓」にする)。
+        """
+        if self.ui_mode in (UI_BROWSER, UI_APP):
+            return self.ui_mode
+        if self.entry_kind == "exe" and not self.health_url:
+            return UI_APP
+        return UI_BROWSER
+
+    @property
+    def is_app(self) -> bool:
+        """自分の窓を出すアプリか (ランチャーはブラウザーを開かない)。"""
+        return self.resolved_ui_mode == UI_APP
+
+    @property
+    def watches_window(self) -> bool:
+        """起動と生死を**窓とプロセスで**見るか (/api/health が無い)。"""
+        return self.is_app and not self.health_url
 
     @property
     def health_url(self) -> str:
@@ -167,7 +212,7 @@ class Tool:
 
     @property
     def entry_kind(self) -> str:
-        """起動入口の種類。`bat` / `vbs` / 空文字。"""
+        """起動入口の種類。`bat` / `vbs` / `exe` / 空文字。"""
         path = self.start_command.strip().strip('"')
         if not path:
             return ""
@@ -187,7 +232,7 @@ class Tool:
         ブラウザーを開く。そこへランチャーも画面を開くと**2枚**になる。
         """
         kind = self.entry_kind
-        if kind == "bat":
+        if kind in ("bat", "exe"):
             return True
         if kind != "vbs":
             return False
@@ -203,6 +248,27 @@ class Tool:
         if NO_BROWSER_ARG not in self.start_args:
             return False
         return self.forwards_args
+
+    def ui_problem(self) -> str:
+        """画面の出し方と、起動ファイル・ポートが噛み合っているか。
+
+        噛み合わない組み合わせは、起動しても確かめようがない。押してから
+        90秒待たせて「起動できませんでした」と出すより、先に理由を言う。
+        """
+        if not self.start_command.strip():
+            return ""
+        if self.is_app:
+            if not self.health_url and self.entry_kind != "exe":
+                return ("Web サーバーを持たないアプリは、起動ファイルに exe を"
+                        "直接指定してください (起動と終了をプロセスで見るため)")
+            return ""
+        if not self.health_url:
+            if self.entry_kind == "exe":
+                return ("ポートが空です。自分で窓を出すアプリなら「画面」を"
+                        "「アプリの窓」に、Web サーバーの exe ならポートを"
+                        "入れてください")
+            return "ブラウザーで開くツールはポートが要ります"
+        return ""
 
 
 # ------------------------------------------------------------------
@@ -226,7 +292,7 @@ def validate_start_command(path: str) -> str:
         # 相対パスを許すと端末ごとに違う場所を指す
         return "絶対パスで指定してください (例: C:\\業務ツール\\日報\\start.bat)"
     if candidate.suffix.lower() not in ENTRY_SUFFIXES:
-        return "拡張子が .bat または .vbs のファイルを指定してください"
+        return "拡張子が .bat・.vbs・.exe のファイルを指定してください"
     if not candidate.exists():
         return f"ファイルが見つかりません: {candidate}"
     if not candidate.is_file():
@@ -464,7 +530,7 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
 
 # 利用者が［設定］で変えられる項目。工場出荷のままかを見るのに使う
 _EDITABLE_FIELDS = ("display_name", "start_args", "port", "stop_method",
-                    "enabled")
+                    "enabled", "ui_mode")
 
 
 def _untouched_default_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
@@ -486,7 +552,8 @@ def _untouched_default_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
                 or row["health_url_override"]):
             continue
         expected = {"display_name": row["app_id"], "start_args": "", "port": 0,
-                    "stop_method": "auto", "enabled": 1, **_tool_values(item)}
+                    "stop_method": "auto", "enabled": 1, "ui_mode": "",
+                    **_tool_values(item)}
         if all(row[name] == expected[name] for name in _EDITABLE_FIELDS):
             found[row["app_id"]] = row
     return found
@@ -504,6 +571,8 @@ def _tool_values(item: dict) -> dict:
         value = item.get(name)
         if isinstance(value, str):
             values[name] = value.strip()
+    if item.get("ui_mode") in UI_MODES:
+        values["ui_mode"] = item["ui_mode"]
     if values.get("display_name") == "":
         del values["display_name"]              # 空の表示名は入れない
     if values.get("health_path") == "":
@@ -633,6 +702,7 @@ def _row_to_tool(row: sqlite3.Row) -> Tool:
         stop_method=row["stop_method"],
         enabled=bool(row["enabled"]),
         updated_at=row["updated_at"],
+        ui_mode=row["ui_mode"] if row["ui_mode"] in UI_MODES else "",
     )
 
 
@@ -664,8 +734,9 @@ def save(tool: Tool) -> None:
             """INSERT INTO tools
                  (app_id, display_name, order_no, repository, start_command,
                   start_args, stop_command, work_dir, port, health_path,
-                  health_url_override, stop_method, enabled, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  health_url_override, stop_method, enabled, updated_at,
+                  ui_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(app_id) DO UPDATE SET
                  display_name        = excluded.display_name,
                  order_no            = excluded.order_no,
@@ -679,13 +750,15 @@ def save(tool: Tool) -> None:
                  health_url_override = excluded.health_url_override,
                  stop_method         = excluded.stop_method,
                  enabled             = excluded.enabled,
-                 updated_at          = excluded.updated_at""",
+                 updated_at          = excluded.updated_at,
+                 ui_mode             = excluded.ui_mode""",
             (tool.app_id, tool.display_name, tool.order_no, tool.repository,
              tool.start_command.strip(), tool.start_args.strip(),
              tool.stop_command.strip(),
              tool.work_dir.strip(), tool.port, tool.health_path,
              tool.health_url_override.strip(), tool.stop_method,
-             1 if tool.enabled else 0, now))
+             1 if tool.enabled else 0, now,
+             tool.ui_mode if tool.ui_mode in UI_MODES else ""))
     log.info("設定を保存しました: %s (start=%s)", tool.app_id, tool.start_command)
 
 
@@ -744,41 +817,83 @@ def next_order_no() -> int:
 
 
 def probe_tool_folder(start_command: str) -> dict:
-    """`start.bat` の隣の `config/app.json` から、そのツールの素性を読む。
+    """起動ファイルの隣の `config/app.json` から、そのツールの素性を読む。
 
     4つの業務ツールは同じ起動基盤なので、アプリID・表示名・版・ポートが
     そこに入っている。**利用者に手で写させない**ためにこれを読む ──
     アプリIDが1文字違うだけで起動確認が永久に通らず、しかも画面には
     「応答がありません」としか出ないので、原因にたどり着きにくい。
 
+    exe なら、app.json が無くても名前を決める (exe の版情報の名前か
+    ファイル名)。Tauri で作った exe は「アプリの窓」にする。
+
     読めなければ空の辞書。手で入れてもらう。
     """
     path = (start_command or "").strip().strip('"')
     if not path:
         return {}
-    try:
-        raw = json.loads((Path(path).parent / "config" / "app.json")
-                         .read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        log.debug("相手の設定を読めませんでした (%s): %s", path, exc)
-        return {}
-    if not isinstance(raw, dict):
-        return {}
+    entry = Path(path)
+    found: dict = {}
+    raw = _read_app_json(entry)
+    if raw:
+        app_id = str(raw.get("app_id", "")).strip()
+        if app_id:
+            found["app_id"] = app_id
+        name = str(raw.get("display_name", "")).strip()
+        if name:
+            found["display_name"] = name
+        version = str(raw.get("version", "")).strip()
+        if version:
+            found["version"] = version
+        port = _first_port(raw.get("server"))
+        if port:
+            found["port"] = port
+        if raw.get("ui_mode") in (UI_BROWSER, UI_APP):
+            found["ui_mode"] = raw["ui_mode"]
 
-    found = {}
-    app_id = str(raw.get("app_id", "")).strip()
-    if app_id:
-        found["app_id"] = app_id
-    name = str(raw.get("display_name", "")).strip()
-    if name:
-        found["display_name"] = name
-    version = str(raw.get("version", "")).strip()
-    if version:
-        found["version"] = version
-    port = _first_port(raw.get("server"))
-    if port:
-        found["port"] = port
+    if entry.suffix.lower() != ".exe":
+        return found
+
+    from . import desktop
+
+    if "ui_mode" not in found:
+        if desktop.looks_like_tauri(entry):
+            found["ui_mode"] = UI_APP
+            found["kind"] = "tauri"
+        elif "port" not in found:
+            found["ui_mode"] = UI_APP         # 開く画面 (URL) が無い
+    if "display_name" not in found:
+        found["display_name"] = desktop.file_description(entry) or entry.stem
+    if "app_id" not in found:
+        found["app_id"] = exe_app_id(entry)
     return found
+
+
+def exe_app_id(entry: Path) -> str:
+    """app.json の無い exe のアプリID。ファイル名から作る (`exe.<名前>`)。"""
+    stem = re.sub(r"[^0-9A-Za-z._-]+", "-", entry.stem).strip("-").lower()
+    return f"exe.{stem or 'app'}"
+
+
+def _read_app_json(entry: Path) -> dict:
+    """起動ファイルの近くの `config/app.json`。無ければ空。
+
+    `.bat` は `<ツール>/start.bat` の隣に `config/` がある。exe は置き方が
+    いろいろなので、exe の隣・その `config/`・一つ上の `config/` を見る。
+    """
+    folder = entry.parent
+    candidates = [folder / "config" / "app.json"]
+    if entry.suffix.lower() == ".exe":
+        candidates += [folder / "app.json", folder.parent / "config" / "app.json"]
+    for candidate in candidates:
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.debug("相手の設定を読めませんでした (%s): %s", candidate, exc)
+            continue
+        if isinstance(raw, dict):
+            return raw
+    return {}
 
 
 # ------------------------------------------------------------------
@@ -817,6 +932,8 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
         return "", "起動ファイルが見つからないため、判定できません"
 
     kind = path.suffix.lower()
+    if kind == ".exe":
+        return _recommend_exe_args(path)
     if kind == ".vbs":
         forwards = _vbs_forwards_args(str(path))
     elif kind == ".bat":
@@ -836,6 +953,41 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
                     "画面はツールが自分で開きます")
     return NO_BROWSER_ARG, ("ツールが --no-browser を受け付けるので入れました。"
                             "画面はランチャーが開き、止めるとき閉じます")
+
+
+def _recommend_exe_args(path: Path) -> tuple[str, str]:
+    """exe の起動引数。exe には引数がそのまま届く。"""
+    found = probe_tool_folder(str(path))
+    if found.get("ui_mode") == UI_APP:
+        return "", ("自分で窓を出すアプリなので、起動引数は要りません。"
+                    "ランチャーはブラウザーを開かず、アプリの窓を前に出します")
+    if _exe_mentions_no_browser(path):
+        return NO_BROWSER_ARG, ("exe が --no-browser を受け付けるので入れました。"
+                                "画面はランチャーが開き、止めるとき閉じます")
+    return "", ("exe の中に --no-browser が見つからないため、空にしました。"
+                "画面はツールが自分で開きます")
+
+
+def _exe_mentions_no_browser(path: Path) -> bool:
+    """exe の中に `--no-browser` の文字があるか。
+
+    Python から作った exe は中身が圧縮されていて見つからないことがある。
+    **見つからなければ空に倒す** (受け付けない引数を渡すと起動に失敗する)。
+    """
+    mark = NO_BROWSER_ARG.encode("ascii")
+    tail = b""
+    try:
+        with open(path, "rb") as handle:
+            for _ in range(64):                 # 4MB × 64 = 256MB まで
+                chunk = handle.read(4 * 1024 * 1024)
+                if not chunk:
+                    return False
+                if mark in tail + chunk:
+                    return True
+                tail = chunk[-len(mark):]
+    except OSError:
+        return False
+    return False
 
 
 def _bat_forwards_args(path: Path) -> bool:
@@ -926,6 +1078,7 @@ _CHANGE_LABELS = (
     ("stop_command", "停止ファイル"),
     ("work_dir", "作業フォルダー"),
     ("health_path", "起動確認のパス"),
+    ("ui_mode", "画面"),
     ("enabled", "使う"),
 )
 
@@ -948,6 +1101,8 @@ def describe_changes(before: list[Tool], after: list[Tool]) -> list[str]:
         for name, label in _CHANGE_LABELS:
             a, b = getattr(was, name), getattr(tool, name)
             if a != b:
+                if name == "ui_mode":
+                    a, b = UI_LABELS.get(a, a), UI_LABELS.get(b, b)
                 lines.append(f"{tool.display_name}: {label} "
                              f"「{_show(a)}」→「{_show(b)}」")
     for app_id, tool in old.items():
@@ -1112,5 +1267,13 @@ def describe() -> str:
             resolved = resolve_config_path(want)
             lines.append(f"         配布先フォルダ: {want}")
             lines.append(f"                       → {resolved} (見つかりません)")
-        lines.append(f"         確認: {tool.health_url or '(ポート未設定)'}")
+        lines.append(f"         画面: {UI_LABELS[tool.resolved_ui_mode]}"
+                     + ("" if tool.ui_mode else " (自動)"))
+        if tool.watches_window:
+            lines.append("         確認: 窓が出たこと (Web サーバーなし)")
+        else:
+            lines.append(f"         確認: {tool.health_url or '(ポート未設定)'}")
+        problem = tool.ui_problem()
+        if problem:
+            lines.append(f"         [注意] {problem}")
     return "\n".join(lines)

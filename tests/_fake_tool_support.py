@@ -79,5 +79,37 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
     return root
 
 
+def make_app_dir(base: Path, *, app_id: str, exe_name: str = "FakeApp.exe",
+                 **options) -> Path:
+    """デスクトップアプリ (exe) らしいフォルダーを作り、exe の道を返す。
+
+    中身は `_fake_app.py` を動かす Python スクリプトで、名前だけ `.exe`。
+    Windows 以外は拡張子ではなく実行権で動くので、ランチャーからは
+    **exe をそのまま実行した**のと同じに見える (`cmd.exe` も `wscript.exe`
+    も挟まない)。コマンドラインに exe の道が入るので、PID の照合も通る。
+
+    `options` は `_fake_app.py` の引数 (`port=0`、`crash_after=1.0` など)。
+    """
+    root = base / app_id
+    root.mkdir(parents=True, exist_ok=True)
+    args = ["--app-id", app_id]
+    for key, value in options.items():
+        flag = "--" + key.replace("_", "-")
+        if value is True:
+            args.append(flag)
+        elif value not in (None, False):
+            args += [flag, str(value)]
+    exe = root / exe_name
+    exe.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(TESTS_DIR)!r})\n"
+        "import _fake_app\n"
+        f"raise SystemExit(_fake_app.main({args!r} + sys.argv[1:]))\n",
+        encoding="utf-8")
+    os.chmod(exe, 0o755)
+    return exe
+
+
 def _quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
