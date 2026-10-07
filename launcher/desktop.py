@@ -11,6 +11,14 @@ Webサーバーを持たないアプリには `/api/health` も無い。ラン�
     見つける     … ランチャーの外で起動されていたアプリを探す (二重起動しない)
     見分ける     … そのPIDが本当にそのアプリか (PIDは使い回される)
 
+**起動した exe がすぐ終わることがある。** 起動用の exe が本体 (サーバーや
+画面) を別のプロセスとして起こし、自分は戻り値 0 で終わる作り。起こした
+exe だけを見ていると「終わった」「窓が出ない」と誤る。そこで、
+**ツールのフォルダーから起動したプロセス** (実行ファイルかコマンドラインが
+そのフォルダーの中) と、その子・孫をまとめて「そのツール」として見る
+(`related_pids`)。サーバーがどのポートで待ち受けているかも、そこから分かる
+(`listening_ports`)。
+
 Windows の API を**標準ライブラリの ctypes だけ**で呼ぶ。外部コマンド
 (PowerShell・wmic・tasklist) を使わないので、それらを禁じている端末でも
 動き、5秒ごとの見回りでも重くならない。
@@ -24,8 +32,9 @@ Windows 以外 (開発機・試験) には窓が無い。答えられないも�
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Union
 
 from .logging_utils import get_logger
 
@@ -44,6 +53,11 @@ _STILL_ACTIVE = 259
 _WM_CLOSE = 0x0010
 _SW_RESTORE = 9
 _GW_OWNER = 4
+_PROCESS_COMMAND_LINE_INFORMATION = 60
+_AF_INET6 = 23
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+
+Pids = Union[int, Iterable[int]]
 
 
 # ------------------------------------------------------------------
@@ -248,27 +262,32 @@ def _processes_windows() -> list[tuple[int, int, str]]:
         return []
 
 
-def process_tree(pid: int) -> set[int]:
-    """そのプロセスと、その子・孫。
+def process_tree(pid: Pids) -> set[int]:
+    """そのプロセス (いくつでも) と、その子・孫。**動いているものだけ。**
 
     窓は本体ではなく子プロセスが出すことがある (PyInstaller で1ファイルに
     まとめた exe は、本体が子を起こして、窓は子が出す)。前に出す・閉じる
-    ときは子まで見る。
+    ときは子まで見る。起こした本人が先に終わっても、子は残る (親の番号を
+    覚えたまま) ので、終わった本人の番号からでも子をたどれる。
     """
-    if pid <= 0:
+    roots = {pid} if isinstance(pid, int) else set(pid)
+    roots = {p for p in roots if p and p > 0}
+    if not roots:
         return set()
+    rows = _processes()
+    alive = {child for child, _, _ in rows}
     children: dict[int, list[int]] = {}
-    for child, parent, _ in _processes():
+    for child, parent, _ in rows:
         if child != parent:
             children.setdefault(parent, []).append(child)
-    tree = {pid}
-    stack = [pid]
+    tree = set(roots)
+    stack = list(roots)
     while stack:
         for child in children.get(stack.pop(), []):
             if child not in tree:
                 tree.add(child)
                 stack.append(child)
-    return tree
+    return tree & alive
 
 
 def process_image(pid: int) -> str:
@@ -379,6 +398,279 @@ def _started_at_windows(pid: int) -> Optional[float]:
         return None
 
 
+def command_line(pid: int) -> str:
+    """そのPIDのコマンドライン。取れなければ空。
+
+    Windows では `NtQueryInformationProcess` で読む (Windows 8.1 以降)。
+    wmic・PowerShell を使わないので、それらを禁じている端末でも取れる。
+    """
+    if pid <= 0:
+        return ""
+    if not IS_WINDOWS:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return ""
+        return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class UNICODE_STRING(ctypes.Structure):
+            _fields_ = [("Length", wintypes.USHORT),
+                        ("MaximumLength", wintypes.USHORT),
+                        ("Buffer", ctypes.c_void_p)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtQueryInformationProcess.argtypes = [
+            wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG)]
+        ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                      False, pid)
+        if not handle:
+            return ""
+        try:
+            size = wintypes.ULONG(0)
+            ntdll.NtQueryInformationProcess(
+                handle, _PROCESS_COMMAND_LINE_INFORMATION, None, 0,
+                ctypes.byref(size))
+            length = max(size.value, ctypes.sizeof(UNICODE_STRING) + 2)
+            buffer = ctypes.create_string_buffer(length)
+            status = ntdll.NtQueryInformationProcess(
+                handle, _PROCESS_COMMAND_LINE_INFORMATION, buffer, length,
+                ctypes.byref(size))
+            if status != 0:
+                return ""
+            text = UNICODE_STRING.from_buffer(buffer)
+            if not text.Buffer or not text.Length:
+                return ""
+            return ctypes.wstring_at(text.Buffer, text.Length // 2)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("PID %s のコマンドラインを取れませんでした: %s", pid, exc)
+        return ""
+
+
+def folder_is_specific(folder: str) -> bool:
+    """「このフォルダーから起動したプロセス = そのツール」と言える場所か。
+
+    ドライブの直下・Windows・Program Files・利用者フォルダーの直下
+    (デスクトップ・ドキュメントなど) は、ほかのアプリも起動する場所なので
+    使わない。ここを緩めると、**無関係なプロセスをツールとして扱い、止めて
+    しまう**ことになる。
+    """
+    text = _normalize(folder)
+    if not text:
+        return False
+    parts = [part for part in text.split("/") if part]
+    if len(parts) < 3:
+        return False
+    home = os.path.expanduser("~")
+    broad = {os.environ.get(name, "") for name in (
+        "WINDIR", "SYSTEMROOT", "PROGRAMFILES", "PROGRAMFILES(X86)",
+        "PROGRAMW6432", "PROGRAMDATA", "LOCALAPPDATA", "APPDATA", "USERPROFILE",
+        "PUBLIC", "TEMP", "TMP")}
+    broad |= {home} | {os.path.join(home, name) for name in (
+        "Desktop", "Documents", "Downloads", "OneDrive")}
+    broad |= {"/", "/usr", "/usr/bin", "/usr/local", "/usr/local/bin", "/opt",
+              "/tmp", "/bin"}
+    return text not in {_normalize(b) for b in broad if b}
+
+
+# コマンドラインでフォルダーのものと見てよい「スクリプトを動かすだけの」
+# 実行ファイル。**これ以外はコマンドラインでは見ない** ── メモ帳で
+# ツールの app.json を開いているだけのものを、ツールとして止めないため
+_SCRIPT_HOSTS = ("python", "pythonw", "py", "pyw", "cmd", "wscript", "cscript",
+                 "node", "java", "javaw")
+
+
+def _is_script_host(image: str) -> bool:
+    # 区切りは「\」も「/」も見る (どちらの書き方で渡されても名前を取る)
+    name = image.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    stem = name[:-4] if name.endswith(".exe") else name
+    return stem.rstrip("0123456789.") in _SCRIPT_HOSTS
+
+
+def processes_in_folder(folder: str) -> list[int]:
+    """**そのフォルダーから起動した**プロセス。
+
+    * 実行ファイルがフォルダーの中 (ツールの exe・同梱の Python)
+    * スクリプトを動かす実行ファイル (python・cmd・wscript など) で、
+      コマンドラインがフォルダーの中のものを指している
+
+    フォルダーが広すぎるとき (`folder_is_specific`) は何も返さない。
+    """
+    if not folder_is_specific(folder):
+        return []
+    wanted = _normalize(folder) + "/"
+    me = os.getpid()
+    found = []
+    for pid, _, _ in _processes():
+        if pid in (0, 4, me):
+            continue
+        image = process_image(pid)
+        if IS_WINDOWS and _normalize(image).startswith(wanted):
+            found.append(pid)
+            continue
+        if image and not _is_script_host(image):
+            continue
+        if wanted in _normalize(command_line(pid)) + "/":
+            if not IS_WINDOWS and _is_zombie(pid):
+                continue
+            found.append(pid)
+    return found
+
+
+def related_pids(folder: str = "", roots: Pids = ()) -> set[int]:
+    """「そのツール」のプロセス一式。
+
+    ツールのフォルダーから起動したプロセスと、ランチャーが起こしたプロセス
+    (`roots`)、それぞれの子・孫。**起こした exe がもう終わっていても**、
+    本体が残っていれば見つかる。
+    """
+    base = set(processes_in_folder(folder)) if folder else set()
+    base |= {roots} if isinstance(roots, int) else set(roots)
+    return process_tree(base)
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8",
+                                                   errors="replace")
+    except OSError:
+        return True
+    return stat.rpartition(")")[2].split()[:1] == ["Z"]
+
+
+def listening_ports(pids: Pids) -> list[tuple[str, int]]:
+    """それらのプロセスが待ち受けているポート。`(ホスト, ポート)` の一覧。
+
+    設定のポートで答えないとき、**本当はどこで待ち受けているか**を探す。
+    Windows は `GetExtendedTcpTable` (ctypes)、ほかは `/proc/net/tcp`。
+    """
+    wanted = {pids} if isinstance(pids, int) else set(pids)
+    if not wanted:
+        return []
+    try:
+        rows = _listeners_windows() if IS_WINDOWS else _listeners_proc()
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("待ち受けているポートを取れませんでした: %s", exc)
+        return []
+    found = []
+    for host, port, pid in rows:
+        if pid in wanted and (host, port) not in found:
+            found.append((host, port))
+    return sorted(found, key=lambda item: (item[1], item[0]))
+
+
+def port_listening(port: int) -> Optional[bool]:
+    """そのポートで**誰かが待ち受けているか**。分からなければ None。
+
+    接続して確かめると、Windows では閉じたポートに断られるまで 1〜2 秒
+    かかる。待ち受けの一覧を見れば一瞬で分かる。
+    """
+    if port <= 0:
+        return False
+    try:
+        rows = _listeners_windows() if IS_WINDOWS else _listeners_proc()
+    except Exception:                         # noqa: BLE001
+        return None
+    return any(p == port for _, p, _ in rows)
+
+
+def _listeners_windows() -> list[tuple[str, int, int]]:
+    import ctypes
+    from ctypes import wintypes
+
+    iphlpapi = ctypes.WinDLL("iphlpapi")
+    iphlpapi.GetExtendedTcpTable.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+        wintypes.ULONG, ctypes.c_int, wintypes.ULONG]
+    iphlpapi.GetExtendedTcpTable.restype = wintypes.DWORD
+
+    class ROW4(ctypes.Structure):
+        _fields_ = [("state", wintypes.DWORD), ("local_addr", wintypes.DWORD),
+                    ("local_port", wintypes.DWORD), ("remote_addr", wintypes.DWORD),
+                    ("remote_port", wintypes.DWORD), ("pid", wintypes.DWORD)]
+
+    class ROW6(ctypes.Structure):
+        _fields_ = [("local_addr", ctypes.c_ubyte * 16),
+                    ("local_scope", wintypes.DWORD),
+                    ("local_port", wintypes.DWORD),
+                    ("remote_addr", ctypes.c_ubyte * 16),
+                    ("remote_scope", wintypes.DWORD),
+                    ("remote_port", wintypes.DWORD),
+                    ("state", wintypes.DWORD), ("pid", wintypes.DWORD)]
+
+    rows: list[tuple[str, int, int]] = []
+    for family, row_type in ((socket.AF_INET, ROW4), (_AF_INET6, ROW6)):
+        size = wintypes.DWORD(0)
+        iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, family,
+                                     _TCP_TABLE_OWNER_PID_LISTENER, 0)
+        if not size.value:
+            continue
+        buffer = ctypes.create_string_buffer(size.value + 1024)
+        size = wintypes.DWORD(len(buffer))
+        if iphlpapi.GetExtendedTcpTable(buffer, ctypes.byref(size), False,
+                                        family, _TCP_TABLE_OWNER_PID_LISTENER, 0):
+            continue
+        count = wintypes.DWORD.from_buffer(buffer).value
+        # 件数 (DWORD) のすぐ後ろに行が並ぶ (どちらの表も 4 バイト境界)
+        offset = ctypes.sizeof(wintypes.DWORD)
+        array = (row_type * count).from_buffer(buffer, offset)
+        for row in array:
+            port = socket.ntohs(row.local_port & 0xFFFF)
+            if family == socket.AF_INET:
+                host = socket.inet_ntoa(row.local_addr.to_bytes(4, "little"))
+            else:
+                host = socket.inet_ntop(socket.AF_INET6, bytes(row.local_addr))
+            rows.append((host, port, int(row.pid)))
+    return rows
+
+
+def _listeners_proc() -> list[tuple[str, int, int]]:
+    """`/proc/net/tcp` の LISTEN と、その持ち主のPID。"""
+    inodes: dict[str, tuple[str, int]] = {}
+    for name, six in (("tcp", False), ("tcp6", True)):
+        try:
+            lines = Path(f"/proc/net/{name}").read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":     # 0A = LISTEN
+                continue
+            address, port = fields[1].split(":")
+            host = "::" if six else socket.inet_ntoa(
+                int(address, 16).to_bytes(4, "little"))
+            inodes[fields[9]] = (host, int(port, 16))
+    rows = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fds = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link.startswith("socket:[") and link[8:-1] in inodes:
+                host, port = inodes[link[8:-1]]
+                rows.append((host, port, int(entry.name)))
+    return rows
+
+
 def runs_exe(pid: int, exe_path: str) -> bool:
     """そのPIDが**その exe を実行しているか**。動いていなければ偽。
 
@@ -477,20 +769,25 @@ def _windows_of(pids: set[int]) -> Optional[list[int]]:
         return None
 
 
-def has_window(pid: int) -> Optional[bool]:
+def has_window(pid: Pids) -> Optional[bool]:
     """そのアプリ (子も含む) の窓が出ているか。分からなければ None。"""
     windows = _windows_of(process_tree(pid))
     return None if windows is None else bool(windows)
 
 
-def bring_to_front(pid: int) -> bool:
+def bring_to_front(pid: Pids) -> bool:
     """そのアプリの窓を前に出す。出せたら True。
 
     最小化されていれば戻す。押したのはランチャーのボタンなので、
     前に出すことを Windows が許す (ランチャーが手前にいる)。
     """
     windows = _windows_of(process_tree(pid))
-    if not windows:
+    return bool(windows) and activate(windows[0])
+
+
+def activate(hwnd: int) -> bool:
+    """その窓を前に出す (最小化されていれば戻す)。"""
+    if not IS_WINDOWS or not hwnd:
         return False
     try:
         import ctypes
@@ -500,16 +797,61 @@ def bring_to_front(pid: int) -> bool:
         user32.IsIconic.argtypes = [wintypes.HWND]
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        hwnd = windows[0]
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, _SW_RESTORE)
         return bool(user32.SetForegroundWindow(hwnd))
     except Exception as exc:                  # noqa: BLE001
-        log.debug("窓を前に出せませんでした (pid=%s): %s", pid, exc)
+        log.debug("窓を前に出せませんでした (hwnd=%s): %s", hwnd, exc)
         return False
 
 
-def close_windows(pid: int) -> Optional[int]:
+def windows_by_title(text: str) -> Optional[list[tuple[int, str]]]:
+    """題名に `text` を含む、見えている最上位の窓 `(窓, 題名)`。Windows 以外は None。
+
+    ツールの画面が**ふだんのブラウザーの窓**として開かれていると、その窓の
+    持ち主はブラウザー本体で、ツールのプロセスからはたどれない。前に出す
+    ときだけ、題名で探す (閉じるときには使わない ── 題名が同じ別の窓を
+    閉じかねない)。
+    """
+    wanted = (text or "").strip()
+    if not IS_WINDOWS or not wanted:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                           wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetWindow.restype = wintypes.HWND
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR,
+                                          ctypes.c_int]
+        found: list[tuple[int, str]] = []
+
+        def visit(hwnd, _param):
+            if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, _GW_OWNER):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            if wanted in buffer.value:
+                found.append((hwnd, buffer.value))
+            return True
+
+        user32.EnumWindows(callback_type(visit), 0)
+        return found
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("窓を題名で探せませんでした: %s", exc)
+        return None
+
+
+def close_windows(pid: Pids) -> Optional[int]:
     """そのアプリの窓に「閉じて」と頼む (×ボタンと同じ)。頼んだ窓の数。
 
     **落とすのではなく頼む。** アプリは保存の確認を出したり、後片付けを

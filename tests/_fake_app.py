@@ -33,11 +33,14 @@ def _serve(options: argparse.Namespace) -> None:
                 self.send_response(404)
                 self.end_headers()
                 return
-            body = json.dumps({
+            payload = {
                 "app_id": options.app_id, "pid": os.getpid(),
                 "port": options.port, "version": "2.0.0",
                 "ready": time.monotonic() - START_AT >= options.ready_after,
-            }).encode("utf-8")
+            }
+            if options.no_port_in_health:
+                del payload["port"]
+            body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -62,9 +65,23 @@ def main(argv=None) -> int:
     parser.add_argument("--ask-on-close", action="store_true")
     # Web サーバーが答えなくなった状態 (窓は出たまま)
     parser.add_argument("--no-health", action="store_true")
+    # 起動確認の応答に port を入れない (入れないツールもある)
+    parser.add_argument("--no-port-in-health", action="store_true")
     # Python から作ったサーバーの exe と同じく、受け取って無視する
     parser.add_argument("--no-browser", action="store_true")
+    # 起動用の exe の真似: 本体を別のプロセスとして起こし、自分は戻り値 0 で
+    # すぐ終わる (梱包資材総合ツール.exe がこの作り)
+    parser.add_argument("--detach", action="store_true")
     options = parser.parse_args(argv)
+
+    if options.detach and not os.environ.get("FAKE_APP_DETACHED"):
+        import subprocess
+        # 本体は同じ exe (ツールのフォルダーの中) を、印を付けて起こす
+        subprocess.Popen([sys.executable, sys.argv[0]] + sys.argv[1:],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True,
+                         env={**os.environ, "FAKE_APP_DETACHED": "1"})
+        return 0
 
     if options.exit_code is not None:
         print("Error: WebView2 を初期化できませんでした", flush=True)

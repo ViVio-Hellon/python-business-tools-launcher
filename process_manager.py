@@ -153,17 +153,40 @@ def app_exe(running: RunningTool) -> str:
     return path if path.lower().endswith(".exe") else ""
 
 
-def app_alive(running: RunningTool) -> Optional[bool]:
-    """アプリの窓を持つプロセスが動いているか。
+def app_folder(running: RunningTool) -> str:
+    """そのツールの置き場所 (ふつうは起動ファイルのフォルダー)。"""
+    exe = app_exe(running)
+    for text in (running.work_dir, running.app_root,
+                 str(Path(exe).parent) if exe else ""):
+        if (text or "").strip():
+            return text.strip()
+    return ""
 
-    アプリの窓のツールでない・exe でない・PIDが分からないときは
-    `None` (分からない)。**PIDだけでなく実行ファイルまで確かめる** ──
-    PIDは使い回される。
+
+def app_pids(running: RunningTool) -> set[int]:
+    """アプリのプロセス一式。
+
+    **起動した exe がすぐ終わる作り** (本体を別に起こして戻り値 0 で終わる)
+    があるので、記録したPIDだけでは足りない。ツールのフォルダーから起動した
+    プロセスと、その子・孫をまとめて見る (`desktop.related_pids`)。記録した
+    PIDは、**いまもその exe を実行しているときだけ**使う (PIDは使い回される)。
     """
     exe = app_exe(running)
-    if not running.is_app or not exe or not running.window_pid:
+    if not running.is_app or not exe:
+        return set()
+    roots = {running.window_pid} if (running.window_pid and
+                                     desktop.runs_exe(running.window_pid, exe)) else set()
+    return desktop.related_pids(app_folder(running), roots)
+
+
+def app_alive(running: RunningTool) -> Optional[bool]:
+    """アプリが動いているか (プロセス一式のどれかが生きているか)。
+
+    アプリの窓のツールでない・exe でないときは `None` (分からない)。
+    """
+    if not running.is_app or not app_exe(running):
         return None
-    return desktop.runs_exe(running.window_pid, exe)
+    return bool(app_pids(running))
 
 
 # ------------------------------------------------------------------
@@ -360,17 +383,16 @@ def _stop_by_closing(running: RunningTool, *,
     「実行中」として返す (強制終了するかは利用者が決める)。強制のときは
     少しだけ待って、次の手 (PID で止める) へ回す。
     """
-    exe = app_exe(running)
-    pid = running.window_pid
-    if not exe or not desktop.runs_exe(pid, exe):
+    pids = app_pids(running)
+    if not pids:
         return None
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
 
-    asked = desktop.close_windows(pid)
+    asked = desktop.close_windows(pids)
     if asked is None:
         # 窓の無い環境 (Windows 以外)。終了の要求で代える
-        if not _terminate(pid, force=False):
+        if not any(_terminate(pid, force=False) for pid in sorted(pids)):
             return None
     elif asked == 0:
         log.info("%s は窓を出していないので、ほかの手で止めます",
@@ -378,8 +400,9 @@ def _stop_by_closing(running: RunningTool, *,
         return None
     else:
         # 確認を出すなら、それが利用者に見えるように前へ
-        desktop.bring_to_front(pid)
-    log.info("アプリの窓を閉じるよう頼みました: %s (pid=%s)", running.app_id, pid)
+        desktop.bring_to_front(pids)
+    log.info("アプリの窓を閉じるよう頼みました: %s (pid=%s)", running.app_id,
+             sorted(pids))
 
     wait = APP_CLOSE_WAIT_FORCE_SEC if force else APP_CLOSE_WAIT_SEC
     if _wait_stopped(running, wait):
@@ -509,8 +532,12 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
 
-    targets = [pid for pid in (running.pid, running.launch_pid)
-               if pid and _is_alive(pid)]
+    if running.is_app and app_exe(running):
+        # 起動した exe が終わっていても、ツールのフォルダーのプロセスを止める
+        targets = sorted(app_pids(running))
+    else:
+        targets = [pid for pid in (running.pid, running.launch_pid)
+                   if pid and _is_alive(pid)]
     if not targets:
         result.stopped = True
         result.method = "already-gone"
@@ -579,6 +606,8 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
     if running.is_app and exe and desktop.runs_exe(pid, exe):
         # 実行ファイルのフルパスで確かめられる (外部コマンドを使わない)
         return Verdict(True, f"実行ファイルが {exe} です")
+    if running.is_app and exe and pid in app_pids(running):
+        return Verdict(True, "ツールのフォルダーから起動したプロセスです")
 
     command = process_command_line(pid)
     if not command:

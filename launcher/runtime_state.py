@@ -69,6 +69,10 @@ class RunningTool:
     # 画面の出し方。"browser" (ランチャーがブラウザーで開く) か
     # "app" (Tauri などの exe が自分の窓を出す)
     ui_mode: str = "browser"
+    # 起動確認 (/api/health) で**確かめられた**か。窓が出た・プロセスが
+    # 動いていることで「起動した」とみなしたものは偽。確かめられるまでは、
+    # 応答が無くても「落ちた」とは判断しない (プロセスの生死で見る)
+    confirmed: bool = True
 
     @property
     def started_text(self) -> str:

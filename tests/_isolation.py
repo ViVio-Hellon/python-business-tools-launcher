@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import os
 import sys
 import tempfile
@@ -75,3 +76,20 @@ class LocalAreaTestCase(unittest.TestCase):
             os.environ[app_config.LOCAL_DIR_ENV] = self._orig
         self._tmp.cleanup()
         super().tearDown()
+
+
+def release_tk(case: unittest.TestCase) -> None:
+    """試験が持っている画面の部品を手放し、**主スレッドで**片付ける。
+
+    tkinter の本体 (Tcl) は、作ったスレッド以外で片付けられると
+    `Tcl_AsyncDelete: async handler deleted by the wrong thread` で Python
+    ごと落ちる。バーと部品は互いを指し合っている (循環参照) ので、放って
+    おくと、**あとの試験の裏のスレッド**で回収されることがある。
+
+    画面を作る試験は、setUp の最初に `self.addCleanup(release_tk, self)` と
+    書く (片付けは後から登録したものが先に走るので、これがいちばん最後)。
+    """
+    mock.patch.stopall()                      # 偽物は呼ばれた引数 (parent=root) を持つ
+    for name in [n for n in vars(case) if not n.startswith("_")]:
+        setattr(case, name, None)
+    gc.collect()

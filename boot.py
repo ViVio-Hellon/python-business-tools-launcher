@@ -109,7 +109,7 @@ def run(report: Report = lambda step: None, *,
                 f"{type(exc).__name__}: {exc}\n\n"
                 "ランチャーは起動します。すでに動いているツールのボタンを押すと、"
                 "二重に起動することがあります。"
-                + (f"\n\n障害記録: {path}" if path else "")))
+                + (f"\n\n障害記録: {trace.real_path(path)}" if path else "")))
         result.manager = manager
 
         enter(BAR)

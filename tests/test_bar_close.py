@@ -23,7 +23,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import LocalAreaTestCase  # noqa: E402
+from _isolation import LocalAreaTestCase, release_tk  # noqa: E402
 
 
 def _can_show_windows() -> bool:
@@ -44,6 +44,7 @@ HAVE_TK = _can_show_windows()
 class CloseTests(LocalAreaTestCase):
 
     def setUp(self) -> None:
+        self.addCleanup(release_tk, self)
         super().setUp()
         import tkinter
 
@@ -206,6 +207,7 @@ class StartupDisplayTests(LocalAreaTestCase):
     """起動の下ごしらえで決まったことを、バーが最初から出す。"""
 
     def setUp(self) -> None:
+        self.addCleanup(release_tk, self)
         super().setUp()
         from app_manager import ToolManager
         from launcher.ui import bar as bar_module

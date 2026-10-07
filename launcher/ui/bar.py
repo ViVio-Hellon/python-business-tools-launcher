@@ -28,6 +28,7 @@ from .geometry import POSITION_KEY
 from .texts import (CLOSE_CANCEL, CLOSE_DEFAULT, CLOSE_STOP, close_choice,
                     close_question, fit_text, force_question)
 from .progress_window import ProgressWindow
+from .record_viewer import RecordViewer
 from .settings_dialog import SettingsDialog
 from .version_dialog import VersionDialog
 
@@ -635,23 +636,14 @@ class LauncherBar:
                 self._follow_state(self.manager.status)
 
     def show_detail(self) -> None:
+        """［詳細］案内と障害記録を、**ランチャーの中で**読む。
+
+        以前はメモ帳 (関連づけ) で開いていたが、Microsoft Store 版の Python
+        では「指定されたパスが見つかりません」になった (`RecordViewer`)。
+        """
         if not self._last_detail:
             return
-        if not self._last_incident:
-            messagebox.showinfo(app_config.display_name(), self._last_detail,
-                                parent=self.root)
-            return
-        # 障害記録がある。**その場で開ける**ようにする ── 場所を書き写して
-        # エクスプローラで探す手間があると、記録は読まれない
-        if messagebox.askyesno(
-                app_config.display_name(),
-                f"{self._last_detail}\n\n"
-                "障害記録 (なぜなぜ分析の下書き) を開きますか?",
-                parent=self.root):
-            if not trace.open_path(self._last_incident):
-                messagebox.showinfo(app_config.display_name(),
-                                    f"開けませんでした。\n{self._last_incident}",
-                                    parent=self.root)
+        RecordViewer(self.root, self._last_detail, self._last_incident)
 
     def _on_ui_error(self, exc_type, exc, tb) -> None:
         """画面の処理で想定外の例外が起きた。**記録して、画面は動かし続ける。**"""

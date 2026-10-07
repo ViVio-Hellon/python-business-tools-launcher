@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import sys
@@ -917,7 +918,10 @@ class AppWindowTests(ManagerTestCase):
                                return_value=True) as front:
             self.manager._select_blocking(tool)
         self.assertEqual(len(self.spawned), 1)
-        front.assert_called_once_with(self.manager.running[tool.app_id].window_pid)
+        front.assert_called_once()
+        # ツールのプロセス一式 (窓を持つ子も含む) を前に出す
+        self.assertIn(self.manager.running[tool.app_id].window_pid,
+                      front.call_args.args[0])
 
     def test_止めると窓を閉じてもらう(self) -> None:
         tool = self.register_app("fake.close", "日報App")
@@ -1069,6 +1073,261 @@ class AppWindowTests(ManagerTestCase):
         self.assertEqual(self.manager.status.state, State.ERROR)
         self.assertIn("exe を直接指定", self.manager.status.detail)
         self.assertEqual(self.spawned, [])
+
+
+@unittest.skipIf(os.name == "nt", "偽の exe (名前だけ .exe のスクリプト) は Windows 以外で動かす")
+class StarterAndPortTests(ManagerTestCase):
+    """現場で起きたこと (梱包資材総合ツール.exe):
+
+    * 起動した exe が**本体を別に起こして戻り値 0 ですぐ終わる**
+    * 本体は**設定 (app.json) と違うポート**で待ち受けている
+    * 以前は「起動できなかった」と出し、起動中の窓を出したまま 90 秒待ち、
+      もう一度押すと2つ目を起こしていた
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name, value in (("APP_CLOSE_WAIT_SEC", 1.0),
+                            ("APP_CLOSE_WAIT_FORCE_SEC", 0.5),
+                            ("TERMINATE_WAIT_SEC", 1.0)):
+            patcher = mock.patch.object(process_manager, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.spawned = []
+        real = self.manager._spawn
+
+        def spawn(*args, **kwargs):
+            proc = real(*args, **kwargs)
+            self.spawned.append(proc)
+            return proc
+        patcher = mock.patch.object(self.manager, "_spawn", spawn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.folders: list[Path] = []
+        self.addCleanup(self._kill_leftovers)
+
+    def _kill_leftovers(self) -> None:
+        """起動用 exe が起こした本体は、ランチャーの子ではない。試験の後始末"""
+        for folder in self.folders:
+            for pid in desktop.processes_in_folder(str(folder)):
+                process_manager._terminate(pid, force=True)
+        for proc in self.spawned:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+    def register_app(self, app_id: str, name: str, *, port: int = 0,
+                     serve_port: int = 0, ui_mode: str = "", **options):
+        exe = make_app_dir(self.work_root, app_id=app_id,
+                           port=(serve_port or port) or None, **options)
+        self.folders.append(exe.parent)
+        tool_registry.save(tool_registry.Tool(
+            app_id=app_id, display_name=name, port=port, start_command=str(exe),
+            ui_mode=ui_mode))
+        return tool_registry.get(app_id)
+
+    def short_timeout(self, seconds: float = 2) -> None:
+        ui = app_manager.app_config.load()["ui"]
+        patcher = mock.patch.dict(ui, {"start_timeout_seconds": seconds})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_起動用exeがすぐ終わっても本体を追う(self) -> None:
+        tool = self.register_app("fake.stub", "梱包資材総合ツール", detach=True)
+        self.start(tool)
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING, status.detail)
+        self.assertEqual(self.spawned[0].wait(timeout=5), 0, "起動用 exe は終わっている")
+        running = self.manager.running[tool.app_id]
+        self.assertTrue(self.manager._tool_alive(running), "本体を見失っています")
+
+        # もう一度押しても2つ目を起こさない。前に出すだけ
+        with mock.patch.object(desktop, "bring_to_front", return_value=True) as front:
+            self.manager._select_blocking(tool)
+        self.assertEqual(len(self.spawned), 1)
+        front.assert_called_once()
+
+        # 止めると本体が終わる
+        self.assertTrue(self.manager._stop_blocking(tool.app_id))
+        deadline = time.monotonic() + 5
+        while desktop.processes_in_folder(str(self.folders[0])) \
+                and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(desktop.processes_in_folder(str(self.folders[0])), [])
+
+    def test_設定と違うポートで動いていても見つけて使う(self) -> None:
+        configured, actual = free_port(), free_port()
+        tool = self.register_app("fake.otherport", "梱包資材総合ツール",
+                                 port=configured, serve_port=actual,
+                                 ui_mode="app", detach=True)
+        began = time.monotonic()
+        self.start(tool)
+        self.assertLess(time.monotonic() - began, 15, "90秒待たせています")
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING, status.detail)
+        running = self.manager.running[tool.app_id]
+        self.assertEqual(running.port, actual)
+        self.assertTrue(running.confirmed)
+        self.assertIn(f"{actual} で動いています", status.detail)
+        self.assertIn("ポートちがい", [r["種類"] for r in trace.read_events()])
+
+    def test_応答しなくても動いていれば2つ目を起こさない(self) -> None:
+        self.short_timeout(2)
+        tool = self.register_app("fake.silent", "梱包資材総合ツール",
+                                 port=free_port(), ui_mode="app", detach=True,
+                                 no_health=True)
+        self.start(tool)
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING, "動いているのに失敗と出しています")
+        self.assertIn("動いています", status.detail)
+        self.assertFalse(self.manager.running[tool.app_id].confirmed)
+
+        self.manager._select_blocking(tool)
+        self.assertEqual(len(self.spawned), 1, "2つ目を起こしました")
+
+    def test_窓が出たら起動中の窓を閉じて動作中にする(self) -> None:
+        """起動確認より先に窓が出たら、それ以上待たせない (起動中の窓が邪魔)。"""
+        tool = self.register_app("fake.window", "梱包資材総合ツール",
+                                 port=free_port(), ui_mode="app", ready_after=1.5)
+        with mock.patch.object(desktop, "has_window", return_value=True):
+            began = time.monotonic()
+            self.start(tool)
+            self.assertLess(time.monotonic() - began, 1.2)
+        self.assertEqual(self.manager.status.state, State.RUNNING)
+        self.assertFalse(self.manager.status.busy, "起動中の窓が閉じません")
+        running = self.manager.running[tool.app_id]
+        self.assertFalse(running.confirmed)
+
+        # 見回りで、あとから起動確認が取れる
+        time.sleep(1.6)
+        self.manager.poll_health()
+        self.assertTrue(self.manager.running[tool.app_id].confirmed)
+        self.assertIn("起動を確かめた", [r["種類"] for r in trace.read_events()])
+
+    def test_ポートのある起動用exeでも本体を追い2つ目を起こさない(self) -> None:
+        """現場の設定そのまま: exe にポート (app.json) があり、［画面］は自動
+        (= ブラウザー)。起動用 exe は戻り値 0 ですぐ終わり、本体は違うポート。"""
+        configured, actual = free_port(), free_port()
+        tool = self.register_app("fake.packaging", "梱包資材総合ツール",
+                                 port=configured, serve_port=actual, detach=True)
+        self.assertFalse(tool.is_app)
+        began = time.monotonic()
+        self.start(tool)
+        self.assertLess(time.monotonic() - began, 15, "90秒待たせています")
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING, status.detail)
+        self.assertEqual(self.spawned[0].wait(timeout=5), 0)
+        self.assertEqual(self.manager.running[tool.app_id].port, actual)
+        self.assertIn(f"{actual} で動いています", status.detail)
+
+        self.manager._select_blocking(tool)
+        self.assertEqual(len(self.spawned), 1, "2つ目を起こしました")
+
+    def test_起動確認の応答にポートが無くても起動できる(self) -> None:
+        port = free_port()
+        for ui_mode in ("", "app"):
+            with self.subTest(ui_mode=ui_mode or "自動"):
+                app_id = f"fake.noport{ui_mode}"
+                tool = self.register_app(app_id, "梱包資材総合ツール", port=port,
+                                         ui_mode=ui_mode, no_port_in_health=True)
+                self.start(tool)
+                status = self.manager.status
+                self.assertEqual(status.state, State.RUNNING, status.detail)
+                self.assertEqual(self.manager.running[app_id].port, port)
+                self.assertNotIn("ではなく", status.detail)
+                self.assertTrue(self.manager._stop_blocking(app_id))
+
+    def test_ブラウザーのツールが自分の窓を出したら待たせない(self) -> None:
+        """中にブラウザーを持つ exe。起動確認より先に、ツール自身の窓が出る。"""
+        tool = self.register_app("fake.ownwindow", "梱包資材総合ツール",
+                                 port=free_port(), ready_after=2.5)
+        # --no-browser を渡す設定でも (ランチャーが画面を開く側でも)、ツールが
+        # 自分の窓を出したら開かない
+        tool_registry.save(dataclasses.replace(tool, start_args="--no-browser"))
+        tool = tool_registry.get(tool.app_id)
+        self.assertTrue(tool.suppresses_browser)
+        self.assertFalse(tool.is_app)
+        with mock.patch.object(desktop, "has_window", return_value=True):
+            began = time.monotonic()
+            self.start(tool)
+            self.assertLess(time.monotonic() - began, 2.2, "起動中の窓が居座っています")
+        status = self.manager.status
+        self.assertEqual(status.state, State.RUNNING, status.detail)
+        self.assertFalse(status.busy, "起動中の窓が閉じません")
+        self.assertEqual(self.opened, [], "ツールの窓があるのにブラウザーを開きました")
+        running = self.manager.running[tool.app_id]
+        self.assertFalse(running.confirmed)
+        self.assertFalse(running.is_app)
+
+        # もう一度押すと、2つ目を起こさずツールの窓を前に出す
+        with mock.patch.object(desktop, "bring_to_front", return_value=True) as front:
+            self.manager._select_blocking(tool)
+        self.assertEqual(len(self.spawned), 1, "2つ目を起こしました")
+        front.assert_called_once()
+        self.assertEqual(self.opened, [])
+
+        # 見回りで、あとから起動確認が取れる
+        time.sleep(2.0)
+        self.manager.poll_health()
+        self.assertTrue(self.manager.running[tool.app_id].confirmed)
+
+    def test_窓を出しているツールは応答が無くても落とさない(self) -> None:
+        """利用者が見ている画面を、ランチャーが消さない。"""
+        self.short_timeout(1)
+        tool = self.register("fake.windowstuck", "日報")
+        Path(tool.start_command).write_text(
+            f"#!/bin/sh\nexec {sys.executable} -c 'import time; time.sleep(30)' "
+            f"{Path(tool.start_command).parent}/app.py\n", encoding="utf-8")
+        # 待っているあいだは窓を見ない (間隔を長くする)。失敗と決めたところで
+        # 窓が見える (起動の上限ぎりぎりに窓が出た)
+        with mock.patch.object(desktop, "has_window", return_value=True), \
+                mock.patch.object(app_manager, "WINDOW_LOOK_SEC", 999):
+            self.start(tool)
+        self.assertEqual(self.manager.status.state, State.ERROR)
+        self.assertIsNone(self.spawned[0].poll(), "窓を出しているツールを落としました")
+
+    def test_ブラウザーのツールも違うポートを見つけて開く(self) -> None:
+        actual = free_port()
+        root = make_tool_dir(self.work_root, app_id="fake.webport", port=actual,
+                             display_name="日報")
+        tool_registry.save(tool_registry.Tool(
+            app_id="fake.webport", display_name="日報", port=free_port(),
+            start_command=str(root / "start.bat"), start_args="--no-browser"))
+        tool = tool_registry.get("fake.webport")
+        self.start(tool)
+        self.assertEqual(self.manager.status.state, State.RUNNING)
+        self.assertEqual(self.opened, [f"http://127.0.0.1:{actual}/"])
+        self.assertIn(f"{actual} で動いています", self.manager.status.detail)
+
+    def test_外で起動されていたツールは起こさず引き継ぐ(self) -> None:
+        tool = self.register("fake.outsidebat", "日報")
+        outside = subprocess.Popen([tool.start_command, "--no-browser"])
+        self.addCleanup(outside.wait, 5)
+        self.addCleanup(lambda: [process_manager._terminate(p, force=True)
+                                 for p in desktop.process_tree({outside.pid})])
+        self.assertIsNotNone(health.wait_ready(tool.health_url, tool.app_id,
+                                               timeout=10))
+        self.manager._select_blocking(tool)
+        self.assertEqual(self.spawned, [], "外で動いているのに2つ目を起こしました")
+        self.assertIn(tool.app_id, self.manager.running)
+
+    def test_応答しないまま動いているブラウザーのツールは片付ける(self) -> None:
+        """残すと、次に押したとき2つ目を起こす (ポートの取り合い)。"""
+        self.short_timeout(1)
+        tool = self.register("fake.stuckbat", "日報")
+        Path(tool.start_command).write_text(
+            f"#!/bin/sh\nexec {sys.executable} -c 'import time; time.sleep(30)' "
+            f"{Path(tool.start_command).parent}/app.py\n", encoding="utf-8")
+        self.start(tool)
+        self.assertEqual(self.manager.status.state, State.ERROR)
+        self.assertIsNotNone(self.spawned[0].poll(), "起動しかけたものが残っています")
+
+    def test_同じフォルダーのツールどうしはフォルダーで見分けない(self) -> None:
+        a = self.register_app("fake.role1", "現場", detach=True)
+        tool_registry.save(tool_registry.Tool(
+            app_id="fake.role2", display_name="資材", start_command=a.start_command))
+        self.assertEqual(app_manager._own_folder(a), "")
+        self.assertEqual(app_manager._own_folder(tool_registry.get("fake.role2")), "")
 
 
 if __name__ == "__main__":

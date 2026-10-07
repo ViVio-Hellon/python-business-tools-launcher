@@ -90,12 +90,14 @@ class Destination:
     problem: str = ""         # 指定先に書けず、既定へ退いた理由
 
     def describe(self) -> str:
+        # ほかのアプリから見た場所で出す (`real_path`)
+        shown = real_path(self.path)
         if not self.configured:
-            return f"{self.path} (既定)"
+            return f"{shown} (既定)"
         if self.problem:
-            return (f"{self.path} (指定先 {self.configured} に書けないため退避中:"
+            return (f"{shown} (指定先 {self.configured} に書けないため退避中:"
                     f" {self.problem})")
-        return f"{self.path} ({self.source}で指定)"
+        return f"{shown} ({self.source}で指定)"
 
 
 def local_dir() -> Path:
@@ -353,7 +355,8 @@ def _write_incident(name: str, text: str) -> Path:
         try:
             folder.mkdir(parents=True, exist_ok=True)
             path = _unused_name(folder / name)
-            path.write_text(data, encoding="utf-8-sig", newline="")
+            # `write_text(newline=...)` は Python 3.10 から。バイトで書く
+            path.write_bytes(data.encode("utf-8-sig"))
             return path
         except OSError as exc:
             log.warning("障害記録を書けませんでした (%s): %s", folder, exc)
@@ -504,19 +507,102 @@ def install_thread_hook() -> None:
     threading.excepthook = hook
 
 
+def real_path(path: "str | Path") -> str:
+    """ほかのアプリ (メモ帳・エクスプローラ) から見た、その場所。
+
+    **Microsoft Store 版の Python** は、AppData に書いたファイルを、その
+    Python だけに見える別の場所 (`AppData\\Local\\Packages\\Python...\\
+    LocalCache\\...`) へ振り替える。ランチャーには `AppData\\Local\\
+    BusinessToolsLauncher` に見えても、メモ帳やエクスプローラには
+    「パスが見つかりません」になる。実体の場所をたどって返す。
+    """
+    try:
+        return os.path.realpath(str(path))
+    except (OSError, ValueError):
+        return str(path)
+
+
+def is_store_python() -> bool:
+    """Microsoft Store 版の Python で動いているか (AppData が振り替えられる)。"""
+    text = f"{sys.executable}|{sys.base_prefix}".lower()
+    return "windowsapps" in text or "pythonsoftwarefoundation" in text
+
+
+def moved_by_python(path: "str | Path") -> bool:
+    """ランチャーに見える場所と、ほかのアプリに見える場所が違うか。"""
+    text = str(path or "")
+    if not text:
+        return False
+    return os.path.normcase(os.path.abspath(text)) != os.path.normcase(real_path(text))
+
+
+# 画面に写す記録の長さの上限 (文字)。障害記録はふつう数千文字
+READ_LIMIT = 200_000
+
+
+def read_record(path: "str | Path") -> tuple[str, str]:
+    """記録の中身を**ランチャー自身が**読む。戻り値は (中身, 読めなかった理由)。
+
+    ランチャーが書いたファイルは、ランチャーからは必ず見える (Microsoft
+    Store 版の Python が場所を振り替えていても)。メモ帳で開けない端末でも
+    ［詳細］で読めるように、ここで読んで画面に写す。
+    """
+    try:
+        with open(str(path), "rb") as handle:
+            data = handle.read(READ_LIMIT * 4 + 1)
+    except OSError as exc:
+        return "", f"{exc.strerror or exc}"
+    text = data.decode("utf-8-sig", errors="replace").replace("\r\n", "\n")
+    if len(text) > READ_LIMIT or len(data) > READ_LIMIT * 4:
+        text = text[:READ_LIMIT] + "\n…(長いので途中まで)"
+    return text, ""
+
+
 def open_path(path: "str | Path") -> bool:
-    """記録をふだんのアプリ (メモ帳・Excel・エクスプローラ) で開く。"""
+    """記録をふだんのアプリ (メモ帳・Excel・エクスプローラ) で開く。
+
+    開けなければ偽 (理由はログ)。**実体の場所** (`real_path`) を渡す。
+    """
+    import subprocess
+
+    target = real_path(path)
+    if not os.path.exists(target):
+        log.warning("開けませんでした (見つかりません): %s → %s", path, target)
+        return False
     try:
         if os.name == "nt":
-            os.startfile(str(path))           # type: ignore[attr-defined]
+            try:
+                os.startfile(target)          # type: ignore[attr-defined]
+                return True
+            except OSError as exc:
+                log.warning("関連づけで開けませんでした (%s): %s", target, exc)
+            program = "explorer.exe" if os.path.isdir(target) else "notepad.exe"
+            subprocess.Popen([program, target])
             return True
-        import subprocess
         opener = "open" if sys.platform == "darwin" else "xdg-open"
-        subprocess.Popen([opener, str(path)], stdout=subprocess.DEVNULL,
+        subprocess.Popen([opener, target], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
         return True
     except (OSError, AttributeError) as exc:
-        log.warning("開けませんでした (%s): %s", path, exc)
+        log.warning("開けませんでした (%s): %s", target, exc)
+        return False
+
+
+def reveal_path(path: "str | Path") -> bool:
+    """エクスプローラでそのファイルを選んだ状態で開く (フォルダーなら開く)。"""
+    import subprocess
+
+    target = real_path(path)
+    if os.name != "nt":
+        return open_path(os.path.dirname(target) if os.path.isfile(target) else target)
+    try:
+        if os.path.isfile(target):
+            subprocess.Popen(["explorer.exe", f"/select,{target}"])
+        else:
+            subprocess.Popen(["explorer.exe", target])
+        return True
+    except OSError as exc:
+        log.warning("エクスプローラで開けませんでした (%s): %s", target, exc)
         return False
 
 

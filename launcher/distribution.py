@@ -365,8 +365,8 @@ def _write_readme() -> None:
     try:
         target = folder() / README_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_README.replace("\n", "\r\n"), encoding="utf-8-sig",
-                          newline="")
+        # `write_text(newline=...)` は Python 3.10 から。バイトで書けば 3.9 でも同じ
+        target.write_bytes(_README.replace("\n", "\r\n").encode("utf-8-sig"))
     except OSError:
         log.warning("配布先フォルダの説明を書けませんでした", exc_info=True)
 

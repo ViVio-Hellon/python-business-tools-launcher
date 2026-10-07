@@ -839,6 +839,24 @@ def validate_app_id(app_id: str, *, existing: bool = False) -> str:
     return ""
 
 
+def shared_folder(folder: str, app_id: str) -> bool:
+    """そのフォルダーを、**ほかの登録済みのツールも**使っているか。
+
+    同じフォルダーに役割違いのツール (現場用・資材用など) を置いていると、
+    「このフォルダーから起動したプロセス = このツール」とは言えない。
+    そのときはフォルダーでツールを見分けない (取り違えて止めないため)。
+    """
+    wanted = _normalize_folder(folder)
+    if not wanted:
+        return False
+    return any(t.app_id != app_id and _normalize_folder(t.resolved_work_dir) == wanted
+               for t in all_tools(include_disabled=True) if t.start_command.strip())
+
+
+def _normalize_folder(folder: str) -> str:
+    return (folder or "").strip().strip('"').replace("\\", "/").rstrip("/").lower()
+
+
 def next_order_no() -> int:
     """並びの最後に置くための番号。"""
     tools = all_tools(include_disabled=True)

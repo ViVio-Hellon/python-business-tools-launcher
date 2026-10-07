@@ -268,7 +268,7 @@ def report_failure(error: StartupError) -> None:
 
     body = f"{error}\n\n{error.hint}\n\nログ: {log_dir}"
     if incident:
-        body += f"\n障害記録: {incident}"
+        body += f"\n障害記録: {trace.real_path(incident)}"
     if _show_message("起動できませんでした", body):
         return
     try:
@@ -433,20 +433,27 @@ def _describe_records() -> str:
     """診断に出す「記録」の段。置き場所と、最近の障害記録。"""
     from launcher import logging_utils, trace
 
+    # **ほかのアプリから見た場所**で出す (Microsoft Store 版の Python は
+    # AppData を振り替えるので、ランチャーに見える場所では探せない)
+    real = trace.real_path
     dest = trace.destination()
     lines = ["[記録 (後追い・なぜなぜ用)]",
              f"  置き場所         : {dest.describe()}",
-             f"  ランチャーのログ : {logging_utils.log_file_path()}",
-             f"  出来事の一覧     : {trace.events_path()}",
-             f"  障害記録         : {dest.path / 'incidents'}",
-             f"  ツールの出力     : {trace.local_dir()}"
+             f"  ランチャーのログ : {real(logging_utils.log_file_path())}",
+             f"  出来事の一覧     : {real(trace.events_path())}",
+             f"  障害記録         : {real(dest.path / 'incidents')}",
+             f"  ツールの出力     : {real(trace.local_dir())}"
              " (tool_<アプリID>.out.log。いつも端末の中)"]
     if dest.problem:
         lines.append(f"  [注意] 指定された出力先に書けません: {dest.problem}")
+    if trace.is_store_python() or trace.moved_by_python(trace.local_dir()):
+        lines.append("  [注意] Microsoft Store 版の Python です。AppData に書いた"
+                     "ファイルは上の場所へ振り替えられます"
+                     " (ランチャーの［詳細］では、そのまま読めます)")
     recent = trace.recent_incidents(days=7)
     if recent:
         lines.append(f"  この7日の障害記録: {len(recent)}件")
-        lines.extend(f"    {path}" for path in recent[:5])
+        lines.extend(f"    {real(path)}" for path in recent[:5])
         if len(recent) > 5:
             lines.append(f"    ほか {len(recent) - 5}件")
     else:

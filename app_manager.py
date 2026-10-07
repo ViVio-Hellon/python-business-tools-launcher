@@ -95,6 +95,13 @@ PHASE_OPEN_BROWSER = "open_browser"      # 画面を開く
 APP_WINDOW_WAIT_SEC = 30.0
 # 窓を見られない環境 (Windows 以外) で、起動できたとみなすまでの時間
 APP_SETTLE_SEC = 0.8
+# 起動した exe がすぐ終わったあと、本体 (別に起こされたプロセス) が見つかる
+# まで待つ時間 (秒)。**起動用の exe が本体を起こして戻り値 0 で終わる**作りがある
+STUB_GRACE_SEC = 5.0
+# 設定のポートで答えないとき、ツールが本当に待ち受けているポートを探す間隔 (秒)
+DISCOVER_EVERY_SEC = 2.0
+# ブラウザーで使うツールが**自分の窓**を出していないか見る間隔 (秒)
+WINDOW_LOOK_SEC = 1.0
 
 # `shutdown(stop_tools=False)` で手放した exe のプロセス。**落とさない** ──
 # exe はツールそのものなので、引き取ろうとして落とすとツールが消える
@@ -346,6 +353,13 @@ class ToolManager:
                 continue
             payload = payloads.get(tool.app_id)
             if not health.is_tool(payload, tool.app_id):
+                # 設定のポートでは答えない。それでも**ツールのプロセスが動いて
+                # いれば**引き継ぐ (起動用の exe が本体を別に起こす作り・
+                # ポートの設定ちがい)。引き継がないと、押したとき2つ目を起こす
+                if tool.is_app or recorded.get(tool.app_id) is not None:
+                    found = self._find_existing(tool)
+                    if found is not None:
+                        adopted[tool.app_id] = found
                 continue
             running = recorded.get(tool.app_id)
             if running is None:
@@ -437,35 +451,137 @@ class ToolManager:
             if process_manager.is_running(running):
                 self._show(tool, running, op)
                 return
-            # 記録はあるが応答しない。落ちている。起動し直す
-            log.info("%s は応答しないので起動し直します", tool.display_name)
-            trace.event("応答なし", trace.WARNING, tool=running, op=op,
-                        cause="動いている記録はあるが応答しないので起動し直す")
-            self._forget(tool.app_id)
-        if tool.watches_window:
-            # ランチャーの外 (デスクトップのショートカットなど) で起動されて
-            # いれば、**もう1つ起動しない**。前に出すだけにする
-            found = _find_running_app(tool)
-            if found is not None:
-                with self._lock:
-                    self._running[tool.app_id] = found
-                    self._failures[tool.app_id] = 0
-                runtime_state.put(found)
-                log.info("ランチャーの外で動いていたアプリを引き継ぎます: %s",
-                         found.summary())
-                trace.event("引き継ぎ", trace.INFO, tool=found, op=op,
-                            cause="ランチャーの外で起動されていた")
-                self._show(tool, found, op)
+            if self._tool_alive(running):
+                # 応答しないが、**ツールのプロセスはまだ動いている**。起動し直すと
+                # 2つ目になる (ポートの取り合い・同じデータの書き合い)。前に出すだけ
+                log.info("%s は動いていますが応答しません。起動し直しません",
+                         tool.display_name)
+                trace.event("応答なし", trace.WARNING, tool=running, op=op,
+                            cause="動いているが応答しないので、起動し直さずに前に出す")
+                self._show(tool, running, op)
                 return
+            # 記録はあるが、プロセスごと無い。落ちている。起動し直す
+            log.info("%s は動いていないので起動し直します", tool.display_name)
+            trace.event("応答なし", trace.WARNING, tool=running, op=op,
+                        cause="動いている記録はあるがプロセスが無いので起動し直す")
+            self._forget(tool.app_id)
+        # ランチャーの外 (デスクトップのショートカット・前のランチャー) で
+        # 起動されていれば、**もう1つ起動しない**。前に出すだけにする
+        found = self._find_existing(tool)
+        if found is not None:
+            with self._lock:
+                self._running[tool.app_id] = found
+                self._failures[tool.app_id] = 0
+            runtime_state.put(found)
+            log.info("すでに動いていたツールを引き継ぎます: %s", found.summary())
+            trace.event("引き継ぎ", trace.INFO, tool=found, op=op,
+                        cause="押したときにはもう動いていた (起動せずに前に出す)")
+            self._show(tool, found, op)
+            return
         self._start(tool, op)
+
+    def _find_existing(self, tool: Tool) -> Optional[RunningTool]:
+        """すでに動いている、そのツール。無ければ None。
+
+        1. 設定のポートの起動確認が、そのツールとして答える
+        2. ツールのフォルダーから起動したプロセスがある (起動用の exe が
+           本体を別に起こす作りでも見つかる)。待ち受けているポートで
+           起動確認が答えれば、そのポートで引き継ぐ
+        """
+        # 待ち受けが無いのに当たりにいかない (Windows では断られるまで
+        # 1〜2 秒かかり、押すたびに待たせる)
+        if tool.health_url and desktop.port_listening(tool.port) is not False:
+            payload = health.probe(tool.health_url)
+            if health.is_tool(payload, tool.app_id):
+                running = _running_from_health(tool, payload, launch_pid=0)
+                if tool.is_app:
+                    running.launch_pid = _find_app_pid(tool)
+                return running
+        if not tool.start_command.strip():
+            return None
+        folder = _own_folder(tool)
+        pids = desktop.processes_in_folder(folder) if folder else []
+        if tool.entry_kind == "exe":
+            pids = sorted(set(pids) | set(desktop.find_by_exe(tool.start_command)))
+        if not pids:
+            return None
+        payload = self._discover(tool, desktop.process_tree(pids)) \
+            if tool.health_url else None
+        if payload is not None:
+            running = _running_from_health(tool, payload, launch_pid=0)
+            running.launch_pid = _find_app_pid(tool) if tool.is_app else 0
+            return running
+        if tool.is_app:
+            return _running_for_app(tool, _find_app_pid(tool) or pids[0])
+        # 応答はしないが、ツールのプロセスは動いている
+        running = _running_from_health(tool, {}, launch_pid=0)
+        running.pid = pids[0]
+        running.confirmed = False
+        return running
+
+    def _discover(self, tool: Tool, pids) -> Optional[dict]:
+        """**ツールが本当に待ち受けているポート**を探し、起動確認が答えれば
+        その応答を返す (`port` と `_health_url` を入れる)。
+
+        設定のポートと、ツールが実際に使うポートが違うことがある (役割ごとに
+        ポートが違うツール・設定を直していない)。そのときも、ツールの
+        プロセスが待ち受けているポートを当たれば見つかる。
+        """
+        if not pids:
+            return None
+        path = tool.health_path or tool_registry.DEFAULT_HEALTH_PATH
+        if not path.startswith("/"):
+            path = "/" + path
+        for host, port in desktop.listening_ports(pids):
+            if port == tool.port and tool.health_url:
+                continue                      # 設定のポートは当たったあと
+            hosts = ["[::1]"] if ":" in host and host not in ("::",) else ["127.0.0.1"]
+            if host == "::":
+                hosts = ["127.0.0.1", "[::1]"]
+            for name in hosts:
+                url = f"http://{name}:{port}{path}"
+                payload = health.probe(url)
+                if health.is_tool(payload, tool.app_id):
+                    found = dict(payload)
+                    found["port"] = port      # 答えたポートを信じる
+                    found["_health_url"] = url
+                    log.info("%s は設定のポート %s ではなく %s で答えました",
+                             tool.app_id, tool.port, port)
+                    return found
+        return None
+
+    def _front_tool_window(self, running: RunningTool) -> bool:
+        """ツールのプロセス一式が出している窓を前に出せたか。"""
+        pids = self._tool_pids(running)
+        return bool(pids) and desktop.bring_to_front(pids)
+
+    def _tool_pids(self, running: RunningTool) -> set[int]:
+        """そのツールのプロセス一式 (ツールのフォルダーから起動したもの・
+        ランチャーが起こしたもの、その子・孫)。"""
+        with self._lock:
+            proc = self._processes.get(running.app_id)
+        folder = _own_folder(running)
+        if proc is not None:
+            # 起こしたプロセスのハンドルを持っているあいだは、その番号は
+            # ほかに使い回されない。終わっていても、子をたどる起点にしてよい
+            return desktop.related_pids(folder, {proc.pid})
+        if running.is_app:
+            return process_manager.app_pids(running) if folder else set()
+        return desktop.related_pids(folder) if folder else set()
+
+    def _tool_alive(self, running: RunningTool) -> bool:
+        """そのツールのプロセスが、どれか動いているか。"""
+        return bool(self._tool_pids(running))
 
     def _show(self, tool: Tool, running: RunningTool,
               op: Optional[trace.Operation] = None) -> None:
         """動いているツールの画面を出す。**起動し直さない** (§9)。"""
         if running.is_app:
             name = tool.display_name
-            brought = desktop.bring_to_front(running.window_pid)
-            shown = brought or desktop.has_window(running.window_pid)
+            pids = self._tool_pids(running)
+            brought = (desktop.bring_to_front(pids) if pids else False) \
+                or _front_by_title(tool)
+            shown = brought or (desktop.has_window(pids) if pids else False)
             trace.event("窓を前へ", trace.OK if brought else trace.INFO,
                         tool=running, op=op,
                         detail="" if brought else "前に出せなかった")
@@ -486,6 +602,12 @@ class ToolManager:
                         tool=running, op=op,
                         detail="" if brought else "前に出せなかった")
             detail = ""
+        elif not running.browser_managed and self._front_tool_window(running):
+            # ツールが**自分の窓**を出している (中にブラウザーを持つ exe など)。
+            # ランチャーの画面は開かない (開けば画面が2枚)。その窓を前に出す
+            log.info("ツールの窓を前に出しました: %s", tool.display_name)
+            trace.event("窓を前へ", trace.OK, tool=running, op=op)
+            detail = ""
         elif running.browser_managed or tool.suppresses_browser:
             # 利用者が画面だけ手で閉じていた。バックエンドは動いたまま
             # なので、起動し直さず画面だけ開く (§11)
@@ -494,10 +616,16 @@ class ToolManager:
             trace.event("画面を開き直す", trace.INFO, tool=running, op=op)
             detail = ""
         else:
-            trace.event("動作中", trace.INFO, tool=running, op=op,
+            # 画面はツールが自分で開いている。その窓を探して前に出す
+            pids = self._tool_pids(running)
+            brought = (desktop.bring_to_front(pids) if pids else False) \
+                or _front_by_title(tool)
+            trace.event("画面を前へ" if brought else "動作中", trace.INFO,
+                        tool=running, op=op,
                         cause="画面はツールがふだんのブラウザーに開いている")
-            detail = (f"{tool.display_name}は動いています。画面はツールが"
-                      "ふだんのブラウザーに開いているので、そちらを見てください。")
+            detail = "" if brought else (
+                f"{tool.display_name}は動いています。画面はツールが"
+                "ふだんのブラウザーに開いているので、そちらを見てください。")
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
                   responding=True)
 
@@ -795,13 +923,63 @@ class ToolManager:
                       phase=PHASE_WAIT, stage=stage, timeout=timeout)
 
         window_note = ""
-        if tool.watches_window:
-            ready, window_note = self._wait_window(tool, proc, timeout, early_exit)
-            payload = {} if ready else None
+        how = "health"
+        if tool.is_app:
+            how, payload, window_note = self._wait_app(tool, proc, timeout,
+                                                       early_exit, seen, op)
+            if how in ("window", "alive"):
+                payload = {}                  # 応答は無いが、起動はしている
+            elif how != "health":
+                payload = None
         else:
+            # 起動を待つあいだも、ツールが**別のポート**で待ち受けていないか
+            # 時々見る (設定のポートが違っていても 90 秒待たせない)
+            discovered: dict[str, dict] = {}
+            # ツールが**自分の窓**を出したか (中にブラウザーを持つ exe など)
+            own_window: dict[str, set] = {}
+            next_look = [time.monotonic() + DISCOVER_EVERY_SEC]
+            next_window = [time.monotonic() + WINDOW_LOOK_SEC]
+            folder = _own_folder(tool)
+
+            def look_elsewhere(elapsed: float, payload: Optional[dict]) -> None:
+                on_progress(elapsed, payload)
+                if tool.app_id in self._cancelled:
+                    return
+                now = time.monotonic()
+                if now < next_look[0] and now < next_window[0]:
+                    return
+                pids = desktop.related_pids(folder, {proc.pid})
+                if now >= next_look[0]:
+                    next_look[0] = now + DISCOVER_EVERY_SEC
+                    found = self._discover(tool, pids)
+                    if found is not None and health.is_ready(found):
+                        discovered["payload"] = found
+                        return
+                if now >= next_window[0]:
+                    next_window[0] = now + WINDOW_LOOK_SEC
+                    if pids and desktop.has_window(pids):
+                        own_window["pids"] = pids
+
             payload = health.wait_ready(
                 tool.health_url, tool.app_id, timeout=timeout,
-                on_progress=on_progress, should_stop=should_stop)
+                on_progress=look_elsewhere,
+                should_stop=lambda: (should_stop() or "payload" in discovered
+                                     or "pids" in own_window))
+            if payload is None and "payload" in discovered:
+                payload = discovered["payload"]
+            if payload is None and "pids" in own_window \
+                    and tool.app_id not in self._cancelled:
+                # 起動確認より先に、ツールが自分の窓を出した。利用者の前には
+                # もう画面がある。**それ以上待たせない** (起動中の窓が、
+                # ツールの画面の上に居座らない)。起動確認は見回りで続ける
+                log.info("ツールが自分の窓を出しました: %s (応答はまだ)",
+                         tool.display_name)
+                op.step("ツールが自分の窓を出した (起動確認の応答はまだ)")
+                how, payload = "window", {}
+            if payload is None and tool.app_id not in self._cancelled:
+                payload = self._discover(tool, desktop.related_pids(folder, {proc.pid}))
+            if payload and int(payload.get("port") or 0) not in (0, tool.port):
+                window_note = _port_note(tool, int(payload["port"]))
 
         if tool.app_id in self._cancelled:
             # 待っているあいだに「やめる」と言われた。**起こしかけた
@@ -821,7 +999,7 @@ class ToolManager:
             if tool.is_app and early_exit.get("code") == 0:
                 # すぐ戻り値 0 で終わった。**すでに動いている同じアプリへ
                 # 引き渡して終わった** (1つしか起動させないアプリ) のかもしれない
-                found = _find_running_app(tool)
+                found = self._find_existing(tool)
                 if found is not None:
                     with self._lock:
                         self._processes.pop(tool.app_id, None)
@@ -832,18 +1010,40 @@ class ToolManager:
                                 cause="すでに動いていた同じアプリへ引き渡された")
                     self._show(tool, found, op)
                     return
-            with self._lock:
-                self._processes.pop(tool.app_id, None)
+            pids = desktop.related_pids(_own_folder(tool), {proc.pid}) \
+                if not tool.is_app else set()
             self._report_start_failure(tool, proc, early_exit,
                                        time.monotonic() - started, op=op,
                                        last_payload=seen.get("payload"),
                                        timeout=timeout)
+            if pids and early_exit.get("code") is None \
+                    and not desktop.has_window(pids):
+                # 応答しないまま動いている。**残すと、次に押したとき2つ目を
+                # 起こす** (ポートの取り合い)。起こしたものは片付ける
+                # (窓を出しているものは、利用者が見ているので落とさない)
+                self._kill_started(tool, proc)
+            with self._lock:
+                self._processes.pop(tool.app_id, None)
             return
 
-        if tool.watches_window:
-            running = _running_for_app(tool, proc.pid)
+        if how in ("window", "alive") and not tool.is_app:
+            # ブラウザーで使うツールが、自分の窓を出した。画面はツールの窓
+            # なので**ランチャーはブラウザーを開かない** (開けば画面が2枚)
+            running = _running_from_health(tool, {}, launch_pid=proc.pid)
+            running.pid = proc.pid
+            running.confirmed = False
+        elif how in ("window", "alive"):
+            # 窓が出た (またはプロセスが動いている)。起動確認はまだでも、
+            # 利用者の前にはもう画面がある。**動いているものとして扱う**
+            # ── 起動中の窓を出したままにしない・もう一度押しても2つ目を
+            # 起こさない。起動確認は見回りのなかで続ける
+            running = _running_for_app(tool, proc.pid,
+                                       confirmed=not tool.health_url)
         else:
             running = _running_from_health(tool, payload, launch_pid=proc.pid)
+            if tool.is_app and int(payload.get("port") or 0) != tool.port \
+                    and payload.get("_health_url"):
+                window_note = _port_note(tool, int(payload["port"]))
         with self._lock:
             self._running[tool.app_id] = running
             self._failures[tool.app_id] = 0
@@ -855,10 +1055,15 @@ class ToolManager:
                     version=str(payload.get("version") or ""),
                     elapsed=time.monotonic() - started)
 
-        if tool.is_app:
-            # **ブラウザーは開かない。** アプリの窓が画面
+        if window_note and "ポート" in window_note:
+            trace.event("ポートちがい", trace.WARNING, tool=running, op=op,
+                        cause=f"設定のポート {tool.port} ではなく {running.port} で応答")
+        if tool.is_app or how == "window":
+            # **ブラウザーは開かない。** アプリ (ツール自身) の窓が画面
             runtime_state.put(running)
-            desktop.bring_to_front(running.window_pid)
+            pids = self._tool_pids(running)
+            if pids:
+                desktop.bring_to_front(pids)
             self._set(State.RUNNING, self.summary(), tool, detail=window_note,
                       elapsed=time.monotonic() - started, responding=True)
             return
@@ -879,9 +1084,10 @@ class ToolManager:
         # なので、書いておかないとそちらから画面を閉じられない
         runtime_state.put(running)
 
-        detail = ""
+        detail = window_note
         if not tool.suppresses_browser:
-            detail = _tool_opens_browser_note(tool)
+            detail = "\n\n".join(x for x in (window_note,
+                                               _tool_opens_browser_note(tool)) if x)
         elif not running.browser_managed:
             detail = ("画面は既定のブラウザーで開きました。\n"
                       "止めるときに自動では閉じないので、"
@@ -889,45 +1095,97 @@ class ToolManager:
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
                   elapsed=time.monotonic() - started, responding=True)
 
-    def _wait_window(self, tool: Tool, proc: subprocess.Popen, timeout: float,
-                     early_exit: dict) -> tuple[bool, str]:
-        """アプリの窓が出るまで待つ。`(起動できたか, 案内)`。
+    def _wait_app(self, tool: Tool, proc: subprocess.Popen, timeout: float,
+                  early_exit: dict, seen: dict,
+                  op: Optional[trace.Operation] = None
+                  ) -> tuple[str, Optional[dict], str]:
+        """自分の窓を出すアプリの起動を待つ。`(どう起動したか, 応答, 案内)`。
 
-        Web サーバーを持たないアプリには `/api/health` が無い。**窓が
-        出たこと**で起動を確かめる。窓が出る前に exe が終われば失敗
-        (戻り値を `early_exit` に入れる)。
+        どう起動したか:
 
-        待っても窓が出ないが、プロセスは生きている ── 通知領域にだけ
-        入るアプリかもしれない。**失敗にはしない** (動いているものを
-        「起動できませんでした」と言うと、利用者はもう一度押して
-        2つ目を起こす)。案内を添えて、動いているものとして扱う。
+            "health"    起動確認が答えた (別のポートで答えたものも含む)
+            "window"    **ツールの窓が出た** (起動確認はまだでもよい)
+            "alive"     窓も応答も確かめられないが、ツールのプロセスは動いている
+            "failed"    ツールのプロセスが無くなった
+            "cancelled" 待っているあいだに「やめる」と言われた
+
+        **起動した exe がすぐ終わる作り**がある (本体を別に起こして戻り値 0 で
+        終わる)。起こした exe だけを見ず、ツールのフォルダーから起動した
+        プロセスと、その子・孫を見る。窓が出たら、それ以上待たせない
+        (起動中の窓が、出てきたツールの画面の上に居座らないように)。
         """
-        limit = min(timeout, APP_WINDOW_WAIT_SEC)
+        folder = _own_folder(tool)
+        limit = timeout if tool.health_url else min(timeout, APP_WINDOW_WAIT_SEC)
         began = time.monotonic()
+        next_look = began + DISCOVER_EVERY_SEC
+        exited_at: Optional[float] = None
         while True:
             if tool.app_id in self._cancelled:
-                return False, ""
+                return "cancelled", None, ""
+            elapsed = time.monotonic() - began
             code = proc.poll()
             if code is not None:
                 early_exit["code"] = code
-                return False, ""
-            elapsed = time.monotonic() - began
-            shown = desktop.has_window(proc.pid)
-            self._set(State.STARTING, f"{tool.display_name}の窓が出るのを待っています...",
-                      tool, elapsed=elapsed, phase=PHASE_WAIT,
-                      stage="窓が出るのを待っています", timeout=limit)
+                exited_at = exited_at or time.monotonic()
+            pids = desktop.related_pids(folder, {proc.pid})
+            if not pids:
+                if code is not None and (
+                        code != 0 or time.monotonic() - exited_at >= STUB_GRACE_SEC):
+                    return "failed", None, ""
+            elif code is not None:
+                early_exit.pop("code", None)  # 起動用の exe。本体は動いている
+
+            payload = None
+            if tool.health_url:
+                payload = health.probe(tool.health_url)
+                if payload:
+                    if "payload" not in seen and op is not None:
+                        op.step(f"初めて応答あり ({elapsed:.1f}秒): "
+                                f"app_id={payload.get('app_id', '?')}")
+                    seen["payload"] = payload
+                if health.is_tool(payload, tool.app_id) and health.is_ready(payload):
+                    return "health", payload, ""
+                if pids and time.monotonic() >= next_look:
+                    next_look = time.monotonic() + DISCOVER_EVERY_SEC
+                    found = self._discover(tool, pids)
+                    if found is not None and health.is_ready(found):
+                        return "health", found, ""
+
+            shown = desktop.has_window(pids) if pids else False
+            if not shown and elapsed >= 1.0 and _title_windows(tool):
+                shown = True                  # 窓の持ち主はたどれないが、題名で出ている
+            stage = health.stage_text(payload) or "窓が出るのを待っています"
+            self._set(State.STARTING, f"{tool.display_name}: {stage}", tool,
+                      elapsed=elapsed, phase=PHASE_WAIT, stage=stage, timeout=limit)
             if shown:
                 log.info("窓が出ました: %s (%.1f秒)", tool.display_name, elapsed)
-                return True, ""
-            if shown is None and elapsed >= APP_SETTLE_SEC:
-                return True, ""               # 窓を見られない環境。生きていればよい
+                return "window", None, ""
+            if shown is None and not tool.health_url and pids \
+                    and elapsed >= APP_SETTLE_SEC:
+                return "window", None, ""     # 窓を見られない環境。生きていればよい
             if elapsed >= limit:
-                log.warning("窓が出ませんが、プロセスは動いています: %s",
-                            tool.display_name)
-                return True, (f"{tool.display_name}は動いていますが、"
-                              f"{limit:.0f}秒待っても窓が出ませんでした。\n"
-                              "通知領域 (画面右下の ^) に入っていないか見てください。")
+                if pids:
+                    log.warning("窓も応答もありませんが、動いています: %s",
+                                tool.display_name)
+                    return "alive", None, (
+                        f"{tool.display_name}は動いていますが、{limit:.0f}秒待っても"
+                        "窓も起動確認の応答もありませんでした。\n"
+                        "通知領域 (画面右下の ^) に入っていないか見てください。"
+                        + (f"\n起動確認: {tool.health_url}" if tool.health_url else ""))
+                return "failed", None, ""
             time.sleep(0.25)
+
+    def _kill_started(self, tool: Tool, proc: subprocess.Popen) -> None:
+        """起動しかけて応答しないまま動いているものを片付ける (起こしたものだけ)。"""
+        tree = desktop.process_tree({proc.pid})
+        log.info("起動できなかった %s のプロセスを片付けます: %s",
+                 tool.app_id, sorted(tree))
+        for pid in sorted(tree, reverse=True):
+            process_manager._terminate(pid, force=True)
+        try:
+            proc.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _spawn(self, tool: Tool,
                op: Optional[trace.Operation] = None) -> Optional[subprocess.Popen]:
@@ -1043,7 +1301,7 @@ class ToolManager:
         out_path = tool_log_path(tool.app_id)
         tail = trace.tail_lines(out_path)
         error = trace.error_line(tail)
-        if tool.watches_window:
+        if tool.is_app:
             self._report_app_failure(tool, early_exit.get("code"), elapsed,
                                      error=error, out_path=out_path, op=op)
             return
@@ -1242,6 +1500,9 @@ class ToolManager:
         answers = _probe_running([r for _, r in targets])
 
         for app_id, running in targets:
+            if not running.confirmed:
+                self._watch_unconfirmed(running, bool(answers.get(app_id)))
+                continue
             if running.is_app:
                 alive = self._app_alive(running)
                 if alive is False:
@@ -1266,6 +1527,76 @@ class ToolManager:
                 continue                      # まだ判断しない
             self._lost(running, count)
         return bool(self._running)
+
+    def _watch_unconfirmed(self, running: RunningTool, answered: bool) -> None:
+        """起動確認がまだ取れていないツール (窓が出た・動いているので起動
+        済みとみなしたもの) を見る。
+
+        **応答が無いことを「落ちた」とは判断しない** ── まだ準備中か、
+        設定のポートが違うだけかもしれない。生死はプロセスで見る。起動の
+        上限を過ぎても答えなければ、本当のポートを探し、見つからなければ
+        1回だけ知らせる。
+        """
+        app_id = running.app_id
+        name = running.display_name or app_id
+        if answered:
+            running.confirmed = True
+            runtime_state.put(running)
+            log.info("起動を確かめました: %s", running.summary())
+            trace.event("起動を確かめた", trace.OK, tool=running)
+            self._set(State.RUNNING, self.summary(), running, responding=True)
+            return
+        if not self._tool_alive(running):
+            if running.is_app:
+                self._app_ended(running)
+                return
+            self._forget(app_id)
+            trace.event("自動終了", trace.INFO, tool=running,
+                        cause="起動を確かめられないまま終わった")
+            self._set(self._settled_state(), f"{name}は終了しました", running)
+            return
+        limit = float(app_config.ui_setting("start_timeout_seconds"))
+        if not running.health_url or app_id in self._unhealthy \
+                or time.time() - running.started_at < limit:
+            return
+        self._unhealthy.add(app_id)
+        tool = tool_registry.get(app_id)
+        found = self._discover(tool, self._tool_pids(running)) if tool else None
+        if found is not None:
+            port = int(found["port"])
+            running.port = port
+            running.health_url = found.get("_health_url") or running.health_url
+            running.url = f"http://127.0.0.1:{port}/"
+            running.confirmed = True
+            runtime_state.put(running)
+            trace.event("ポートちがい", trace.WARNING, tool=running,
+                        cause=f"設定のポート {tool.port} ではなく {port} で応答")
+            self._set(State.RUNNING, self.summary(), running, responding=True,
+                      detail=_port_note(tool, port))
+            return
+        ports = desktop.listening_ports(self._tool_pids(running))
+        listening = "、".join(str(p) for _, p in ports) or "なし"
+        path = trace.incident(
+            f"{name}の起動を確かめられない", tool=running,
+            whys=[f"起動確認 ({running.health_url}) に、{limit:.0f}秒たっても応答が無い",
+                  f"ツールのプロセスは動いている (待ち受けているポート: {listening})"],
+            hints=["設定のポートが、ツールの使うポートと同じか (［設定］のポート)",
+                   "ツールに起動確認 (/api/health) があるか。無ければポートを空にする"
+                   " (窓で起動を確かめる)"],
+            observed=[("起動確認", running.health_url),
+                      ("待ち受けているポート", listening)],
+            tool_log=tool_log_path(app_id))
+        trace.event("起動を確かめられない", trace.WARNING, tool=running,
+                    cause=f"待ち受けているポート: {listening}", incident=path)
+        if running.is_app:
+            # 以後はプロセスと窓で見る (応答が無いたびに知らせない)
+            running.health_url = ""
+            runtime_state.put(running)
+        self._set(State.RUNNING, self.summary(), running, responding=True,
+                  incident=path,
+                  detail=(f"{name}は動いていますが、起動確認 (ポート {running.port or '?'})"
+                          f" に応答しません。\n待ち受けているポート: {listening}\n"
+                          "［設定］のポートを確かめてください。\n" + _records_note(path)))
 
     def _watch_browser(self, running: RunningTool) -> None:
         """画面を閉じたら知らせる。**閉じるとツールはまもなく自分で終わる。**
@@ -1300,11 +1631,14 @@ class ToolManager:
         ハンドル) で答える。** 道の書き方の違いや PID の使い回しに
         左右されない。ランチャーの外で起動されたものは、exe の道で確かめる。
         """
+        if not running.is_app:
+            return None
         with self._lock:
             proc = self._processes.get(running.app_id)
-        if proc is not None and proc.pid == running.window_pid:
-            return proc.poll() is None
-        return process_manager.app_alive(running)
+        if proc is not None and proc.poll() is None:
+            return True
+        # 起こした exe が終わっていても、本体が動いていれば動いている
+        return bool(self._tool_pids(running))
 
     def _app_ended(self, running: RunningTool) -> None:
         """アプリの窓が閉じられた (プロセスが終わった)。
@@ -1554,6 +1888,12 @@ def _running_from_health(tool: Tool, payload: Optional[dict],
     payload = payload or {}
     port = int(payload.get("port") or tool.port or 0)
     url = f"http://127.0.0.1:{port}/" if port else tool.home_url
+    health_url = tool.health_url
+    if payload.get("_health_url"):
+        # 設定とは別のポートで答えた。**答えた場所**を記録する
+        health_url = payload["_health_url"]
+        base = health_url.split("/", 3)
+        url = "/".join(base[:3]) + "/"
     return RunningTool(
         app_id=tool.app_id,
         display_name=tool.display_name,
@@ -1561,7 +1901,7 @@ def _running_from_health(tool: Tool, payload: Optional[dict],
         launch_pid=launch_pid,
         port=port,
         url=url,
-        health_url=tool.health_url,
+        health_url=health_url,
         app_root=str(payload.get("app_root") or tool.resolved_work_dir),
         start_command=tool.start_command,
         work_dir=tool.resolved_work_dir,
@@ -1571,8 +1911,12 @@ def _running_from_health(tool: Tool, payload: Optional[dict],
     )
 
 
-def _running_for_app(tool: Tool, pid: int) -> RunningTool:
-    """Web サーバーを持たないアプリの記録。PIDは exe そのもの。"""
+def _running_for_app(tool: Tool, pid: int, *,
+                     confirmed: Optional[bool] = None) -> RunningTool:
+    """窓 (またはプロセス) で起動を確かめたアプリの記録。PIDは exe そのもの。
+
+    起動確認 (/api/health) があるのにまだ答えていなければ `confirmed` は偽。
+    """
     return RunningTool(
         app_id=tool.app_id,
         display_name=tool.display_name,
@@ -1587,22 +1931,70 @@ def _running_for_app(tool: Tool, pid: int) -> RunningTool:
         stop_command=tool.stop_command,
         stop_method=tool.stop_method,
         ui_mode=tool_registry.UI_APP,
+        confirmed=(not tool.health_url) if confirmed is None else confirmed,
     )
 
 
 def _find_app_pid(tool: Tool) -> int:
-    """その exe を実行しているプロセス。無ければ 0。"""
+    """そのアプリのプロセス。exe そのものが動いていればそれ、無ければ
+    ツールのフォルダーから起動したもの。無ければ 0。"""
     exe = tool.start_command.strip().strip('"')
     if not exe.lower().endswith(".exe"):
         return 0
     pids = desktop.find_by_exe(exe)
-    return pids[0] if pids else 0
+    if pids:
+        return pids[0]
+    folder = _own_folder(tool)
+    pids = desktop.processes_in_folder(folder) if folder else []
+    return min(pids) if pids else 0
 
 
 def _find_running_app(tool: Tool) -> Optional[RunningTool]:
     """ランチャーの外で動いている、そのアプリ。無ければ None。"""
     pid = _find_app_pid(tool)
     return _running_for_app(tool, pid) if pid else None
+
+
+def _own_folder(item) -> str:
+    """そのツールのフォルダー。**ほかのツールと共有していれば空**
+    (フォルダーでツールを見分けられない)。`Tool` でも `RunningTool` でもよい。"""
+    if isinstance(item, RunningTool):
+        folder = process_manager.app_folder(item)
+    else:
+        folder = item.resolved_work_dir
+    if not folder:
+        return ""
+    try:
+        if tool_registry.shared_folder(folder, item.app_id):
+            return ""
+    except Exception:                         # noqa: BLE001 - 分からなければ使わない
+        return ""
+    return folder
+
+
+def _title_windows(tool: Tool) -> list[int]:
+    """題名がツールの表示名そのもの (か「表示名 - …」) の窓。
+
+    ツールの画面がふだんのブラウザーの窓だと、窓の持ち主はブラウザー本体で
+    ツールのプロセスからたどれない。**前に出す・出たかを見るだけ**に使う。
+    """
+    name = (tool.display_name or "").strip()
+    found = desktop.windows_by_title(name) if len(name) >= 2 else None
+    return [hwnd for hwnd, title in (found or [])
+            if title.strip() == name or title.startswith(name + " - ")
+            or title.startswith(name + " ー ")]
+
+
+def _front_by_title(tool: Tool) -> bool:
+    windows = _title_windows(tool)
+    return bool(windows) and desktop.activate(windows[0])
+
+
+def _port_note(tool: Tool, port: int) -> str:
+    """設定と違うポートで動いていたときの案内。"""
+    return (f"{tool.display_name}は、設定のポート {tool.port or '(空)'} ではなく "
+            f"{port} で動いています。\n［設定］でポートを {port} にすると、"
+            "起動の確認が早くなります。")
 
 
 def _launched_exe(record: Optional[RunningTool]) -> bool:
@@ -1672,10 +2064,15 @@ def tool_log_path(app_id: str) -> Path:
 
 
 def _records_note(incident: str) -> str:
-    """案内の末尾に付ける「記録の場所」。"""
+    """案内の末尾に付ける「記録の場所」。
+
+    **ほかのアプリから見た場所** (`trace.real_path`) を書く。Microsoft Store
+    版の Python では、ランチャーに見える場所をエクスプローラで探しても
+    見つからない。中身は［詳細］でランチャーが読んで見せる。
+    """
     if incident:
-        return f"障害記録: {incident}"
-    return f"ランチャーのログ: {trace.destination().path}"
+        return f"障害記録: {trace.real_path(incident)}"
+    return f"ランチャーのログ: {trace.real_path(trace.destination().path)}"
 
 
 def _describe_payload(payload: Optional[dict]) -> str:
