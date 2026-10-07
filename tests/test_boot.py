@@ -67,11 +67,21 @@ class BootTests(LocalAreaTestCase):
         self.assertTrue(result.started)
 
     def test_途中で失敗したらロックを外す(self) -> None:
-        with mock.patch.object(ToolManager, "adopt_running",
-                               side_effect=RuntimeError("壊れた")):
+        with mock.patch.object(tool_registry, "initialize",
+                               side_effect=RuntimeError("設定DBが壊れた")):
             with self.assertRaises(RuntimeError):
                 boot.run()
         self.assertFalse(launch_guard.lock_path().exists())
+
+    def test_引き継ぎに失敗しても起動する(self) -> None:
+        """1つのツールの記録や置き場所がおかしいだけで、全部を使えなくしない。"""
+        with mock.patch.object(ToolManager, "adopt_running",
+                               side_effect=RuntimeError("壊れた記録")):
+            result = boot.run()
+        self.assertTrue(result.started)
+        self.assertIsNotNone(result.manager)
+        self.assertIn("動いているツールを確かめられませんでした",
+                      [title for title, _ in result.warnings])
 
     def test_別スレッドで回しても段が届く(self) -> None:
         """起動中の窓と同じ回し方 (別スレッド + キュー)。"""

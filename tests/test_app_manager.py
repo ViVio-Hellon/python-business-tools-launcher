@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -537,6 +538,43 @@ class ShutdownTests(ManagerTestCase):
             self.assertTrue(process_manager.is_running(running))
         # 記録も残る。次にランチャーを開いたとき引き継げる
         self.assertEqual(set(runtime_state.read_all()), {"fake.keep1", "fake.keep2"})
+
+    def starting_in_background(self, tool) -> threading.Thread:
+        """起動を始め、`start.bat` を実行したところまで待つ。"""
+        worker = threading.Thread(target=self.manager._select_blocking,
+                                  args=(tool,), daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 5
+        while tool.app_id not in self.manager._processes \
+                and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.manager.starting_ids, [tool.app_id])
+        self.addCleanup(worker.join, 10)
+        return worker
+
+    def test_いいえなら起動の最中のツールもやめさせない(self) -> None:
+        """以前は「動かしたまま」を選んでも、起動中のツールは起動をやめていた。"""
+        tool = self.register("fake.midway", "看板", ready_after=1.0)
+        worker = self.starting_in_background(tool)
+
+        self.assertTrue(self.manager.shutdown(stop_tools=False))
+        worker.join(10)
+        self.assertIn(tool.app_id, self.manager.running, "起動をやめさせました")
+        running = self.manager.running[tool.app_id]
+        self.assertTrue(process_manager.is_running(running))
+        # 後始末: ツールを止めてから、手放した start.bat を引き取る
+        process_manager.stop(running, force=True, timeout=5)
+        for proc in list(app_manager._DETACHED):
+            app_manager._DETACHED.remove(proc)
+            proc.wait(timeout=10)
+
+    def test_はいなら起動の最中のツールは片付けてから閉じる(self) -> None:
+        tool = self.register("fake.midway2", "看板", ready_after=30)
+        self.starting_in_background(tool)
+
+        self.assertTrue(self.manager.shutdown(stop_tools=True))
+        self.assertEqual(self.manager.starting_ids, [])
+        self.assertFalse(health.is_tool(health.probe(tool.health_url), tool.app_id))
 
     def test_ツールごと閉じられる(self) -> None:
         a = self.register("fake.both1", "日報")

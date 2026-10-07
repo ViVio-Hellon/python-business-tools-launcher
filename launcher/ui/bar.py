@@ -21,11 +21,12 @@ from tkinter import font as tkfont
 from tkinter import messagebox
 from typing import Optional
 
-from .. import app_config, logging_utils, tool_registry, trace
+from .. import app_config, fileprobe, logging_utils, tool_registry, trace
 from ..logging_utils import get_logger
 from . import geometry, password, theme
 from .geometry import POSITION_KEY
-from .texts import close_question, fit_text
+from .texts import (CLOSE_CANCEL, CLOSE_DEFAULT, CLOSE_STOP, close_choice,
+                    close_question, fit_text, force_question)
 from .progress_window import ProgressWindow
 from .settings_dialog import SettingsDialog
 from .version_dialog import VersionDialog
@@ -92,6 +93,8 @@ class LauncherBar:
         self._engaged = False
         # 生存監視が回っている最中か (重ねて走らせない)
         self._polling = False
+        # 閉じる処理の最中か。**× を続けて押しても2回走らせない**
+        self._closing = False
         self._save_handle = None
         # 自分で動かしている最中か。**利用者のドラッグと区別する印**
         self._programmatic = False
@@ -112,6 +115,10 @@ class LauncherBar:
         self.root.bind("<Configure>", self._on_configure)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 起動の下ごしらえで決まった状態を出す (引き継いだツール・確かめられ
+        # ない起動ファイルの案内)。**この窓ができる前に出た知らせ**なので、
+        # 待っていても届かない
+        self._render(self.manager.status)
         self.root.after(DRAIN_MS, self._drain)
         self.root.after(self._poll_interval_ms(), self._poll_health)
 
@@ -212,6 +219,9 @@ class LauncherBar:
                      bg=theme.BG, fg=theme.MUTED, font=theme.FONT).pack(side="left")
             return
 
+        # 起動ファイルは**まとめて同時に**確かめる (全体で数秒まで)。古い
+        # 置き場所がつながらない共有フォルダーでも、バーが固まらない
+        files = fileprobe.probe_many(t.start_command for t in tools)
         for tool in tools:
             button = self._tool_button(
                 tool.display_name,
@@ -220,7 +230,11 @@ class LauncherBar:
             self.buttons[tool.app_id] = button
             self._names[tool.app_id] = tool.display_name
             self._order.append(tool.app_id)
-            self._configured[tool.app_id] = tool.is_configured
+            found = files.get(tool.start_command.strip().strip('"'))
+            # 確かめられないものは「未設定」(茶) にしない。**設定はある** ──
+            # 押せば、確かめられない理由を出す
+            self._configured[tool.app_id] = bool(found) and (found.found
+                                                              or found.unknown)
         self._apply_overflow()
         self._paint_buttons(self.manager.status)
 
@@ -661,34 +675,75 @@ class LauncherBar:
             pass
 
     def on_close(self) -> None:
-        """「終了」またはウィンドウを閉じたとき。
+        """「終了」またはウィンドウの × (Alt+F4・タスクバーの「閉じる」も)。
 
-        **業務ツールまで止めるかを尋ねる。** ブラウザーを閉じることと
+        **どれも同じ確かめを通る** (`WM_DELETE_WINDOW` もここへ結んである)。
+        業務ツールまで止めるかを尋ねる。ブラウザーを閉じることと
         バックエンドを止めることは別 (要件定義書 §11) なので、ランチャー
         だけ終わらせたい場面がある。止めずに閉じたツールは:
 
         * そのまま使い続けられる (画面も残る)
         * 画面を閉じれば、そのツールは自分で終わる
         * 次にランチャーを起動したとき引き継ぐ (二重に起動しない)
+
+        **× は「終了」ボタンと違い、設定画面などを開いているあいだも押せる**
+        (Windows ではその窓だけが前を塞ぎ、バーの × は生きている)。そのまま
+        閉じると、開いている画面の下でランチャーが消える。開いている画面を
+        前に出して、閉じない。
         """
+        if self._closing:
+            return
+        modal = self._modal_window()
+        if modal:
+            log.info("設定画面などを開いているので閉じません: %s", modal)
+            self._raise_modal(modal)
+            return
+        self._closing = True
+        try:
+            self._close()
+        finally:
+            self._closing = False
+
+    def _modal_window(self) -> str:
+        """前を塞いでいる (入力を独り占めしている) 窓の名前。無ければ空。"""
+        try:
+            names = [str(item) for item in
+                     self.root.tk.splitlist(self.root.tk.call("grab", "current"))]
+        except tk.TclError:
+            return ""
+        names = [name for name in names if name and name != "."]
+        return names[0] if names else ""
+
+    def _raise_modal(self, name: str) -> None:
+        try:
+            self.root.tk.call("raise", name)
+            self.root.tk.call("focus", "-force", name)
+            self.root.bell()
+        except tk.TclError:
+            pass
+
+    def _close(self) -> None:
         running = self.manager.running
-        stop_tools = False
-        if running:
-            names = "、".join(r.display_name or a for a, r in running.items())
+        starting = [a for a in self.manager.starting_ids if a not in running]
+        names = "、".join(r.display_name or a for a, r in running.items())
+        starting_names = "、".join(self._names.get(a, a) for a in starting)
+        choice = None
+        if running or starting:
             answer = messagebox.askyesnocancel(
                 app_config.display_name(),
-                close_question(names),
-                parent=self.root)
-            if answer is None:
+                close_question(names, starting_names),
+                # **既定のボタンを「はい」(全部止める) にしない**
+                default=CLOSE_DEFAULT, parent=self.root)
+            choice = close_choice(answer)
+            if choice == CLOSE_CANCEL:
                 return
-            stop_tools = bool(answer)
+        stop_tools = choice == CLOSE_STOP
 
         log.info("ランチャーを終了します (ツールも停止=%s)", stop_tools)
-        names = "、".join(r.display_name or a for a, r in running.items())
         trace.event("ランチャー終了", trace.INFO,
                     cause=("ツールも止める" if stop_tools else
-                           "ツールは動かしたまま" if running else ""),
-                    detail=names)
+                           "ツールは動かしたまま" if running or starting else ""),
+                    detail="、".join(x for x in (names, starting_names) if x))
         if stop_tools:
             self._set_status_text("stopping", "ツールを終了しています...")
             self.root.update_idletasks()
@@ -698,12 +753,15 @@ class LauncherBar:
             # **黙って閉じない** ── 止めたつもりで残るのがいちばん困る
             detail = self.manager.status.detail or "終了できませんでした。"
             if not messagebox.askyesno(
-                    app_config.display_name(),
-                    f"{detail}\n\n中断して終了しますか?\n"
-                    "「いいえ」を選ぶと、ツールを動かしたままにします。",
-                    parent=self.root):
+                    app_config.display_name(), force_question(detail),
+                    # 中断は取り返しがつかない。**既定は「いいえ」**
+                    icon="warning", default="no", parent=self.root):
+                trace.event("ランチャー終了", trace.CANCELLED,
+                            cause="実行中の処理を中断しないことを選んだ")
                 self._render(self.manager.status)
                 return
+            trace.event("強制終了を選んだ", trace.WARNING,
+                        cause="ランチャーを閉じるとき、実行中の処理を中断")
             if not self.manager.shutdown(stop_tools=True, force=True):
                 messagebox.showerror(
                     app_config.display_name(),

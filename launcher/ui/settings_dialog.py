@@ -20,12 +20,13 @@
 """
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .. import app_config, distribution, tool_registry, trace
+from .. import app_config, distribution, fileprobe, tool_registry, trace
 from ..logging_utils import get_logger
 from ..tool_registry import STOP_METHODS, UI_LABELS, Tool
 from . import password, theme
@@ -293,7 +294,7 @@ class SettingsDialog:
         start = trace.expand_dir(current) if current else trace.local_dir()
         chosen = filedialog.askdirectory(
             parent=self.top, title="ログの出力先",
-            initialdir=str(start if start.exists() else Path.home()))
+            initialdir=str(start if os.path.isdir(start) else Path.home()))
         if chosen:
             self.log_dir_var.set(str(Path(chosen)))
 
@@ -667,7 +668,7 @@ class _ToolRow:
         """［自動］。いまの起動ファイルから起動引数を決め直す。"""
         args, reason = tool_registry.recommend_start_args(
             self.path_var.get().strip().strip('"'))
-        if Path(self.path_var.get().strip().strip('"')).is_file():
+        if fileprobe.is_file(self.path_var.get()):
             self.args_var.set(args)
         self.show_note(reason)
 

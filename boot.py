@@ -84,6 +84,8 @@ def run(report: Report = lambda step: None, *,
                     detail=guard.reason)
         return result
     log.info("多重起動の判定: %s", guard.reason)
+    if guard.warning:
+        result.warnings.append(("二重起動を確かめられません", guard.warning))
     result.started = True
 
     try:
@@ -94,11 +96,27 @@ def run(report: Report = lambda step: None, *,
         from app_manager import ToolManager
 
         manager = ToolManager()
-        # すでに動いているツールがあれば引き継ぐ (要件定義書 §9)
-        manager.adopt_running()
+        # すでに動いているツールがあれば引き継ぐ (要件定義書 §9)。
+        # **ここで失敗してもランチャーは起動する** ── 1つのツールの記録や
+        # 置き場所がおかしいだけで、全部のツールが使えなくなるほうが困る
+        try:
+            manager.adopt_running()
+        except Exception as exc:              # noqa: BLE001
+            log.exception("動いているツールの引き継ぎに失敗しました")
+            path = trace.unexpected("動いているツールの引き継ぎ", exc)
+            result.warnings.append((
+                "動いているツールを確かめられませんでした",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "ランチャーは起動します。すでに動いているツールのボタンを押すと、"
+                "二重に起動することがあります。"
+                + (f"\n\n障害記録: {path}" if path else "")))
         result.manager = manager
 
         enter(BAR)
+        # 起動ファイルを**ここで**確かめておく (起動中の窓が出ているあいだ)。
+        # 古い置き場所がつながらないと、問い合わせに数十秒かかることがある。
+        # バーを作るときに待たせない (確かめられなかった場所は覚えておく)
+        _check_start_files(manager)
         # 画面の部品を読み込んでおく。窓を作るのは呼び出し側 (メインスレッド)。
         # 読めなくてもここでは止めない ── 呼び出し側がもう一度読み込み、
         # そこで理由つきで失敗する (tkinter の無い試験環境でも段を確かめられる)
@@ -121,6 +139,37 @@ def run(report: Report = lambda step: None, *,
                         f" / 記録の置き場所 {trace.destination().describe()}"),
                 elapsed=clock() - started_at)
     return result
+
+
+def _check_start_files(manager) -> None:
+    """起動ファイルを確かめ、**確かめられないもの**をバーの［詳細］に出す。
+
+    ツールを別の場所へ移したあと、古い置き場所 (つながらない共有フォルダー・
+    アクセス権を外されたフォルダー) が設定に残っていることが多い。黙って
+    いると、押したときに初めて分かる。
+    """
+    from launcher import fileprobe, tool_registry
+
+    try:
+        tools = [t for t in tool_registry.all_tools() if t.start_command.strip()]
+        files = fileprobe.probe_many(t.start_command for t in tools)
+    except Exception:                         # noqa: BLE001 - 確かめられなくても起動する
+        log.warning("起動ファイルを確かめられませんでした", exc_info=True)
+        return
+    lines = []
+    for tool in tools:
+        found = files.get(tool.start_command.strip().strip('"'))
+        if found is None or not found.unknown:
+            continue
+        lines.append(f"・{tool.display_name}: {tool.start_command}\n  ({found.reason})")
+        trace.event("起動ファイルを確かめられない", trace.WARNING, tool=tool,
+                    cause=found.reason, detail=tool.start_command)
+    if lines:
+        manager.notify(
+            "次のツールの起動ファイルを確かめられません:\n" + "\n".join(lines)
+            + "\n\nツールの置き場所が変わっていれば、［設定］の［参照］で"
+              "指定し直してください。共有フォルダーなら、つながっているか"
+              "確かめてください。")
 
 
 def _load_settings(result: BootResult) -> None:

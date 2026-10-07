@@ -41,6 +41,7 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -56,8 +57,9 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 import process_manager  # noqa: E402
-from launcher import (app_config, browser, desktop, health,  # noqa: E402
-                      logging_utils, runtime_state, tool_registry, trace)
+from launcher import (app_config, browser, desktop, fileprobe,  # noqa: E402
+                      health, logging_utils, runtime_state, tool_registry,
+                      trace)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
@@ -229,6 +231,12 @@ class ToolManager:
                 return None
             return max(self._running.values(), key=lambda r: r.started_at)
 
+    @property
+    def starting_ids(self) -> list[str]:
+        """起動している最中のツール (まだ動いている一覧には入っていない)。"""
+        with self._lock:
+            return sorted(a for a in self._starting if a not in self._running)
+
     def is_busy(self, app_id: str) -> bool:
         with self._lock:
             return app_id in self._starting or app_id in self._stopping
@@ -284,6 +292,18 @@ class ToolManager:
             running_ids=running_ids, starting_ids=starting_ids,
             stopping_ids=stopping_ids, focus_id=self._focus,
             incident=incident, ui_mode=ui_mode))
+
+    def notify(self, detail: str) -> None:
+        """全体への案内を出す (起動ファイルを確かめられない、など)。
+
+        いまの案内 (引き継いだツールの説明など) があれば、その後ろに足す。
+        """
+        current = self._status.detail
+        merged = f"{current}\n\n{detail}" if current else detail
+        with self._lock:
+            responding = bool(self._running)
+        self._set(self._settled_state(), self.summary(), detail=merged,
+                  responding=responding)
 
     def summary(self) -> str:
         """「動作中：日報、看板」。何も動いていなければ「起動していません」。"""
@@ -509,6 +529,10 @@ class ToolManager:
         threading.Thread(target=self._stop_all_blocking, kwargs={"force": force},
                          name="stop-all", daemon=True).start()
 
+    # 起動をやめさせたツールが片付くのを待つ上限 (秒)。起動を待つ見回りは
+    # 0.5 秒ごとなのですぐ気づくが、立ち上がりかけていれば止めにいくので少し長め
+    CANCEL_WAIT_SEC = 15.0
+
     def _stop_all_blocking(self, *, force: bool = False) -> bool:
         with self._lock:
             self._cancelled.update(self._starting)
@@ -516,7 +540,25 @@ class ToolManager:
         op = trace.operation("すべて停止")
         results = [self._stop_blocking(app_id, force=force, op=op)
                    for app_id in targets]
-        return all(results)
+        return all(results) and self._wait_starts_cancelled()
+
+    def _wait_starts_cancelled(self) -> bool:
+        """起動をやめさせたツールが、片付け終わるのを待つ。
+
+        **待たずにランチャーが終わると、片付けの途中で打ち切られる** ──
+        起動しかけたツールが、誰も知らないまま残る。
+        """
+        deadline = time.monotonic() + self.CANCEL_WAIT_SEC
+        while True:
+            with self._lock:
+                left = set(self._starting)
+            if not left:
+                return True
+            if time.monotonic() >= deadline:
+                log.warning("起動をやめさせたツールが片付きません: %s",
+                            "、".join(sorted(left)))
+                return False
+            time.sleep(0.1)
 
     def _stop_blocking(self, app_id: str, *, force: bool = False,
                        op: Optional[trace.Operation] = None) -> bool:
@@ -946,12 +988,12 @@ class ToolManager:
                 observed=[("実行したコマンド", " ".join(command)),
                           ("起動ファイル", tool.start_command),
                           ("ファイルがあるか",
-                           "ある" if Path(tool.start_command.strip().strip('"')).exists()
-                           else "無い"),
+                           fileprobe.probe(tool.start_command).describe()),
                           ("作業フォルダー", work_dir or "-"),
                           ("フォルダーがあるか",
                            "-" if not work_dir else
-                           ("ある" if Path(work_dir).is_dir() else "無い"))],
+                           ("ある" if os.path.isdir(work_dir) else
+                            "無い (または確かめられない)"))],
                 hints=["ファイルの場所が変わっていないか (設定画面の［参照］で指定し直す)",
                        "ウイルス対策ソフトなどに実行を止められていないか"],
                 exc=exc)
@@ -1423,14 +1465,18 @@ class ToolManager:
         """
         if stop_tools:
             return self._stop_all_blocking(force=force)
+        # 「動かしたまま」。**起動の最中のものもやめさせない** ── 以前は
+        # ここで起動をやめさせていて、「いいえ」を選んでも起動中のツールは
+        # 止まっていた。そのまま立ち上がれば、次のランチャーが引き継ぐ
         with self._lock:
-            self._cancelled.update(self._starting)
             pending = list(self._processes)
             running = dict(self._running)
+            starting = set(self._starting)
         for app_id in pending:
-            if _launched_exe(running.get(app_id)):
-                # **exe はツールそのもの。** 引き取ろうとして落とすと、
-                # 動かしたままにしたはずのツールが消える。手放すだけにする
+            if app_id in starting or _launched_exe(running.get(app_id)):
+                # **exe はツールそのもの、起動中のものは起動の途中。**
+                # 引き取ろうとして落とすと、動かしたままにしたはずのツールが
+                # 消える。手放すだけにする
                 with self._lock:
                     proc = self._processes.pop(app_id, None)
                 if proc is not None:

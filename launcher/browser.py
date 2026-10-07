@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import app_config
+from . import app_config, fileprobe
 from .logging_utils import get_logger
 
 log = get_logger("browser")
@@ -135,7 +135,7 @@ def find_browser(preferred: Optional[list[str]] = None) -> tuple[str, str]:
         for candidate in table.get(name, ()):
             if os.name == "nt":
                 path = _expand(candidate)
-                if path and Path(path).is_file():
+                if path and fileprobe.is_file(path):
                     return name, path
             else:
                 found = shutil.which(candidate)
@@ -144,7 +144,8 @@ def find_browser(preferred: Optional[list[str]] = None) -> tuple[str, str]:
 
     # 設定で明示された実行ファイル (見つけられない置き方をしている端末用)
     for extra in _configured_paths():
-        if Path(extra).is_file():
+        # 設定に古い置き場所が残っていても止まらないように (`fileprobe`)
+        if fileprobe.is_file(extra):
             return "custom", extra
     return "", ""
 

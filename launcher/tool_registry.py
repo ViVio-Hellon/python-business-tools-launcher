@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Optional
 
-from . import app_config, distribution
+from . import app_config, distribution, fileprobe
 from .logging_utils import get_logger
 
 log = get_logger("tool_registry")
@@ -206,9 +206,19 @@ class Tool:
 
     @property
     def is_configured(self) -> bool:
-        """起動できる状態か。起動入口が設定され、実在すること。"""
-        path = self.start_command.strip()
-        return bool(path) and Path(path).is_file()
+        """起動できる状態か。起動入口が設定され、実在すること。
+
+        **例外を出さず、待ちすぎない** (`fileprobe`)。古い置き場所が
+        つながらない共有フォルダーやアクセス権の無いフォルダーだと、
+        Windows では問い合わせそのものが失敗したり長く待たされたりする。
+        ここで例外が出るとランチャーのバーが作れず、起動ごと止まる。
+        """
+        return fileprobe.is_file(self.start_command)
+
+    @property
+    def start_file(self) -> "fileprobe.Probe":
+        """起動ファイルを確かめた結果 (ある / 無い / 確かめられない)。"""
+        return fileprobe.probe(self.start_command)
 
     @property
     def entry_kind(self) -> str:
@@ -293,10 +303,14 @@ def validate_start_command(path: str) -> str:
         return "絶対パスで指定してください (例: C:\\業務ツール\\日報\\start.bat)"
     if candidate.suffix.lower() not in ENTRY_SUFFIXES:
         return "拡張子が .bat・.vbs・.exe のファイルを指定してください"
-    if not candidate.exists():
+    found = fileprobe.probe(candidate)
+    if found.state == fileprobe.MISSING:
         return f"ファイルが見つかりません: {candidate}"
-    if not candidate.is_file():
+    if found.state == fileprobe.NOT_FILE:
         return f"ファイルではありません: {candidate}"
+    if found.unknown:
+        return (f"起動ファイルを確かめられません ({found.reason}): {candidate}\n"
+                "ツールの置き場所が変わっていれば、［参照］で指定し直してください")
     return ""
 
 
@@ -325,10 +339,11 @@ def resolve_config_path(text: str) -> str:
     path = Path(expanded)
     if not path.is_absolute():
         path = app_config.APP_ROOT / path
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
+    # **ファイルには問い合わせず、文字の上だけで** `..` を畳む。
+    # `Path.resolve()` は中でファイルを見にいく ── 古い置き場所が
+    # つながらない共有フォルダーだと、そこで数十秒待たされたり、
+    # Windows の Python 3.9 では例外になったりする
+    return os.path.normpath(str(path))
 
 
 def _vbs_forwards_args(path: str) -> bool:
@@ -491,12 +506,16 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
         if validate_app_id(app_id):
             continue
         wanted.add(app_id)
+        # 起動ファイルは**入れるときだけ**確かめる (`_with_start`)。すでに
+        # ある行のために毎回確かめると、設定を読むたびに古い置き場所へ
+        # 問い合わせることになる
         values = _tool_values(item)
         exists = conn.execute("SELECT 1 FROM tools WHERE app_id = ?",
                               (app_id,)).fetchone()
         if exists is None:
             if app_id in seeded:
                 continue                        # その端末で消した
+            values = _with_start(values, item)
             conn.execute(
                 """INSERT INTO tools (app_id, display_name, updated_at)
                    VALUES (?, ?, ?)""",
@@ -506,6 +525,7 @@ def _seed_missing(conn: sqlite3.Connection) -> None:
             added.append(app_id)
         elif from_distribution and app_id in untouched:
             row = untouched[app_id]
+            values = _with_start(values, item)
             if any(row[name] != value for name, value in values.items()):
                 _update_row(conn, app_id, values, now)
                 aligned.append(app_id)
@@ -587,10 +607,13 @@ def _tool_values(item: dict) -> dict:
         values["stop_method"] = item["stop_method"]
     if isinstance(item.get("enabled"), bool):
         values["enabled"] = 1 if item["enabled"] else 0
-    start = _configured_start_command(item)
-    if start:
-        values["start_command"] = start
     return values
+
+
+def _with_start(values: dict, item: dict) -> dict:
+    """起動ファイルも入れる。**この端末に実在するときだけ** (`_configured_start_command`)。"""
+    start = _configured_start_command(item)
+    return {**values, "start_command": start} if start else values
 
 
 def _update_row(conn: sqlite3.Connection, app_id: str, values: dict,
@@ -611,7 +634,7 @@ def _configured_start_command(item: dict) -> str:
     resolved = resolve_config_path(str(item.get("start_command", "")))
     if not resolved:
         return ""
-    return resolved if Path(resolved).is_file() else ""
+    return resolved if fileprobe.is_file(resolved) else ""
 
 
 def _fill_blank_paths(conn: sqlite3.Connection) -> None:
@@ -623,8 +646,14 @@ def _fill_blank_paths(conn: sqlite3.Connection) -> None:
     """
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     filled = []
+    # **空欄の行だけ**確かめる。埋まっている行のために、設定を読むたび
+    # 配布先フォルダの (古いかもしれない) 置き場所へ問い合わせない
+    blank = {row["app_id"] for row in conn.execute(
+        "SELECT app_id FROM tools WHERE start_command = ''")}
     for item in distribution.merged_tools():
         app_id = str(item.get("app_id", "")).strip()
+        if app_id not in blank:
+            continue
         path = _configured_start_command(item)
         if not app_id or not path:
             continue
@@ -671,7 +700,7 @@ def reload_from_distribution() -> list[str]:
     with _connect() as conn:
         for item in distribution.tools():
             app_id = item["app_id"]
-            values = _tool_values(item)
+            values = _with_start(_tool_values(item), item)
             conn.execute(
                 """INSERT OR IGNORE INTO tools (app_id, display_name, updated_at)
                    VALUES (?, ?, ?)""",
@@ -928,7 +957,10 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
     そのものに失敗するので、迷ったら空に倒す。
     """
     path = Path((start_command or "").strip().strip('"'))
-    if not path.is_file():
+    found = fileprobe.probe(path)
+    if found.unknown:
+        return "", f"起動ファイルを確かめられないため、判定できません ({found.reason})"
+    if not found.found:
         return "", "起動ファイルが見つからないため、判定できません"
 
     kind = path.suffix.lower()
@@ -943,7 +975,7 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
     if not forwards:
         hint = ""
         sibling = path.with_name("start.bat")
-        if kind == ".vbs" and sibling.is_file() and _bat_forwards_args(sibling):
+        if kind == ".vbs" and fileprobe.is_file(sibling) and _bat_forwards_args(sibling):
             hint = "（同じフォルダーの start.bat を選ぶと、ランチャーが画面を閉じられます）"
         return "", (f"{path.name} は引数をツールへ渡さないため、空にしました。"
                     "画面はツールが自分で開きます" + hint)
@@ -1257,12 +1289,21 @@ def describe() -> str:
     lines.append(f"このPCのモード: {mode or '(未設定)'}")
     planned = {str(item.get("app_id", "")): str(item.get("start_command", ""))
                for item in distribution.merged_tools()}
-    for tool in all_tools(include_disabled=True):
-        mark = "OK" if tool.is_configured else "未設定"
+    tools = all_tools(include_disabled=True)
+    files = fileprobe.probe_many(t.start_command for t in tools)
+    for tool in tools:
+        found = files.get(tool.start_command.strip().strip('"'))
+        configured = bool(found and found.found)
+        mark = ("OK" if configured else
+                "確認不可" if found and found.unknown else "未設定")
         lines.append(f"  [{mark:>4}] {tool.display_name} ({tool.app_id})")
         lines.append(f"         起動: {tool.start_command or '(未設定)'}")
+        if found and found.unknown:
+            # **古い置き場所**のことが多い。つながらない共有フォルダー・
+            # アクセス権を外されたフォルダー
+            lines.append(f"         [注意] 起動ファイルを確かめられません: {found.reason}")
         want = planned.get(tool.app_id, "")
-        if want and not tool.is_configured:
+        if want and not configured:
             # **配布先フォルダにはあるのに入っていない。** 配置が想定と違う
             resolved = resolve_config_path(want)
             lines.append(f"         配布先フォルダ: {want}")

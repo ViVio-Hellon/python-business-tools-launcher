@@ -319,6 +319,66 @@ def process_image(pid: int) -> str:
         return ""
 
 
+def process_started_at(pid: int) -> Optional[float]:
+    """そのPIDのプロセスが**いつ起動したか** (エポック秒)。分からなければ None。
+
+    PIDは使い回される。記録に残ったPIDのプロセスが、記録を書いたあとで
+    起動していれば、**それは記録を書いた本人ではない** (番号が同じだけ)。
+    外部コマンドを使わずに確かめられるので、コマンドラインが取れない
+    端末でも使える。
+    """
+    if pid <= 0:
+        return None
+    if IS_WINDOWS:
+        return _started_at_windows(pid)
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8",
+                                                   errors="replace")
+        ticks = int(stat.rpartition(")")[2].split()[19])
+        boot = None
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                boot = int(line.split()[1])
+                break
+        if boot is None:
+            return None
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _started_at_windows(pid: int) -> Optional[float]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+            ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                      False, pid)
+        if not handle:
+            return None
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                return None
+            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            # FILETIME は 1601/1/1 からの 100ns 単位
+            return (created - 116444736000000000) / 10_000_000
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:                  # noqa: BLE001
+        log.debug("PID %s の起動時刻を取れませんでした: %s", pid, exc)
+        return None
+
+
 def runs_exe(pid: int, exe_path: str) -> bool:
     """そのPIDが**その exe を実行しているか**。動いていなければ偽。
 

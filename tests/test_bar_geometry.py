@@ -333,3 +333,40 @@ class TextTests(unittest.TestCase):
         self.assertIn("日報、看板", text)
         self.assertIn("自分で終了", text)
         self.assertIn("引き継ぎ", text)
+        self.assertNotIn("起動中", text)
+
+    def test_起動の最中のツールも問いに入れる(self) -> None:
+        from launcher.ui.texts import close_question
+        text = close_question("", "看板")
+        self.assertIn("起動中のツール: 看板", text)
+        self.assertIn("起動をやめる", text)
+        self.assertIn("そのまま起動を続ける", text)
+
+
+class CloseChoiceTests(unittest.TestCase):
+    """閉じるときの答え。**「はい」とはっきり答えたときだけ止める。**"""
+
+    def test_答えをすることに直す(self) -> None:
+        from launcher.ui.texts import (CLOSE_CANCEL, CLOSE_KEEP, CLOSE_STOP,
+                                       close_choice)
+        self.assertEqual(close_choice(True), CLOSE_STOP)
+        self.assertEqual(close_choice(False), CLOSE_KEEP)
+        self.assertEqual(close_choice(None), CLOSE_CANCEL)
+
+    def test_文字で返ってきてもいいえをはいと読まない(self) -> None:
+        """`bool("no")` は真。そのまま読むと**いつも「はい」**になる。"""
+        from launcher.ui.texts import CLOSE_KEEP, CLOSE_STOP, close_choice
+        self.assertEqual(close_choice("no"), CLOSE_KEEP)
+        self.assertEqual(close_choice("yes"), CLOSE_STOP)
+        self.assertEqual(close_choice(""), CLOSE_KEEP)
+
+    def test_既定のボタンははいにしない(self) -> None:
+        from launcher.ui.texts import CLOSE_DEFAULT
+        self.assertNotEqual(CLOSE_DEFAULT, "yes")
+
+    def test_中断の問いはいいえを選んだらどうなるかまで書く(self) -> None:
+        from launcher.ui.texts import force_question
+        text = force_question("日報で実行中の処理があります: 取り込み")
+        self.assertIn("取り込み", text)
+        self.assertIn("失われます", text)
+        self.assertIn("ツールもランチャーもそのまま", text)

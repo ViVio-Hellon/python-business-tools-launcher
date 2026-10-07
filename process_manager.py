@@ -48,7 +48,7 @@ APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from launcher import app_config, desktop, health, runtime_state  # noqa: E402
+from launcher import app_config, desktop, fileprobe, health, runtime_state  # noqa: E402
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 
@@ -269,13 +269,15 @@ def resolve_stop_bat(running: RunningTool) -> Optional[Path]:
     configured = (running.stop_command or "").strip().strip('"')
     if configured:
         path = Path(configured)
-        return path if path.is_file() else None
+        return path if fileprobe.is_file(path) else None
 
     start = (running.start_command or "").strip().strip('"')
     if not start:
         return None
+    # 起動ファイルの隣。**古い置き場所**でつながらなければ、ここは飛ばして
+    # 次の手 (停止要求・PID) へ回る (`fileprobe` は例外を出さない)
     candidate = Path(start).parent / "stop.bat"
-    return candidate if candidate.is_file() else None
+    return candidate if fileprobe.is_file(candidate) else None
 
 
 def _stop_by_bat(running: RunningTool, *, force: bool,

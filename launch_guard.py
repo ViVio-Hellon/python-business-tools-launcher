@@ -8,10 +8,17 @@
 判定は2段構え:
 
     1. ロックファイルのPIDのプロセスが存在するか
-    2. そのプロセスが**このランチャー**か (コマンドラインを照合)
+    2. そのプロセスが**このランチャー**か
 
 1だけでは足りない。PIDは使い回されるので、無関係なプロセスが同じ番号を
 持っていることがある。そうなると、ランチャーが二度と起動しなくなる。
+
+2は**そのプロセスがいつ起動したか**で見分ける (Windows の API を ctypes で
+呼ぶ。外部コマンドは要らない)。ロックを書いたあとで起動したなら別の
+プロセス (番号が同じだけ)、前から動いているならロックを書いた本人。
+コマンドラインも照合に使うが、**wmic が無く PowerShell も禁じられた端末では
+取れない**。起動時刻だけで決められるので、そうした端末でも、電源断などで
+残ったロックのせいで起動できなくなることがない。
 
 業務ツール側の多重起動防止は、それぞれのツールが自分で持っている
 (4つとも同じ起動基盤を使っている)。ここが見るのはランチャー自身だけ。
@@ -20,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -30,7 +38,7 @@ APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from launcher import app_config  # noqa: E402
+from launcher import app_config, desktop  # noqa: E402
 from launcher.logging_utils import get_logger  # noqa: E402
 
 log = get_logger("launch_guard")
@@ -60,6 +68,8 @@ class GuardResult:
     should_start: bool
     reason: str
     existing: Optional[LockInfo] = None
+    # 起動はするが、利用者に知らせたいこと (ロックを片付けられなかった、など)
+    warning: str = ""
 
 
 def lock_path() -> Path:
@@ -102,14 +112,30 @@ def read_lock() -> Optional[LockInfo]:
         return None
 
 
-def remove_lock() -> None:
-    try:
-        lock_path().unlink()
-        log.info("ロックを消しました")
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        log.warning("ロックを消せませんでした: %s", exc)
+def remove_lock() -> str:
+    """ロックを消す。消せなければその理由、消せた (無かった) なら空。
+
+    Windows では、**読み取り専用**になったファイルは消せない
+    (ほかの OS では消せる)。読み取り専用を外してからもう一度試す。
+    """
+    path = lock_path()
+    for attempt in (1, 2):
+        try:
+            path.unlink()
+            log.info("ロックを消しました")
+            return ""
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            if attempt == 1:
+                try:
+                    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                except OSError:
+                    pass
+                continue
+            log.warning("ロックを消せませんでした: %s", exc)
+            return str(exc)
+    return ""
 
 
 def acquire() -> GuardResult:
@@ -149,7 +175,10 @@ def acquire() -> GuardResult:
 
         # すでに誰かが持っている。中身を見て、生きているかを判断する
         verdict = _inspect_existing()
-        if not verdict.should_start:
+        if not verdict.should_start or verdict.warning:
+            # 片付けられないロックなら、取り直しても同じ。**起動は止めない**
+            # ── 「ほかのランチャーが起動したようです」と誤って断ると、
+            # 消せないロック1つでランチャーがずっと使えなくなる
             return verdict
         if attempt == 1:
             # 死んだロックを片付けた。もう一度だけ取りにいく
@@ -173,34 +202,76 @@ def _inspect_existing() -> GuardResult:
     if info is None:
         # ここまで待っても読めない。**本当に壊れている**ので捨ててよい
         log.warning("壊れたロックを片付けます: %s", lock_path())
-        remove_lock()
-        return GuardResult(True, "壊れたロックを片付けました")
+        return _discard("壊れたロックを片付けました")
 
     if info.pid == os.getpid():
         return GuardResult(True, "自分自身のロックです")
 
+    verdict = judge_owner(info)
+    if verdict.should_start:
+        return _discard(verdict.reason)
+    return verdict
+
+
+def _discard(reason: str) -> GuardResult:
+    """残っていたロックを片付ける。**片付けられなくても起動は止めない。**"""
+    problem = remove_lock()
+    if not problem:
+        return GuardResult(True, reason)
+    return GuardResult(
+        True, f"{reason}が、消せませんでした ({problem})",
+        warning=(f"前回のロック ({lock_path()}) を消せませんでした。\n{problem}\n\n"
+                 "ランチャーは起動しますが、二重に起動していないかを確かめられません。"
+                 "\nこのファイルを手で消すか、読み取り専用を外してください。"))
+
+
+# ロックを書いた時刻と、プロセスの起動時刻の比べの余裕 (秒)。
+# 起動してからロックを書くまでは数秒かかるので、逆向きにだけ余裕を見る
+PID_REUSE_MARGIN_SEC = 2.0
+
+
+def judge_owner(info: LockInfo) -> GuardResult:
+    """ロックの持ち主がまだ動いているランチャーか。
+
+    should_start=True なら、そのロックは残りもの (片付けてよい)。
+    **外部コマンドに頼らない判断を先にする** (起動時刻・実行ファイル)。
+    """
     import process_manager
 
     if not process_manager._is_alive(info.pid):
-        remove_lock()
         return GuardResult(True, f"残っていたロックを片付けました (pid={info.pid})")
 
+    started = desktop.process_started_at(info.pid)
+    if started is not None and started > info.started_at + PID_REUSE_MARGIN_SEC:
+        # ロックを書いたあとで起動した = 番号が同じだけの別のプロセス
+        return GuardResult(True, f"残っていたロックを片付けました (pid={info.pid} は"
+                                 "ロックのあとで起動した別のプロセス)")
+
     command = process_manager.process_command_line(info.pid)
-    if command and _looks_like_launcher(command, info):
+    if command:
+        if _looks_like_launcher(command, info):
+            return GuardResult(False,
+                               f"すでに起動しています (pid={info.pid} / "
+                               f"{info.started_text})", info)
+        return GuardResult(True, f"pid={info.pid} は別のプロセスでした")
+
+    # コマンドラインが取れない (wmic も PowerShell も使えない端末)
+    if started is not None:
+        # ロックより前から動いている = **ロックを書いた本人** (動いている
+        # プロセスどうしで同じ番号は使われない)
         return GuardResult(False,
                            f"すでに起動しています (pid={info.pid} / "
                            f"{info.started_text})", info)
-
-    if not command:
-        # 中身を確かめられない。**起動を止めるほうに倒す** ── 本当に
-        # 動いているランチャーを2つにするより、起動しないほうがよい
-        return GuardResult(False,
-                           f"pid={info.pid} が何かを確かめられませんでした。"
-                           f"動いていなければ {lock_path()} を削除してください",
-                           info)
-
-    remove_lock()
-    return GuardResult(True, f"pid={info.pid} は別のプロセスでした")
+    image = desktop.process_image(info.pid)
+    if image and not Path(image).name.lower().startswith("python"):
+        return GuardResult(True, f"pid={info.pid} は別のプロセスでした "
+                                 f"({Path(image).name})")
+    # 中身を確かめられない。**起動を止めるほうに倒す** ── 本当に
+    # 動いているランチャーを2つにするより、起動しないほうがよい
+    return GuardResult(False,
+                       f"pid={info.pid} が何かを確かめられませんでした。"
+                       f"動いていなければ {lock_path()} を削除してください",
+                       info)
 
 
 def _read_lock_settled() -> Optional[LockInfo]:
@@ -218,7 +289,7 @@ def _read_lock_settled() -> Optional[LockInfo]:
         info = read_lock()
         if info is not None:
             return info
-        if not lock_path().exists():
+        if not os.path.exists(lock_path()):
             return None                       # 持ち主が自分で片付けた
         if time.monotonic() >= deadline:
             return None
@@ -238,31 +309,11 @@ def check_existing() -> GuardResult:
     if info.pid == os.getpid():
         return GuardResult(True, "自分自身のロックです")
 
-    # `process_manager` の判定をそのまま使う。**同じ照合を2か所に
-    # 書かない** ── 片方だけ直した状態を作らないため
-    import process_manager
-
-    if not process_manager._is_alive(info.pid):
-        remove_lock()
-        return GuardResult(True, f"残っていたロックを片付けました (pid={info.pid})")
-
-    command = process_manager.process_command_line(info.pid)
-    if command and _looks_like_launcher(command, info):
-        return GuardResult(False,
-                           f"すでに起動しています (pid={info.pid} / "
-                           f"{info.started_text})", info)
-
-    if not command:
-        # 中身を確かめられない。**起動を止めるほうに倒す** ── 本当に
-        # 動いているランチャーを2つにするより、起動しないほうがよい。
-        # 利用者にはPIDと片付け方を出す
-        return GuardResult(False,
-                           f"pid={info.pid} が何かを確かめられませんでした。"
-                           f"動いていなければ {lock_path()} を削除してください",
-                           info)
-
-    remove_lock()
-    return GuardResult(True, f"pid={info.pid} は別のプロセスでした")
+    # `acquire()` と**同じ判断**を使う (片方だけ直した状態を作らない)
+    verdict = judge_owner(info)
+    if verdict.should_start:
+        return _discard(verdict.reason)
+    return verdict
 
 
 def _looks_like_launcher(command: str, info: LockInfo) -> bool:
