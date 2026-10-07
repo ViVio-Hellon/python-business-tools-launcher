@@ -540,6 +540,12 @@ class LauncherBar:
         """
         self._engaged = True
         self._focus_id = app_id
+        if app_id in self.manager.starting_ids:
+            # 起動の最中にもう一度押された。2つ目は起こさない (manager)。
+            # 進み具合の窓を出し直す ── ［隠す］で隠していると、押しても
+            # 何も起きないように見える。ツールの窓がもう出ていれば
+            # manager がそちらを前に出す
+            self.progress.reveal(app_id)
         self.manager.select(app_id)
 
     def on_stop_tool(self) -> None:

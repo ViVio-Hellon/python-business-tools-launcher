@@ -190,6 +190,11 @@ class ToolManager:
         # 「まだ動いていない」と見て、両方が `start.bat` を実行してしまう
         self._starting: set[str] = set()
         self._stopping: set[str] = set()
+        # ボタンを押してから、その処理 (動いているかの確かめ・起動) が終わる
+        # まで。**このあいだにもう一度押されても、確かめ直さない** ──
+        # 起こしかけのツールを「外で動いていたもの」と取り違えて引き継ぎ、
+        # 準備ができる前に画面を開いてしまう
+        self._selecting: set[str] = set()
         # 起動を待っている最中に「やめる」と言われたツール
         self._cancelled: set[str] = set()
         # 画面が開いていたか (前回の見回り)。変わったときだけ知らせる
@@ -445,6 +450,40 @@ class ToolManager:
         """起動の本体。試験からはこちらを直接呼ぶ。"""
         op = op or trace.operation("ボタン", tool)
         self._focus = tool.app_id
+        with self._lock:
+            busy = tool.app_id in self._selecting or tool.app_id in self._starting
+            if not busy:
+                self._selecting.add(tool.app_id)
+        if busy:
+            # 起動の最中にもう一度押された。2つ目は起こさず、出ている窓を前へ
+            self._show_starting(tool, op)
+            return
+        try:
+            self._select_unlocked(tool, op)
+        finally:
+            with self._lock:
+                self._selecting.discard(tool.app_id)
+
+    def _show_starting(self, tool: Tool, op: trace.Operation) -> None:
+        """起動の最中に、そのツールのボタンがもう一度押された。
+
+        **2つ目は起こさない。** ツールの窓がもう出ていれば前に出す (起動の
+        確かめが窓に気づく少し前)。まだ窓が無ければ、進み具合の窓をバーが
+        出し直す (［隠す］で隠していても)。
+        """
+        with self._lock:
+            proc = self._processes.get(tool.app_id)
+        folder = _own_folder(tool)
+        roots = {proc.pid} if proc is not None else set()
+        pids = desktop.related_pids(folder, roots) if (folder or roots) else set()
+        brought = (desktop.bring_to_front(pids) if pids else False) \
+            or _front_by_title(tool)
+        log.info("%s は起動の最中です (窓を前へ=%s)", tool.display_name, brought)
+        trace.event("起動中に押された", trace.INFO, tool=tool, op=op,
+                    detail="ツールの窓を前に出した" if brought
+                    else "まだ窓が無い (起動を続ける)")
+
+    def _select_unlocked(self, tool: Tool, op: trace.Operation) -> None:
         with self._lock:
             running = self._running.get(tool.app_id)
         if running is not None:

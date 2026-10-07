@@ -15,7 +15,8 @@
 
 * 忙しくなって少し経ってから出す (すぐ終わる操作でちらつかせない)
 * 起動が終わる・失敗すると自分で閉じる (失敗の理由はバーの［詳細］)
-* ［隠す］を押したら、その操作のあいだは出し直さない
+* ［隠す］を押したら、その操作のあいだは出し直さない。ただし、起動の最中に
+  **そのツールのボタンがもう一度押されたら**出し直して前に出す (`reveal`)
 
 中身は `startup_progress` が組み立てる。ここは描くだけ。
 """
@@ -153,6 +154,33 @@ class ProgressWindow:
         self.top.geometry(f"+{x}+{y}")
 
     # --------------------------------------------------------------
+    def reveal(self, app_id: str) -> bool:
+        """起動の最中に、そのツールのボタンがもう一度押された。
+
+        ［隠す］で隠していても**出し直して前に出す** (押したのに何も
+        起きないように見せない)。そのツールの進み具合を出していなければ
+        何もしない。出したら真。
+        """
+        if not app_id or self.tracker.watching != app_id or self._view is None:
+            return False
+        self._dismissed = False
+        if self.top is None:
+            if self._show_job is not None:
+                try:
+                    self.root.after_cancel(self._show_job)
+                except tk.TclError:
+                    pass
+                self._show_job = None
+            self._open()
+        if self.top is None:
+            return False
+        try:
+            self.top.deiconify()
+            self.top.lift()
+        except tk.TclError:
+            return False
+        return True
+
     def dismiss(self) -> None:
         """［隠す］。起動は続ける。この操作のあいだは出し直さない。"""
         self._dismissed = True

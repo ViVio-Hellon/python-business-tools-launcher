@@ -72,6 +72,11 @@ class ProgressTracker:
         self._app = False
         self._last = None
 
+    @property
+    def watching(self) -> str:
+        """いま見ている操作のツール (アプリID)。見ていなければ空。"""
+        return self._app_id
+
     def update(self, status) -> Optional[ProgressView]:
         """知らせを1つ受け取る。窓に出す中身か、閉じる合図の `None`。
 

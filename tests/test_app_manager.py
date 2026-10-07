@@ -1286,6 +1286,49 @@ class StarterAndPortTests(ManagerTestCase):
         self.assertEqual(self.manager.status.state, State.ERROR)
         self.assertIsNone(self.spawned[0].poll(), "窓を出しているツールを落としました")
 
+    def start_in_background(self, tool) -> threading.Thread:
+        """ボタンを押したのと同じに、裏で起動させる。起こし始めるまで待つ。"""
+        thread = threading.Thread(target=self.manager._select_blocking, args=(tool,))
+        thread.start()
+        self.addCleanup(thread.join, 30)
+        deadline = time.monotonic() + 5
+        while not (tool.app_id in self.manager.starting_ids
+                   and tool.app_id in self.manager._processes) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIn(tool.app_id, self.manager.starting_ids)
+        time.sleep(0.3)                       # ツールのプロセスが立ち上がる
+        return thread
+
+    def test_起動中に押すと2つ目を起こさずツールの窓を前に出す(self) -> None:
+        tool = self.register("fake.pressstart", "日報", ready_after=2.0)
+        thread = self.start_in_background(tool)
+        proc = self.manager._processes[tool.app_id]
+        with mock.patch.object(desktop, "bring_to_front", return_value=True) as front:
+            began = time.monotonic()
+            self.manager._select_blocking(tool)
+            self.assertLess(time.monotonic() - began, 1.0, "起動が終わるまで待たせました")
+        front.assert_called_once()
+        self.assertIn(proc.pid, front.call_args.args[0])
+        self.assertIn("起動中に押された", [r["種類"] for r in trace.read_events()])
+        thread.join(30)
+        self.assertEqual(self.manager.status.state, State.RUNNING)
+        self.assertEqual(len(self.spawned), 1, "2つ目を起こしました")
+
+    def test_起動中に押しても起こしかけのツールを引き継がない(self) -> None:
+        """以前は、起こしかけのツールを「外で動いていたもの」と見て引き継ぎ、
+        **準備ができる前に画面を開いた** (起動が終わるとさらにもう1枚)。"""
+        tool = self.register("fake.pressrace", "日報", ready_after=2.0)
+        thread = self.start_in_background(tool)
+        self.manager._select_blocking(tool)
+        self.assertNotIn(tool.app_id, self.manager.running, "起こしかけを引き継ぎました")
+        self.assertEqual(self.opened, [], "準備ができる前に画面を開きました")
+        thread.join(30)
+        self.wait_opened(1)
+        time.sleep(0.3)
+        self.assertEqual(self.opened, [tool.home_url], "画面が2枚になりました")
+        self.assertEqual(len(self.spawned), 1)
+
     def test_ブラウザーのツールも違うポートを見つけて開く(self) -> None:
         actual = free_port()
         root = make_tool_dir(self.work_root, app_id="fake.webport", port=actual,
