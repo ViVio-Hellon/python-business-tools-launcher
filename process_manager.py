@@ -48,7 +48,8 @@ APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from launcher import app_config, desktop, fileprobe, health, runtime_state  # noqa: E402
+from launcher import (app_config, desktop, fileprobe, health,  # noqa: E402
+                      runtime_state, tool_entries)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 
@@ -135,10 +136,16 @@ def status(running: Optional[RunningTool] = None) -> Optional[dict]:
 def is_running(running: RunningTool) -> bool:
     """そのツールが動いているか。
 
-    ブラウザー画面のツールは `/api/health` で見る。アプリの窓のツールは
-    **窓を持つプロセス (exe) が生きているか**を先に見る ── 窓を閉じれば
-    アプリは終わる。中に Web サーバーを持つアプリは、さらに応答も見る。
+    **ツールが起動確認の入口 (`launcher_check.bat` など) を用意していれば、
+    それだけで決める** (ランチャー連携 §10。ランチャーは推測しない)。
+
+    無ければ、ブラウザー画面のツールは `/api/health` で見る。アプリの窓の
+    ツールは**窓を持つプロセス (exe) が生きているか**を先に見る ── 窓を
+    閉じればアプリは終わる。中に Web サーバーを持つアプリは、さらに応答も見る。
     """
+    entries = tool_entries.for_record(running)
+    if entries.has_check:
+        return tool_entries.check(entries).alive
     alive = app_alive(running)
     if alive is False:
         return False
@@ -212,6 +219,18 @@ def stop(running: RunningTool, *, force: bool = False,
     if on_backend is not None:
         on_backend()
 
+    # **ツールが終了の入口 (`launcher_stop.bat` など) を用意していれば、
+    # それに任せる** (ランチャー連携 §3.5・§3.6)。ランチャーの止め方
+    # (停止要求・窓を閉じる・PID) は、利用者が強制終了を選んだときだけ続ける
+    entries = tool_entries.for_record(running)
+    if entries.stop:
+        outcome = _stop_by_entry(running, entries, timeout=timeout)
+        outcome.browser_closed = result.browser_closed
+        if outcome.stopped or not force:
+            return outcome
+        log.warning("%s。強制終了を選ばれたので、ランチャーの止め方で続けます",
+                    outcome.message)
+
     if not is_running(running):
         # 応答しない。プロセスだけ残っていないか確かめてから片付ける
         return _handle_unresponsive(running, result, force=force)
@@ -277,6 +296,38 @@ def _handle_unresponsive(running: RunningTool, result: StopResult, *,
     result.method = "already-gone"
     result.message = "動いていませんでした(残っていた記録を片付けました)"
     log.info("%s は動いていませんでした", running.app_id)
+    return result
+
+
+# --- 0. ツールが用意した終了の入口 ---------------------------------
+def _stop_by_entry(running: RunningTool, entries: "tool_entries.Entries", *,
+                   timeout: float) -> StopResult:
+    """ツールの終了の入口を実行し、止まったことを確かめる。"""
+    result = StopResult(app_id=running.app_id,
+                        display_name=running.display_name)
+    name = Path(entries.stop).name
+    log.info("ツールの終了の入口に任せます: %s", entries.stop)
+    ok, message = tool_entries.run_stop(entries, timeout=max(timeout, 10.0))
+    if not ok:
+        # ツールが断った (0 以外)。**待たずにすぐ知らせる**
+        stopped = False
+    elif entries.has_check:
+        stopped = _wait_stopped(running, timeout)
+    elif running.health_url or app_alive(running) is not None:
+        stopped = _wait_stopped(running, timeout)
+    else:
+        # 確かめる手がかりが無い。**ツールの答え (終了コード 0) を信じる**
+        stopped = ok
+    result.method = name
+    if stopped:
+        result.stopped = True
+        result.message = "正常に終了しました"
+    else:
+        result.message = (message if not ok
+                          else f"{name} を実行しましたが、まだ動いています")
+        # **ツールが止まらなかった (断った) ことを、そのまま利用者に返す。**
+        # 実行中の処理があるときと同じく、強制終了するかは利用者が決める
+        result.busy_jobs = [result.message]
     return result
 
 
@@ -358,6 +409,10 @@ def _wait_stopped(running: RunningTool, timeout: float) -> bool:
     窓のツールは**窓を持つプロセスが消えるまで**も待つ (Web サーバーを
     持たなければ、それだけが手がかり)。
     """
+    entries = tool_entries.for_record(running)
+    if entries.has_check:
+        # ツールの起動確認の入口が「動いていない」と言うまで
+        return tool_entries.wait_until(entries, want_alive=False, timeout=timeout)
     deadline = time.monotonic() + timeout
     while True:
         alive = app_alive(running)

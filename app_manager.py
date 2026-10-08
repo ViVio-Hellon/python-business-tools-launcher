@@ -59,7 +59,7 @@ if str(APP_ROOT) not in sys.path:
 import process_manager  # noqa: E402
 from launcher import (app_config, browser, desktop, fileprobe,  # noqa: E402
                       health, logging_utils, runtime_state, tool_registry,
-                      trace)
+                      trace, tool_entries)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
@@ -102,6 +102,10 @@ STUB_GRACE_SEC = 5.0
 DISCOVER_EVERY_SEC = 2.0
 # ブラウザーで使うツールが**自分の窓**を出していないか見る間隔 (秒)
 WINDOW_LOOK_SEC = 1.0
+# ツールの起動確認の入口に聞く間隔 (秒)
+ENTRY_CHECK_EVERY_SEC = 1.0
+# 起動ファイルが 0 以外で終わったあと、入口が「動いている」と言うのを待つ時間 (秒)
+ENTRY_EXIT_GRACE_SEC = 3.0
 
 # `shutdown(stop_tools=False)` で手放した exe のプロセス。**落とさない** ──
 # exe はツールそのものなので、引き取ろうとして落とすとツールが消える
@@ -345,11 +349,21 @@ class ToolManager:
         """
         recorded = runtime_state.read_all()
         tools = tool_registry.all_tools()
-        payloads = _probe_all(tools)
+        # ツールが起動確認の入口を用意していれば、そちらで決める (§10)
+        by_entry = {t.app_id: e for t in tools
+                    for e in [tool_entries.for_tool(t)] if e.has_check}
+        answers = _check_all(by_entry)
+        payloads = _probe_all([t for t in tools if t.app_id not in by_entry])
 
         adopted: dict[str, RunningTool] = {}
         outside: list[str] = []
         for tool in tools:
+            if tool.app_id in by_entry:
+                answer = answers.get(tool.app_id)
+                if answer is not None and answer.alive:
+                    adopted[tool.app_id] = (recorded.get(tool.app_id)
+                                            or _running_by_entries(tool, confirmed=answer.ready))
+                continue
             if tool.watches_window:
                 # Web サーバーを持たないアプリ。プロセスで探す
                 running = recorded.get(tool.app_id)
@@ -492,7 +506,8 @@ class ToolManager:
             if process_manager.is_running(running):
                 self._show(tool, running, op)
                 return
-            if self._tool_alive(running):
+            if not tool_entries.for_tool(running).has_check \
+                    and self._tool_alive(running):
                 # 応答しないが、**ツールのプロセスはまだ動いている**。起動し直すと
                 # 2つ目になる (ポートの取り合い・同じデータの書き合い)。前に出すだけ
                 log.info("%s は動いていますが応答しません。起動し直しません",
@@ -539,7 +554,8 @@ class ToolManager:
         ツールは先に動いているほうへ合流するか、ポートを取れずに終わり、
         ランチャーは起動確認を時間切れまで待っていた。
         """
-        if not tool.health_url or desktop.port_listening(tool.port) is False:
+        if not tool.health_url or tool_entries.for_tool(tool).has_check \
+                or desktop.port_listening(tool.port) is False:
             return ""
         payload = health.probe(tool.health_url)
         other = str((payload or {}).get("app_id") or "")
@@ -563,6 +579,13 @@ class ToolManager:
            本体を別に起こす作りでも見つかる)。待ち受けているポートで
            起動確認が答えれば、そのポートで引き継ぐ
         """
+        # **ツールの起動確認の入口があれば、それだけで決める**
+        entries = tool_entries.for_tool(tool)
+        if entries.has_check:
+            answer = tool_entries.check(entries)
+            if not answer.alive:
+                return None
+            return _running_by_entries(tool, confirmed=answer.ready)
         # 待ち受けが無いのに当たりにいかない (Windows では断られるまで
         # 1〜2 秒かかり、押すたびに待たせる)
         if tool.health_url and desktop.port_listening(tool.port) is not False:
@@ -1005,7 +1028,14 @@ class ToolManager:
 
         window_note = ""
         how = "health"
-        if tool.is_app:
+        entries = tool_entries.for_tool(tool)
+        if entries.has_check:
+            # **ツールの起動確認の入口に任せる** (ランチャー連携 §10)。
+            # ランチャーの推測 (ポート探し・窓の検出) は使わない
+            how = self._wait_by_entries(tool, proc, entries, timeout,
+                                        early_exit, seen, op)
+            payload = {} if how == "entry" else None
+        elif tool.is_app:
             how, payload, window_note = self._wait_app(tool, proc, timeout,
                                                        early_exit, seen, op)
             if how in ("window", "alive"):
@@ -1076,6 +1106,17 @@ class ToolManager:
                       tool)
             return
 
+        if payload is None and how in ("failed", "cancelled") and entries.has_check:
+            # 起動確認の入口が「使える」と言わなかった。**起こしたものは
+            # 片付けない** (止め方はツールが決める)。次に押したときは、
+            # 入口が「動いている」と言えば起動し直さない
+            self._report_entry_failure(tool, proc, entries, early_exit, seen,
+                                       time.monotonic() - started, op=op,
+                                       timeout=timeout)
+            with self._lock:
+                self._processes.pop(tool.app_id, None)
+            return
+
         if payload is None:
             if tool.is_app and early_exit.get("code") == 0:
                 # すぐ戻り値 0 で終わった。**すでに動いている同じアプリへ
@@ -1107,7 +1148,9 @@ class ToolManager:
                 self._processes.pop(tool.app_id, None)
             return
 
-        if how in ("window", "alive") and not tool.is_app:
+        if how == "entry":
+            running = _running_by_entries(tool, launch_pid=proc.pid)
+        elif how in ("window", "alive") and not tool.is_app:
             # ブラウザーで使うツールが、自分の窓を出した。画面はツールの窓
             # なので**ランチャーはブラウザーを開かない** (開けば画面が2枚)
             running = _running_from_health(tool, {}, launch_pid=proc.pid)
@@ -1175,6 +1218,76 @@ class ToolManager:
                       "不要になったタブは手で閉じてください。")
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
                   elapsed=time.monotonic() - started, responding=True)
+
+    def _wait_by_entries(self, tool: Tool, proc: subprocess.Popen,
+                         entries: "tool_entries.Entries", timeout: float,
+                         early_exit: dict, seen: dict,
+                         op: Optional[trace.Operation] = None) -> str:
+        """ツールの起動確認の入口が「使える」と言うまで待つ。
+
+        戻り値: "entry" (使える) / "failed" / "cancelled"。起動ファイルが
+        0 以外で終わり、少し待っても入口が「動いている」と言わなければ失敗。
+        """
+        began = time.monotonic()
+        while True:
+            if tool.app_id in self._cancelled:
+                return "cancelled"
+            elapsed = time.monotonic() - began
+            code = proc.poll()
+            if code is not None:
+                early_exit["code"] = code
+            result = tool_entries.check(entries)
+            seen["check"] = result
+            if result.ready:
+                if op is not None:
+                    op.step(f"起動確認の入口が「使える」と答えた ({elapsed:.1f}秒)")
+                return "entry"
+            stage = result.note if result.alive else ""
+            stage = stage or ("準備中" if result.alive else "起動を待っています")
+            self._set(State.STARTING, f"{tool.display_name}: {stage}", tool,
+                      elapsed=elapsed, phase=PHASE_WAIT, stage=stage, timeout=timeout)
+            if code not in (None, 0) and not result.alive \
+                    and elapsed >= ENTRY_EXIT_GRACE_SEC:
+                return "failed"
+            if elapsed >= timeout:
+                return "failed"
+            time.sleep(ENTRY_CHECK_EVERY_SEC)
+
+    def _report_entry_failure(self, tool: Tool, proc: subprocess.Popen,
+                              entries: "tool_entries.Entries", early_exit: dict,
+                              seen: dict, elapsed: float, *,
+                              op: Optional[trace.Operation] = None,
+                              timeout: float = 0.0) -> None:
+        """入口で確かめるツールが起動しなかった。確かめた事実だけを書く。"""
+        name = tool.display_name
+        last = seen.get("check")
+        check_name = Path(entries.check).name if entries.check else entries.check_url
+        whys = [f"起動確認の入口 ({check_name}) が {elapsed:.0f}秒たっても"
+                "「使える」(終了コード 0) と答えなかった"]
+        if last is not None:
+            answer = {tool_entries.STARTING: "準備中 (2)",
+                      tool_entries.STOPPED: "動いていない",
+                      tool_entries.UNKNOWN: "確かめられない"}.get(last.state, last.state)
+            whys.append(f"最後の答え: {answer}"
+                        + (f" / 終了コード {last.code}" if last.code is not None else "")
+                        + (f" / {last.note}" if last.note else ""))
+        code = early_exit.get("code")
+        if code not in (None, 0):
+            whys.append(f"起動ファイルが先に終了した (戻り値 {desktop.describe_exit_code(code)})")
+        path = trace.incident(
+            f"{name}を起動できなかった", tool=tool, op=op, whys=whys,
+            observed=[("起動ファイル", tool.start_command),
+                      ("起動確認の入口", check_name),
+                      ("終了の入口", entries.stop or "(なし)")],
+            hints=["起動確認の入口を手で実行し、終了コードを確かめる (ツール側)",
+                   "起動ファイルを直接ダブルクリックして、ツールが起動するか確かめる"],
+            tool_log=tool_log_path(tool.app_id))
+        trace.event("起動失敗", trace.FAILED, tool=tool, op=op,
+                    cause=whys[0], elapsed=elapsed, incident=path)
+        self._set(State.ERROR, f"{name}を起動できませんでした", tool,
+                  detail=(f"{whys[0]}。\n" + (whys[1] + "\n" if len(whys) > 1 else "")
+                          + _records_note(path)),
+                  incident=path)
 
     def _wait_app(self, tool: Tool, proc: subprocess.Popen, timeout: float,
                   early_exit: dict, seen: dict,
@@ -1355,7 +1468,15 @@ class ToolManager:
         起動をやめたとき、こちらは記録を持たないまま去るので、
         止める人が誰も居なくなる。**立ち上がっていれば止める**。
         """
-        payload = health.probe(tool.health_url)
+        entries = tool_entries.for_tool(tool)
+        if entries.has_check:
+            if tool_entries.check(entries).alive:
+                running = _running_by_entries(tool, launch_pid=proc.pid)
+                log.info("打ち切ったツールを止めます: %s", running.summary())
+                process_manager.stop(running, force=True, timeout=10)
+            payload = None
+        else:
+            payload = health.probe(tool.health_url)
         if health.is_tool(payload, tool.app_id):
             running = _running_from_health(tool, payload, launch_pid=proc.pid)
             log.info("打ち切ったツールを止めます: %s", running.summary())
@@ -1581,10 +1702,14 @@ class ToolManager:
         answers = _probe_running([r for _, r in targets])
 
         for app_id, running in targets:
-            if not running.confirmed:
+            by_entry = tool_entries.for_record(running).has_check
+            if by_entry and not running.confirmed and answers.get(app_id):
+                running.confirmed = True       # 入口が「動いている」と答えた
+                runtime_state.put(running)
+            if not running.confirmed and not by_entry:
                 self._watch_unconfirmed(running, bool(answers.get(app_id)))
                 continue
-            if running.is_app:
+            if running.is_app and not by_entry:
                 alive = self._app_alive(running)
                 if alive is False:
                     # 窓を持つプロセスが消えたのは**確か**なので、1回で判断する
@@ -1948,6 +2073,17 @@ def _probe_all(tools: list[Tool]) -> dict[str, Optional[dict]]:
         return {t.app_id: payload for t, payload in zip(targets, answers)}
 
 
+def _check_all(by_entry: dict) -> dict:
+    """ツールの起動確認の入口に**同時に**聞く。アプリIDごとの答え。"""
+    if not by_entry:
+        return {}
+    items = list(by_entry.items())
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(items)),
+                            thread_name_prefix="entry") as pool:
+        results = pool.map(lambda item: tool_entries.check(item[1]), items)
+        return {app_id: result for (app_id, _), result in zip(items, results)}
+
+
 def _probe_running(records: list[RunningTool]) -> dict[str, bool]:
     """動いているはずのツールを**同時に**当たる。答えたかどうか。"""
     if not records:
@@ -1990,6 +2126,17 @@ def _running_from_health(tool: Tool, payload: Optional[dict],
         stop_method=tool.stop_method,
         ui_mode=tool.resolved_ui_mode,
     )
+
+
+def _running_by_entries(tool: Tool, *, launch_pid: int = 0,
+                        confirmed: bool = True) -> RunningTool:
+    """ツールの入口で起動を確かめたツールの記録。"""
+    if tool.is_app:
+        return _running_for_app(tool, launch_pid or _find_app_pid(tool),
+                                confirmed=confirmed)
+    running = _running_from_health(tool, {}, launch_pid=launch_pid)
+    running.confirmed = confirmed
+    return running
 
 
 def _running_for_app(tool: Tool, pid: int, *,

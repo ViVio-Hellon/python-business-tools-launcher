@@ -25,7 +25,7 @@ import app_manager  # noqa: E402
 import process_manager  # noqa: E402
 from app_manager import State, ToolManager  # noqa: E402
 from launcher import app_config, browser, logging_utils  # noqa: E402
-from launcher import runtime_state, tool_registry  # noqa: E402
+from launcher import desktop, runtime_state, tool_registry  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 
 _FAKE_BROWSER = Path(__file__).resolve().parent / "_fake_browser.py"
@@ -144,8 +144,12 @@ class AdoptedToolTests(LocalAreaTestCase):
     def _stop(self) -> None:
         for running in runtime_state.read_all().values():
             process_manager.stop(running, force=True, timeout=5)
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.kill()
+        if self.proc is not None:
+            # start.bat の下の本体ごと止める (start.bat だけ止めると本体が残る)
+            for pid in desktop.process_tree({self.proc.pid}):
+                process_manager._terminate(pid, force=True)
+            if self.proc.poll() is None:
+                self.proc.kill()
             self.proc.wait(timeout=5)
 
     def test_画面を閉じられないことを伝える(self) -> None:

@@ -65,9 +65,12 @@ class LocalAreaTestCase(unittest.TestCase):
         self.addCleanup(setattr, trace, "_destination", None)
         trace._seen_unexpected.clear()
         # 「確かめられなかった起動ファイル」の覚えも試験ごとに忘れる
-        from launcher import fileprobe
+        from launcher import fileprobe, tool_entries
         fileprobe.forget()
         self.addCleanup(fileprobe.forget)
+        # 見つけたツールの入口 (launcher_check.bat など) の覚えも
+        tool_entries.forget()
+        self.addCleanup(tool_entries.forget)
 
     def tearDown(self) -> None:
         if self._orig is None:

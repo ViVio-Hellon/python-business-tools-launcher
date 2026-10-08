@@ -1339,10 +1339,21 @@ def describe() -> str:
             lines.append(f"                       → {resolved} (見つかりません)")
         lines.append(f"         画面: {UI_LABELS[tool.resolved_ui_mode]}"
                      + ("" if tool.ui_mode else " (自動)"))
-        if tool.watches_window:
+        from . import tool_entries
+
+        entries = tool_entries.for_tool(tool)
+        if entries.check:
+            lines.append(f"         確認: ツールの入口 {entries.check}")
+        elif entries.check_url:
+            lines.append(f"         確認: ツールの入口 {entries.check_url}")
+        elif tool.watches_window:
             lines.append("         確認: 窓が出たこと (Web サーバーなし)")
         else:
             lines.append(f"         確認: {tool.health_url or '(ポート未設定)'}")
+        if entries.stop:
+            lines.append(f"         終了: ツールの入口 {entries.stop}")
+        if entries.problem:
+            lines.append(f"         [注意] {entries.problem}")
         problem = tool.ui_problem()
         if problem:
             lines.append(f"         [注意] {problem}")

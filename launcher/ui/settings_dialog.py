@@ -26,7 +26,8 @@ from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .. import app_config, distribution, fileprobe, tool_registry, trace
+from .. import (app_config, distribution, fileprobe, tool_entries,
+               tool_registry, trace)
 from ..logging_utils import get_logger
 from ..tool_registry import STOP_METHODS, UI_LABELS, Tool
 from . import password, theme
@@ -527,6 +528,7 @@ class SettingsDialog:
         for app_id in removed:
             tool_registry.delete_tool(app_id)
         tool_registry.save_all(updated)
+        tool_entries.forget()                 # 起動ファイルが変われば入口も変わる
         mode_before = tool_registry.pc_mode()
         tool_registry.set_pc_mode(self.mode_var.get().strip())
         if self.reset_position.get():
@@ -656,6 +658,10 @@ class _ToolRow:
         self.note = tk.Label(box, text="", bg=theme.BG, fg=theme.MUTED,
                              font=theme.FONT_SMALL, anchor="w", justify="left",
                              wraplength=560)
+        # ツールが用意した入口 (launcher_check.bat など) があれば、どれを
+        # 使うかを見せる。**ランチャーの推測より優先する**ので、知らずに
+        # いると「設定の停止方法が効かない」ように見える
+        self.show_note(tool_entries.for_start(tool.start_command).describe())
 
     def show_note(self, text: str) -> None:
         if text:
@@ -666,11 +672,12 @@ class _ToolRow:
 
     def recommend_args(self) -> None:
         """［自動］。いまの起動ファイルから起動引数を決め直す。"""
-        args, reason = tool_registry.recommend_start_args(
-            self.path_var.get().strip().strip('"'))
+        path = self.path_var.get().strip().strip('"')
+        args, reason = tool_registry.recommend_start_args(path)
         if fileprobe.is_file(self.path_var.get()):
             self.args_var.set(args)
-        self.show_note(reason)
+        entries = tool_entries.for_start(path).describe()
+        self.show_note("\n".join(text for text in (reason, entries) if text))
 
     def _on_delete_toggled(self) -> None:
         if self.delete_var.get():
