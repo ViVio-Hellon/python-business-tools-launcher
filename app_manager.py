@@ -519,7 +519,41 @@ class ToolManager:
                         cause="押したときにはもう動いていた (起動せずに前に出す)")
             self._show(tool, found, op)
             return
+        conflict = self._port_taken_by_other(tool)
+        if conflict:
+            # 起こしても、先に動いているほうに断られるか、ポートを取れない。
+            # **90秒待たせてから「起動できませんでした」にしない**
+            log.info("%s を起動しません: %s", tool.display_name, conflict)
+            trace.event("起動できない", trace.FAILED, tool=tool, op=op,
+                        cause=conflict.splitlines()[0])
+            self._set(State.ERROR, f"{tool.display_name}を起動できません", tool,
+                      detail=conflict)
+            return
         self._start(tool, op)
+
+    def _port_taken_by_other(self, tool: Tool) -> str:
+        """設定のポートを、**別のツール (アプリ)** がもう使っているか。理由の文。
+
+        同じツールの Python 版 (Start.vbs) と exe 版 (Tauri) を両方登録して
+        いると、同じポートを使う。片方が動いているときにもう片方を押すと、
+        ツールは先に動いているほうへ合流するか、ポートを取れずに終わり、
+        ランチャーは起動確認を時間切れまで待っていた。
+        """
+        if not tool.health_url or desktop.port_listening(tool.port) is False:
+            return ""
+        payload = health.probe(tool.health_url)
+        other = str((payload or {}).get("app_id") or "")
+        if not other or other == tool.app_id:
+            return ""                         # 答えない・名乗らないものは決めつけない
+        owner = tool_registry.get(other)
+        if owner is not None:
+            name = owner.display_name or other
+            return (f"ポート {tool.port} は、いま「{name}」が使っています。\n"
+                    "同じポートのツール (同じツールの Python 版と exe 版など) は、"
+                    "同時には動かせません。\n"
+                    f"先に「{name}」を止めてから押してください。")
+        return (f"ポート {tool.port} は、ランチャーに登録されていない別のアプリ ({other}) が"
+                "使っています。\nそのアプリを止めるか、［設定］のポートを確かめてください。")
 
     def _find_existing(self, tool: Tool) -> Optional[RunningTool]:
         """すでに動いている、そのツール。無ければ None。
@@ -664,9 +698,15 @@ class ToolManager:
             trace.event("画面を前へ" if brought else "動作中", trace.INFO,
                         tool=running, op=op,
                         cause="画面はツールがふだんのブラウザーに開いている")
-            detail = "" if brought else (
-                f"{tool.display_name}は動いています。画面はツールが"
-                "ふだんのブラウザーに開いているので、そちらを見てください。")
+            if not brought:
+                # 前に出せない (画面はふだんのブラウザーのタブで、窓の持ち主は
+                # ブラウザー)。**バーの1行で伝えるだけにする** ── 押すたびに
+                # ［詳細 ！］で注意を引くほどのことではない
+                self._set(State.RUNNING,
+                          f"{tool.display_name}は動いています (画面はブラウザーにあります)",
+                          tool, responding=True)
+                return
+            detail = ""
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
                   responding=True)
 

@@ -745,16 +745,31 @@ class RecordTests(ManagerTestCase):
         self.assertEqual(failed[0]["操作ID"], self.events("起動開始")[0]["操作ID"])
 
     def test_ポートを別のアプリが使っていたらそう書く(self) -> None:
+        """押した時点で断る (1.6.4)。以前は起こしてから時間切れまで待っていた。"""
         other = self.register("fake.squatter", "看板")
         self.start(other)
         victim = self.register("fake.victim", "日報", port=other.port)
         self.start(victim)
 
         self.assertEqual(self.manager.status.state, State.ERROR)
-        text = self.incident_text()
-        self.assertIn(f"ポート {other.port} では、別のアプリ (アプリID fake.squatter)",
-                      text)
-        self.assertIn("別のアプリ (fake.squatter)", self.manager.status.detail)
+        detail = self.manager.status.detail
+        self.assertIn(f"ポート {other.port} は、いま「看板」が使っています", detail)
+        self.assertNotIn("fake.victim", self.manager._processes)
+
+    def test_ポートを登録されていないアプリが使っていたらアプリIDを書く(self) -> None:
+        port = free_port()
+        root = make_tool_dir(self.work_root, app_id="outside.app", port=port)
+        outside = subprocess.Popen([str(root / "start.bat"), "--no-browser"])
+        self.addCleanup(outside.wait, 5)
+        self.addCleanup(lambda: [process_manager._terminate(p, force=True)
+                                 for p in desktop.process_tree({outside.pid})])
+        self.assertIsNotNone(health.wait_ready(f"http://127.0.0.1:{port}/api/health",
+                                               "outside.app", timeout=10))
+        victim = self.register("fake.victim2", "日報", port=port)
+        self.start(victim)
+        self.assertEqual(self.manager.status.state, State.ERROR)
+        self.assertIn("登録されていない別のアプリ (outside.app)",
+                      self.manager.status.detail)
 
     def test_待ち受けていなければそう書く(self) -> None:
         """BAT は動いたまま、ツールが立ち上がらない (時間切れ)。"""

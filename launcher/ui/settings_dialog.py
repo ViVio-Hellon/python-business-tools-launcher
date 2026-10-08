@@ -509,7 +509,7 @@ class SettingsDialog:
             return False
 
         warnings = [_delivery_warning(tool) for tool in updated]
-        warnings = [text for text in warnings if text]
+        warnings = [text for text in warnings if text] + _shared_port_warnings(updated)
         if warnings and not messagebox.askyesno(
                 "設定",
                 "\n\n".join(warnings) + "\n\nこのまま保存しますか?",
@@ -747,6 +747,22 @@ class _ToolRow:
         if problem:
             return self.tool, problem
         return tool, ""
+
+
+def _shared_port_warnings(tools: list[Tool]) -> list[str]:
+    """同じポートを使うツールが2つ以上あれば、その知らせ。
+
+    同じツールの Python 版 (Start.vbs) と exe 版 (Tauri) を両方登録すると
+    起きやすい。**同時には動かせない** (あとから押したほうは、先に動いて
+    いるほうに断られる)。保存は止めない ── 片方ずつ使うなら困らない。
+    """
+    by_port: dict[int, list[str]] = {}
+    for tool in tools:
+        if tool.enabled and tool.port > 0:
+            by_port.setdefault(tool.port, []).append(tool.display_name or tool.app_id)
+    return [f"{'、'.join(names)} が同じポート {port} を使います。"
+            "同時には動かせません (あとから押したほうは起動できません)。"
+            for port, names in sorted(by_port.items()) if len(names) > 1]
 
 
 def _delivery_warning(tool: Tool) -> str:

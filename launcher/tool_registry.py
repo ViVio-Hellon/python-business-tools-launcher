@@ -845,12 +845,23 @@ def shared_folder(folder: str, app_id: str) -> bool:
     同じフォルダーに役割違いのツール (現場用・資材用など) を置いていると、
     「このフォルダーから起動したプロセス = このツール」とは言えない。
     そのときはフォルダーでツールを見分けない (取り違えて止めないため)。
+
+    **片方のフォルダーがもう片方の中にある**ときも同じ。Python 版のツールの
+    フォルダーの中に、同じツールの exe 版 (Tauri で作ったもの) を置いて
+    いると、外側のツールのプロセスに内側のツールが混ざり、片方を止めると
+    両方止まる。
     """
     wanted = _normalize_folder(folder)
     if not wanted:
         return False
-    return any(t.app_id != app_id and _normalize_folder(t.resolved_work_dir) == wanted
-               for t in all_tools(include_disabled=True) if t.start_command.strip())
+    for tool in all_tools(include_disabled=True):
+        if tool.app_id == app_id or not tool.start_command.strip():
+            continue
+        other = _normalize_folder(tool.resolved_work_dir)
+        if other and (other == wanted or other.startswith(wanted + "/")
+                      or wanted.startswith(other + "/")):
+            return True
+    return False
 
 
 def _normalize_folder(folder: str) -> str:
