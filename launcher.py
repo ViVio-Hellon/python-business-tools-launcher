@@ -234,6 +234,10 @@ def _show_message(title: str, body: str) -> bool:
         root.withdraw()
         messagebox.showinfo(f"{app_config.display_name()} - {title}", body)
         root.destroy()
+        # この Tk はメインスレッドで片付ける (`launcher/ui/splash.py` と同じ理由)
+        del root
+        import gc
+        gc.collect()
         return True
     except Exception:                         # noqa: BLE001 - 伝え方で落ちない
         return False

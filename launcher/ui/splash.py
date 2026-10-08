@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import gc
 import queue
 import threading
 import time
@@ -160,4 +161,13 @@ def run_with_splash(steps: Sequence[str],
         splash = Splash(steps)
     except tk.TclError:
         return work(lambda step: None)
-    return splash.run(work)
+    try:
+        return splash.run(work)
+    finally:
+        # **ここ (メインスレッド) で片付ける。** この窓は自分の Tk (Tcl の
+        # 本体) を持ち、部品どうしが指し合っているので、参照が切れても残る。
+        # 放っておくと、あとで裏のスレッド (ツールの起動を待つ処理など) が
+        # ごみ集めをしたときに片付けられ、Tcl が「別のスレッドで消された」と
+        # して**ランチャーごと落ちる** (Windows では 0x80000003)
+        del splash
+        gc.collect()

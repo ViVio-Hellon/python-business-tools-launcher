@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import gc
 import queue
 import threading
 import tkinter as tk
@@ -33,6 +34,10 @@ from .settings_dialog import SettingsDialog
 from .version_dialog import VersionDialog
 
 log = get_logger("ui.bar")
+
+# ごみ集め (循環参照の片付け) を**メインスレッドで**行う間隔 (ミリ秒)。
+# バーが動いているあいだは自動のごみ集めを止める (`run`)
+GC_MS = 10_000
 
 # 画面側のループが状態を取りに行く間隔 (ミリ秒)。
 # 起動中の経過表示がなめらかに見える程度でよい
@@ -914,10 +919,35 @@ class LauncherBar:
             self._polling = False
 
     # --------------------------------------------------------------
+    def _collect_garbage(self) -> None:
+        """循環参照のごみを**メインスレッドで**片付ける。
+
+        tkinter の部品 (とくに Tk・Tcl の本体) は、作ったスレッド以外で
+        片付けられると Tcl が Python ごと落とす。自動のごみ集めは、たまたま
+        たくさん物を作ったスレッド (ツールの起動を待つ・プロセスを数える
+        裏の処理) で走るので、バーが動いているあいだは止めて (`run`)、
+        ここで定期的に行う。
+        """
+        try:
+            gc.collect()
+        finally:
+            self.root.after(GC_MS, self._collect_garbage)
+
     def run(self) -> None:
+        self.root.after(GC_MS, self._collect_garbage)
         self.root.mainloop()
 
 
 def run(manager) -> None:
-    """バーを出して常駐する。"""
-    LauncherBar(manager).run()
+    """バーを出して常駐する。
+
+    動いているあいだは**自動のごみ集めを止める** (`_collect_garbage`)。
+    現場で、ツールの起動を待つ裏の処理がごみ集めを始め、起動中の窓の Tk を
+    片付けて、ランチャーごと落ちていた (0x80000003)。
+    """
+    gc.collect()                              # ここまでのごみはメインスレッドで
+    gc.disable()
+    try:
+        LauncherBar(manager).run()
+    finally:
+        gc.enable()
