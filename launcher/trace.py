@@ -326,7 +326,8 @@ def read_events(path: Optional[Path] = None) -> list[dict]:
 def incident(title: str, *, tool: Any = None, op: Optional[Operation] = None,
              whys: Iterable[str] = (), observed: Iterable[tuple[str, str]] = (),
              hints: Iterable[str] = (), tool_log: Optional[Path] = None,
-             exc: Optional[BaseException] = None) -> str:
+             exc: Optional[BaseException] = None,
+             attachments: Iterable[tuple[str, Path]] = ()) -> str:
     """障害記録を1件書き、その場所を返す。書けなければ空。
 
     `whys` は**ランチャーが確かめられた「なぜ」**だけを入れる。推測は
@@ -337,7 +338,8 @@ def incident(title: str, *, tool: Any = None, op: Optional[Operation] = None,
     try:
         text = render_incident(title, tool=tool, op=op, whys=list(whys),
                                observed=list(observed), hints=list(hints),
-                               tool_log=tool_log, exc=exc)
+                               tool_log=tool_log, exc=exc,
+                               attachments=list(attachments))
         name = (f"{time.strftime('%Y%m%d_%H%M%S')}_"
                 f"{_safe(_name_of(tool)) or 'ランチャー'}_{_safe(title)[:30]}.txt")
         path = _write_incident(name, text)
@@ -378,7 +380,8 @@ def render_incident(title: str, *, tool: Any = None,
                     observed: list[tuple[str, str]],
                     hints: Optional[list[str]] = None,
                     tool_log: Optional[Path] = None,
-                    exc: Optional[BaseException] = None) -> str:
+                    exc: Optional[BaseException] = None,
+                    attachments: Iterable[tuple[str, Path]] = ()) -> str:
     """障害記録の本文 (なぜなぜ分析の書式)。"""
     lines: list[str] = []
     add = lines.append
@@ -453,6 +456,17 @@ def render_incident(title: str, *, tool: Any = None,
             add("  (出力はありません)")
         add("")
 
+    # ほかに末尾を写すファイル (落ちたときの記録・ランチャーのログなど)
+    for label, path in attachments:
+        tail = tail_lines(path, TAIL_LINES)
+        add(f"■ {label} (最後の{TAIL_LINES}行)  {path}")
+        if tail:
+            for line in tail:
+                add(f"  | {line}")
+        else:
+            add("  (ありません)")
+        add("")
+
     add("■ 関連する記録")
     from .logging_utils import log_file_path
     add(f"  ランチャーのログ : {log_file_path()}")
@@ -505,6 +519,56 @@ def install_thread_hook() -> None:
         previous(args)
 
     threading.excepthook = hook
+
+
+# 落ちたときの記録 (faulthandler)。これより大きければ空にしてから書く
+CRASH_LOG_MAX_BYTES = 1024 * 1024
+_crash_stream = None
+
+
+def crash_log_path() -> Path:
+    """**Python ごと落ちた**ときの記録。いつも端末の中 (落ちる瞬間に書くので)。"""
+    return local_dir() / "launcher_crash.log"
+
+
+def enable_crash_log() -> None:
+    """Python ごと落ちたとき (例外ではなく、アクセス違反・abort など) に、
+    全スレッドのどこにいたかを書き残すようにする (標準の faulthandler)。
+
+    ふつうの例外は障害記録になるが、これらは**何も残さずに窓が消える**。
+    書けなくても起動は止めない。
+    """
+    global _crash_stream
+    import faulthandler
+
+    path = crash_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "w" if (path.exists() and path.stat().st_size > CRASH_LOG_MAX_BYTES) else "a"
+        stream = open(path, mode, encoding="utf-8", errors="replace")
+        stream.write(f"--- {time.strftime('%Y/%m/%d %H:%M:%S')} ランチャー起動 "
+                     f"pid={os.getpid()} ---\n")
+        stream.flush()
+        faulthandler.enable(file=stream, all_threads=True)
+        _crash_stream = stream                # 閉じないで持っておく
+    except (OSError, ValueError, RuntimeError) as exc:
+        log.warning("落ちたときの記録を用意できませんでした (%s): %s", path, exc)
+
+
+def crash_lines_since(started_at: float) -> list[str]:
+    """`started_at` のあとに起動したランチャーが、落ちたときに書いたもの。"""
+    path = crash_log_path()
+    try:
+        if path.stat().st_mtime < started_at:
+            return []
+    except OSError:
+        return []
+    lines = tail_lines(path, 200)
+    # 最後の「ランチャー起動」の見出しより後ろ (= 前回の分)
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith("--- ") and "ランチャー起動" in lines[index]:
+            return [line for line in lines[index + 1:] if line.strip()]
+    return [line for line in lines if line.strip()]
 
 
 def real_path(path: "str | Path") -> str:

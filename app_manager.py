@@ -305,17 +305,19 @@ class ToolManager:
             stopping_ids=stopping_ids, focus_id=self._focus,
             incident=incident, ui_mode=ui_mode))
 
-    def notify(self, detail: str) -> None:
+    def notify(self, detail: str, *, incident: str = "") -> None:
         """全体への案内を出す (起動ファイルを確かめられない、など)。
 
         いまの案内 (引き継いだツールの説明など) があれば、その後ろに足す。
+        `incident` を渡すと、［詳細］でその障害記録を読める。
         """
         current = self._status.detail
         merged = f"{current}\n\n{detail}" if current else detail
         with self._lock:
             responding = bool(self._running)
         self._set(self._settled_state(), self.summary(), detail=merged,
-                  responding=responding)
+                  responding=responding,
+                  incident=incident or self._status.incident)
 
     def summary(self) -> str:
         """「動作中：日報、看板」。何も動いていなければ「起動していません」。"""

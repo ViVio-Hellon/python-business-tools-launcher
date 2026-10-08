@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
@@ -262,6 +263,53 @@ def _processes_windows() -> list[tuple[int, int, str]]:
         return []
 
 
+# 親子の起動時刻の比べの余裕 (秒)。子が親より前に起動することはない
+_PARENT_MARGIN_SEC = 0.05
+
+
+def _older_than_parent(child: int, parent: int, starts: dict) -> bool:
+    """子のはずのプロセスが、親より**前に**起動していたか。
+
+    Windows の「親のPID」は、親が終わったあとも番号のまま残る。番号は
+    すぐ使い回されるので、**同じ番号の別のプロセスの子**に見えてしまう
+    (Start.vbs の wscript が終わり、その番号でツールが起動すると、
+    ランチャーがツールの子に見える)。起動時刻で見分ける。
+    """
+    for pid in (child, parent):
+        if pid not in starts:
+            starts[pid] = process_started_at(pid)
+    child_at, parent_at = starts[child], starts[parent]
+    if child_at is None or parent_at is None:
+        return False                          # 分からなければ親子とみる
+    return child_at + _PARENT_MARGIN_SEC < parent_at
+
+
+def protected_pids(rows: Optional[list] = None) -> set[int]:
+    """ランチャー自身と、その親・祖先 (起動に使った pyw.exe・wscript など)。
+
+    **どの処理でもツールとして扱わない・止めない。** ツールのフォルダーに
+    ランチャーのフォルダーが入っている置き方では、ランチャーを起こした
+    pyw.exe のコマンドラインがそのフォルダーを指すので、ツールの一部に
+    見えてしまう (その子のランチャーごと止めることになる)。
+    """
+    me = os.getpid()
+    if rows is None:
+        rows = _processes()
+    parent_of = {pid: parent for pid, parent, _ in rows}
+    starts: dict = {}
+    result = {me}
+    child = me
+    while True:
+        parent = parent_of.get(child)
+        if not parent or parent in result or parent in (0, 4) or parent not in parent_of:
+            break
+        if _older_than_parent(child, parent, starts):
+            break                             # 番号を使い回された別のプロセス
+        result.add(parent)
+        child = parent
+    return result
+
+
 def process_tree(pid: Pids) -> set[int]:
     """そのプロセス (いくつでも) と、その子・孫。**動いているものだけ。**
 
@@ -269,25 +317,39 @@ def process_tree(pid: Pids) -> set[int]:
     まとめた exe は、本体が子を起こして、窓は子が出す)。前に出す・閉じる
     ときは子まで見る。起こした本人が先に終わっても、子は残る (親の番号を
     覚えたまま) ので、終わった本人の番号からでも子をたどれる。
+
+    ただし**ランチャー自身とその祖先は決して入れない** (`protected_pids`)。
+    また、親より前に起動した「子」は、番号を使い回された別のプロセスの
+    子なので入れない (`_older_than_parent`)。
     """
     roots = {pid} if isinstance(pid, int) else set(pid)
     roots = {p for p in roots if p and p > 0}
     if not roots:
         return set()
     rows = _processes()
+    protected = protected_pids(rows)
+    # 祖先から下へたどると、ランチャー自身や関係ないものまで入る
+    roots -= protected - {os.getpid()}
     alive = {child for child, _, _ in rows}
     children: dict[int, list[int]] = {}
     for child, parent, _ in rows:
         if child != parent:
             children.setdefault(parent, []).append(child)
+    starts: dict = {}
     tree = set(roots)
     stack = list(roots)
     while stack:
-        for child in children.get(stack.pop(), []):
-            if child not in tree:
-                tree.add(child)
-                stack.append(child)
-    return tree & alive
+        parent = stack.pop()
+        for child in children.get(parent, []):
+            if child in tree or child in protected:
+                continue
+            if parent in alive and _older_than_parent(child, parent, starts):
+                log.debug("PID %s は PID %s の子ではありません (番号の使い回し)",
+                          child, parent)
+                continue
+            tree.add(child)
+            stack.append(child)
+    return (tree & alive) - protected
 
 
 def process_image(pid: int) -> str:
@@ -336,6 +398,30 @@ def process_image(pid: int) -> str:
     except Exception as exc:                  # noqa: BLE001
         log.debug("PID %s の実行ファイルを取れませんでした: %s", pid, exc)
         return ""
+
+
+def system_boot_time() -> Optional[float]:
+    """この端末が起動した時刻 (エポック秒)。分からなければ None。
+
+    前のランチャーが片付けずに終わっていたとき、**そのあとで端末が
+    起動し直していれば**電源断・再起動のせい (ランチャーの不具合ではない)。
+    """
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32")
+            kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+            return time.time() - kernel32.GetTickCount64() / 1000.0
+        except Exception:                     # noqa: BLE001
+            return None
+    try:
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def process_started_at(pid: int) -> Optional[float]:
@@ -511,10 +597,11 @@ def processes_in_folder(folder: str) -> list[int]:
     if not folder_is_specific(folder):
         return []
     wanted = _normalize(folder) + "/"
-    me = os.getpid()
+    rows = _processes()
+    protected = protected_pids(rows)
     found = []
-    for pid, _, _ in _processes():
-        if pid in (0, 4, me):
+    for pid, _, _ in rows:
+        if pid in (0, 4) or pid in protected:
             continue
         image = process_image(pid)
         if IS_WINDOWS and _normalize(image).startswith(wanted):

@@ -111,6 +111,8 @@ def run(report: Report = lambda step: None, *,
                 "二重に起動することがあります。"
                 + (f"\n\n障害記録: {trace.real_path(path)}" if path else "")))
         result.manager = manager
+        if guard.leftover is not None:
+            _report_unclean_end(guard.leftover, manager)
 
         enter(BAR)
         # 起動ファイルを**ここで**確かめておく (起動中の窓が出ているあいだ)。
@@ -139,6 +141,59 @@ def run(report: Report = lambda step: None, *,
                         f" / 記録の置き場所 {trace.destination().describe()}"),
                 elapsed=clock() - started_at)
     return result
+
+
+def _report_unclean_end(info, manager) -> str:
+    """前のランチャーが**終了の手順を通らずに**終わっていた (ロックが残っていた)。
+
+    「ツールを起動したらランチャーが閉じた」は、利用者には理由が見えない。
+    ふつうに終われば (例外で落ちても) ロックは必ず消すので、残っていれば:
+
+    * そのあと端末が起動し直している → 電源断・再起動。記録だけ
+    * そうでなければ → Python ごと落ちた (落ちたときの記録がある) か、
+      外から止められた (taskkill・タスクマネージャー・ツールが止めた)。
+      障害記録を書き、バーの［詳細］で知らせる
+
+    障害記録の場所を返す (書かなかったら空)。
+    """
+    from launcher import desktop
+
+    when = info.started_text
+    boot_at = desktop.system_boot_time()
+    if boot_at is not None and boot_at > info.started_at:
+        log.info("前回のランチャー (pid=%s, %s 起動) は端末の再起動・電源断で"
+                 "終わっていました", info.pid, when)
+        trace.event("前回の終わり方", trace.INFO, cause="端末の再起動・電源断",
+                    detail=f"pid={info.pid} / {when} 起動")
+        return ""
+
+    crash = trace.crash_lines_since(info.started_at)
+    whys = [f"前回のランチャー (pid={info.pid}, {when} 起動) のロックが残っていた"
+            " ── ふつうに終われば (例外で落ちても) 必ず消している",
+            "そのあと端末は起動し直していない (電源断・再起動ではない)"]
+    if crash:
+        whys.append("落ちたときの記録 (faulthandler) が残っている ── "
+                    "Python ごと落ちた (アクセス違反・abort など)")
+        hints = ["落ちたときの記録の、最後のスレッドの流れを開発担当へ渡してください"]
+    else:
+        whys.append("落ちたときの記録は残っていない")
+        hints = ["外から止められた可能性: タスクマネージャー・taskkill、"
+                 "またはツールが起動・終了のときに python / pythonw を止めていないか",
+                 "ランチャーのログの最後の行で、何をしていたときかを確かめる"]
+    log_path = (trace.destination().path
+                / f"launcher_{time.strftime('%Y%m%d', time.localtime(info.started_at))}.log")
+    path = trace.incident(
+        "ランチャーが終了の手順を通らずに終わっていた", whys=whys, hints=hints,
+        observed=[("前回のランチャー", f"pid={info.pid} / {when} 起動 / {info.python}")],
+        attachments=[("落ちたときの記録", trace.crash_log_path()),
+                     ("前回のランチャーのログ", log_path)])
+    trace.event("前回の異常終了", trace.WARNING,
+                cause="落ちた" if crash else "外から止められた可能性",
+                detail=f"pid={info.pid} / {when} 起動", incident=path)
+    manager.notify("前回、ランチャーが終了の手順を通らずに終わっていました"
+                   " (急に閉じた)。\n［詳細］の障害記録を開発担当へ渡してください。",
+                   incident=path)
+    return path
 
 
 def _check_start_files(manager) -> None:

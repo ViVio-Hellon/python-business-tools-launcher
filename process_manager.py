@@ -917,16 +917,31 @@ def _command_line_windows(pid: int) -> str:
 
 
 def _terminate(pid: int, *, force: bool) -> bool:
-    """1つのプロセスを止める。要求を出せたかを返す。
+    """1つのプロセス (と、その子・孫) を止める。要求を出せたかを返す。
 
-    Windowsでは `taskkill` を使う。`/T` を付けるのは、`start.bat` から
-    起こした `cmd.exe` の下にPythonがぶら下がっているため ── 親だけ
-    落とすと、業務ツール本体が残る。
+    子まで止めるのは、`start.bat` から起こした `cmd.exe` の下にPythonが
+    ぶら下がっているため ── 親だけ落とすと、業務ツール本体が残る。
+
+    **ランチャー自身とその祖先は決して止めない** (`desktop.protected_pids`)。
+    以前は `taskkill /T` に子をたどらせていた。Windows の「親のPID」は
+    番号のまま残って使い回されるので、たとえば Start.vbs の wscript の
+    番号でツールが起動すると、**ランチャーがツールの子に見えて一緒に
+    落とされた** (ツールを起動・停止したらランチャーが閉じる)。子は
+    起動時刻で確かめてから、こちらで1つずつ指定する。
     """
+    protected = desktop.protected_pids()
+    if pid in protected:
+        log.error("ランチャー自身 (またはそれを起こしたプロセス) は止めません: pid=%s",
+                  pid)
+        return False
+    targets = sorted((desktop.process_tree(pid) | {pid}) - protected)
     if os.name == "nt":
-        command = ["taskkill", "/PID", str(pid), "/T"]
+        command = ["taskkill"]
+        for target in targets:
+            command += ["/PID", str(target)]
         if force:
             command.append("/F")
+        log.info("止めます: %s%s", targets, " (強制)" if force else "")
         try:
             subprocess.run(command, capture_output=True, text=True,
                            errors="replace", timeout=COMMAND_TIMEOUT_SEC,

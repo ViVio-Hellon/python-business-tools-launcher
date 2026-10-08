@@ -163,6 +163,13 @@ def start() -> int:
 
     log = get_logger("launcher")
     log_environment()
+    try:
+        from launcher import trace
+
+        # Python ごと落ちたとき (窓が何も言わずに消える) の手がかりを残す
+        trace.enable_crash_log()
+    except Exception:                         # noqa: BLE001 - 記録で止めない
+        log.warning("落ちたときの記録を用意できませんでした", exc_info=True)
 
     try:
         from launcher.ui.splash import run_with_splash

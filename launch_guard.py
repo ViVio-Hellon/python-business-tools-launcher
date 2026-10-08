@@ -30,7 +30,7 @@ import os
 import stat
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +70,9 @@ class GuardResult:
     existing: Optional[LockInfo] = None
     # 起動はするが、利用者に知らせたいこと (ロックを片付けられなかった、など)
     warning: str = ""
+    # 片付けた残りのロック (前のランチャーが**終了の手順を通らずに**終わった:
+    # 強制終了・異常終了・電源断)。ふつうに終われば、ロックは必ず消している
+    leftover: Optional[LockInfo] = None
 
 
 def lock_path() -> Path:
@@ -154,6 +157,7 @@ def acquire() -> GuardResult:
     path = lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    leftover: Optional[LockInfo] = None
     for attempt in (1, 2):
         try:
             handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -171,10 +175,11 @@ def acquire() -> GuardResult:
                 stream.write(json.dumps(asdict(info), ensure_ascii=False,
                                         indent=2))
             log.info("ロックを取りました: %s (pid=%s)", path, info.pid)
-            return GuardResult(True, "ロックを取りました")
+            return GuardResult(True, "ロックを取りました", leftover=leftover)
 
         # すでに誰かが持っている。中身を見て、生きているかを判断する
         verdict = _inspect_existing()
+        leftover = verdict.leftover or leftover
         if not verdict.should_start or verdict.warning:
             # 片付けられないロックなら、取り直しても同じ。**起動は止めない**
             # ── 「ほかのランチャーが起動したようです」と誤って断ると、
@@ -209,7 +214,7 @@ def _inspect_existing() -> GuardResult:
 
     verdict = judge_owner(info)
     if verdict.should_start:
-        return _discard(verdict.reason)
+        return replace(_discard(verdict.reason), leftover=info)
     return verdict
 
 
@@ -312,7 +317,7 @@ def check_existing() -> GuardResult:
     # `acquire()` と**同じ判断**を使う (片方だけ直した状態を作らない)
     verdict = judge_owner(info)
     if verdict.should_start:
-        return _discard(verdict.reason)
+        return replace(_discard(verdict.reason), leftover=info)
     return verdict
 
 
