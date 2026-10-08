@@ -253,11 +253,21 @@ def stop(running: RunningTool, *, force: bool = False,
         # 「止まらないまま放置」がいちばん困る
         attempts = [method] if method == "pid" else [method, "pid"]
 
+    # 窓に「閉じて」と頼んだか。頼んだあとは stop.bat・停止要求を使わず PID へ
+    # 進む ── デスクトップ版の stop.bat は窓を前に出すために exe を起動する
+    # ので、窓が閉じかけだと**新しく起動してしまう** (coil-packing-tools・
+    # all-tools の報告)
+    asked_window = False
     for attempt in attempts:
+        if asked_window and attempt in ("stop_bat", "shutdown_api"):
+            log.info("窓に閉じるよう頼んだあとなので、%s は使わずに次へ: %s",
+                     attempt, running.app_id)
+            continue
         if attempt == "stop_bat":
             outcome = _stop_by_bat(running, force=force, timeout=timeout)
         elif attempt == "close_window":
             outcome = _stop_by_closing(running, force=force)
+            asked_window = outcome is not None
         elif attempt == "shutdown_api":
             outcome = _stop_by_api(running, force=force, timeout=timeout)
         else:

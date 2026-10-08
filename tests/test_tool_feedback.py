@@ -52,6 +52,38 @@ class AppStopTests(ManagerTestCase):
         self.assertEqual(desktop.processes_in_folder(str(exe.parent)), [])
 
 
+class ForceAppStopTests(ManagerTestCase):
+
+    def test_窓に閉じるよう頼んだあとの強制終了はstopbatでなくPIDで止める(self) -> None:
+        """デスクトップ版の stop.bat は窓を前に出すために exe を起動する。窓が
+        閉じかけのときに呼ぶと、新しく起動してしまう (coil-packing-tools・all-tools)。"""
+        exe = make_app_dir(self.work_root, app_id="nlm.coil-packing", ask_on_close=True)
+        marker = exe.parent / "stop_bat_called.txt"
+        stop_bat = exe.parent / "stop.bat"
+        stop_bat.write_text(f"#!/bin/sh\necho \"$@\" >> '{marker}'\nexit 0\n",
+                            encoding="utf-8")
+        os.chmod(stop_bat, 0o755)
+        tool_registry.save(tool_registry.Tool(
+            app_id="nlm.coil-packing", display_name="コイル梱包ツール",
+            start_command=str(exe)))
+        tool = tool_registry.get("nlm.coil-packing")
+        self.assertTrue(tool.is_app)
+        self.start(tool)
+        pid = self.manager.running[tool.app_id].pid
+        # 「保存しますか」を出して止まらない → 断り
+        self.assertFalse(self.manager._stop_blocking(tool.app_id))
+        # 強制終了: 窓に頼み直したあと、stop.bat --force ではなく PID で止める
+        with mock.patch.object(process_manager, "_stop_by_pid",
+                               wraps=process_manager._stop_by_pid) as by_pid:
+            self.assertTrue(self.manager._stop_blocking(tool.app_id, force=True))
+        self.assertTrue(by_pid.called)
+        self.assertFalse(marker.exists(), "窓が閉じかけなのに stop.bat を呼びました")
+        deadline = time.monotonic() + 5
+        while process_manager.is_pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(process_manager.is_pid_alive(pid))
+
+
 class StopExitCodeTests(ManagerTestCase):
 
     def test_stopbatが断ったら待たずに理由を出しforceで呼び直す(self) -> None:
