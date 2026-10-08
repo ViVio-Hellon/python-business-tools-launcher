@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -69,6 +70,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, "Entries"]] = {}
+_LOCAL_URL = re.compile(r"http://(127\.0\.0\.1|localhost):(\d{2,5})/[^\s)」）]*")
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,21 @@ class Check:
     @property
     def ready(self) -> bool:
         return self.state == READY
+
+    @property
+    def url(self) -> str:
+        """答えの行にある、この端末の画面の URL (`http://127.0.0.1:8742/` など)。
+
+        ツールは、空いていなければ次のポートで待ち受けることがある。**ツールが
+        自分で答えた URL** を使えば、ランチャーは設定のポートを決め打ちしない。
+        """
+        found = _LOCAL_URL.search(self.note or "")
+        return found.group(0) if found else ""
+
+    @property
+    def port(self) -> int:
+        found = _LOCAL_URL.search(self.note or "")
+        return int(found.group(2)) if found else 0
 
     @property
     def alive(self) -> bool:

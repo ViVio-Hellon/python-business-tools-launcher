@@ -365,7 +365,8 @@ class ToolManager:
                 answer = answers.get(tool.app_id)
                 if answer is not None and answer.alive:
                     adopted[tool.app_id] = (recorded.get(tool.app_id)
-                                            or _running_by_entries(tool, confirmed=answer.ready))
+                                            or _running_by_entries(tool, confirmed=answer.ready,
+                                                                   answer=answer))
                 continue
             if tool.watches_window:
                 # Web サーバーを持たないアプリ。プロセスで探す
@@ -588,7 +589,7 @@ class ToolManager:
             answer = tool_entries.check(entries)
             if not answer.alive:
                 return None
-            return _running_by_entries(tool, confirmed=answer.ready)
+            return _running_by_entries(tool, confirmed=answer.ready, answer=answer)
         # 待ち受けが無いのに当たりにいかない (Windows では断られるまで
         # 1〜2 秒かかり、押すたびに待たせる)
         if tool.health_url and desktop.port_listening(tool.port) is not False:
@@ -1153,7 +1154,8 @@ class ToolManager:
             return
 
         if how == "entry":
-            running = _running_by_entries(tool, launch_pid=proc.pid)
+            running = _running_by_entries(tool, launch_pid=proc.pid,
+                                          answer=seen.get("check"))
         elif how in ("window", "alive") and not tool.is_app:
             # ブラウザーで使うツールが、自分の窓を出した。画面はツールの窓
             # なので**ランチャーはブラウザーを開かない** (開けば画面が2枚)
@@ -1375,11 +1377,18 @@ class ToolManager:
 
     def _kill_started(self, tool: Tool, proc: subprocess.Popen) -> None:
         """起動しかけて応答しないまま動いているものを片付ける (起こしたものだけ)。"""
-        tree = desktop.process_tree({proc.pid})
-        log.info("起動できなかった %s のプロセスを片付けます: %s",
-                 tool.app_id, sorted(tree))
-        for pid in sorted(tree, reverse=True):
-            process_manager._terminate(pid, force=True)
+        # 受け皿 (start.bat) が、ちょうど本体を起こしているところかもしれない。
+        # 一覧を取ったあとに生まれた子を取りこぼさないよう、少し置いてもう一度見る
+        # (受け皿が終わっても、子は親の番号でたどれる)
+        for round_no in range(2):
+            tree = desktop.process_tree({proc.pid})
+            if round_no == 0 or tree:
+                log.info("起動できなかった %s のプロセスを片付けます: %s",
+                         tool.app_id, sorted(tree))
+            for pid in sorted(tree, reverse=True):
+                process_manager._terminate(pid, force=True)
+            if round_no == 0:
+                time.sleep(0.3)
         try:
             proc.wait(timeout=5)
         except (OSError, subprocess.SubprocessError):
@@ -1485,6 +1494,12 @@ class ToolManager:
             running = _running_from_health(tool, payload, launch_pid=proc.pid)
             log.info("打ち切ったツールを止めます: %s", running.summary())
             process_manager.stop(running, force=True, timeout=10)
+        if not entries.has_check:
+            # まだ答えていなくても、起こしかけのものは**子・孫ごと**片付ける。
+            # 以前は start.bat (受け皿) だけを落とし、その下で立ち上がりかけの
+            # ツール本体が残った (起動の最中にランチャーを閉じたとき)
+            self._kill_started(tool, proc)
+            return
         try:
             if proc.poll() is None:
                 proc.kill()
@@ -2133,13 +2148,21 @@ def _running_from_health(tool: Tool, payload: Optional[dict],
 
 
 def _running_by_entries(tool: Tool, *, launch_pid: int = 0,
-                        confirmed: bool = True) -> RunningTool:
-    """ツールの入口で起動を確かめたツールの記録。"""
+                        confirmed: bool = True,
+                        answer: "Optional[tool_entries.Check]" = None) -> RunningTool:
+    """ツールの入口で起動を確かめたツールの記録。
+
+    入口の答えに画面の URL があれば (`ブラウザ版が使えます(http://127.0.0.1:8742/)`)、
+    **その URL を開く**。ツールは設定のポートが空いていなければ次の番号を使う。
+    """
     if tool.is_app:
         return _running_for_app(tool, launch_pid or _find_app_pid(tool),
                                 confirmed=confirmed)
     running = _running_from_health(tool, {}, launch_pid=launch_pid)
     running.confirmed = confirmed
+    if answer is not None and answer.url:
+        running.url = answer.url
+        running.port = answer.port
     return running
 
 

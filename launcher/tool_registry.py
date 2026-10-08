@@ -912,6 +912,10 @@ def probe_tool_folder(start_command: str) -> dict:
         port = _first_port(raw.get("server"))
         if port:
             found["port"] = port
+        roles = _role_ports(raw.get("server"))
+        if len(roles) > 1:
+            # 役割 (現場・資材など) でポートが違う。どれを使うかは端末ごと
+            found["role_ports"] = roles
         if raw.get("ui_mode") in (UI_BROWSER, UI_APP):
             found["ui_mode"] = raw["ui_mode"]
 
@@ -1103,6 +1107,16 @@ def _mentions_no_browser(folder: Path) -> bool:
             except OSError:
                 continue
     return False
+
+
+def _role_ports(server) -> dict:
+    """役割ごとのポート (`{"field": 8713, "material": 8723}`)。無ければ空。"""
+    roles = server.get("roles") if isinstance(server, dict) else None
+    if not isinstance(roles, dict):
+        return {}
+    return {str(name): role["port"] for name, role in roles.items()
+            if isinstance(role, dict) and isinstance(role.get("port"), int)
+            and role["port"] > 0}
 
 
 def _first_port(server) -> int:
@@ -1375,3 +1389,98 @@ def describe() -> str:
         if problem:
             lines.append(f"         [注意] {problem}")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# ［設定］のヒント (どう設定すればよいか)
+# ------------------------------------------------------------------
+def setting_hints(tool: Tool, probed: Optional[dict] = None) -> list[str]:
+    """その行の設定について、**どう設定するのがよいか**の短い案内。
+
+    ランチャーはツールごとの特殊な処理を持たない (ランチャー連携 §2) ので、
+    ここも**起動ファイルとその隣にあるもの**から言えることだけを言う:
+    起動ファイルの種類・ツールの入口・config/app.json のポート・隣の
+    stop.bat / Start.vbs・ほかの行とのフォルダーの重なり。例外は出さない。
+    """
+    from . import tool_entries
+
+    path = (tool.start_command or "").strip().strip('"')
+    if not path:
+        return ["起動ファイルを［参照］で選んでください (exe・Start.vbs・start.bat)"]
+    if not fileprobe.probe(path).found:
+        return []                             # 確かめられない置き場所は問い合わせない
+    entry = Path(path)
+    kind = tool.entry_kind
+    found = probed if probed is not None else probe_tool_folder(path)
+    entries = tool_entries.for_start(path)
+    hints: list[str] = []
+
+    if entries.any:
+        hints.append("ツールが入口を用意しています (" + entries.describe().replace(
+            "ツールの入口: ", "") + ")。起動の確かめと停止はそれを使うので、"
+            "ポート・停止方法は自動のままでかまいません")
+
+    app_port = int(found.get("port") or found.get("browser_port") or 0)
+    roles = found.get("role_ports") or {}
+    if kind == "exe":
+        browser_port = int(found.get("browser_port") or 0)
+        if tool.port > 0 and not entries.has_check:
+            if tool.port == browser_port:
+                hints.append(f"ポートは空にしてください。{tool.port} は config/app.json の"
+                             "ブラウザー版のポートで、exe 版は待ち受けません")
+            else:
+                hints.append("exe 版のポートは、exe 自身が Web サーバーとして待ち受ける"
+                             "ときだけ入れます。デスクトップ版 (自分の窓) なら空に")
+        if tool.stop_method == "auto" and not entries.stop:
+            stop_bat = entry.with_name("stop.bat")
+            text = ("停止 (自動) は、窓に「閉じて」と頼みます (× と同じ)。窓に確認が"
+                    "出るツールは、利用者が答えるまで待ちます")
+            if fileprobe.is_file(stop_bat):
+                # 隣の stop.bat はブラウザー版のためのことが多い (exe 版を止めない・
+                # 窓を前に出すために exe を起動するものもある)。勧めはしない
+                text += ("。隣の stop.bat はブラウザー版用のことが多いので、停止方法は"
+                         "自動のままを勧めます (ツールの説明が exe 版に stop.bat を"
+                         "指定しているときだけ「stop_bat」に)")
+            hints.append(text)
+    else:
+        if kind == "bat" and entry.name.lower() == "start.bat" \
+                and fileprobe.is_file(entry.with_name("Start.vbs")):
+            hints.append("start.bat は診断用です。ふだんは隣の Start.vbs を勧めます "
+                         "(start.bat だとランチャーが画面を先に閉じてから止めるので、"
+                         "保存が閉じ際の送信頼みになります)")
+        if kind == "vbs" and not tool.forwards_args:
+            hints.append("この Start.vbs は引数を渡さないので、画面はツールがふだんの"
+                         "ブラウザーに開きます (ランチャーからは前に出せません。"
+                         "押すと「動いています」と出ます)")
+        if not entries.has_check:
+            if roles:
+                listed = " / ".join(f"{name} {port}" for name, port in roles.items())
+                hints.append(f"役割ごとにポートが違います ({listed})。"
+                             "この PC の役割のポートにしてください")
+            elif tool.port <= 0 and app_port:
+                hints.append(f"ポートは config/app.json の {app_port} です")
+            elif app_port and tool.port != app_port:
+                hints.append(f"config/app.json のポートは {app_port} です "
+                             f"(いまは {tool.port})。違う番号で動かす PC でなければ合わせてください")
+        if tool.stop_method == "auto" and not entries.stop:
+            if fileprobe.is_file(entry.with_name("stop.bat")):
+                hints.append("停止 (自動) は隣の stop.bat を使います。ツールが断ったら"
+                             "理由を出し、強制終了するかを聞きます")
+
+    # ほかの行とフォルダーが重なる (統合ツールの中のツールなど)
+    folder = _normalize_folder(str(entry.parent))
+    for other in all_tools(include_disabled=True):
+        if other.app_id == tool.app_id or not other.start_command.strip():
+            continue
+        theirs = _normalize_folder(other.resolved_work_dir)
+        name = other.display_name or other.app_id
+        if theirs and folder.startswith(theirs + "/"):
+            hints.append(f"このフォルダーは「{name}」のフォルダーの中です。中のツールは"
+                         f"「{name}」が自分で起こすなら、登録しないでください")
+        elif theirs and theirs.startswith(folder + "/"):
+            hints.append(f"「{name}」はこのツールのフォルダーの中にあります。"
+                         "このツールが中で起こすものなら、そちらは登録しないでください")
+        elif theirs == folder:
+            hints.append(f"「{name}」と同じフォルダーです。1台の PC には exe 版か"
+                         "ブラウザー版のどちらか1つを登録します")
+    return hints

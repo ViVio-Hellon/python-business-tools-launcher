@@ -76,7 +76,10 @@ class SettingsDialog:
         header.pack(fill="x", padx=16, pady=(14, 2))
         tk.Label(self.top,
                  text="PCごとに置き場所が違っていても、ここを変えるだけで動きます。"
-                      "ツールの追加・削除もここで行えます。",
+                      "ツールの追加・削除もここで行えます。\n"
+                      "各行の下の「ヒント」(橙色) に、選んだ起動ファイルでのおすすめの"
+                      "設定が出ます (ポート・停止方法・登録しないほうがよいもの)。",
+                 justify="left",
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(fill="x", padx=16, pady=(0, 10))
 
@@ -660,10 +663,63 @@ class _ToolRow:
         self.note = tk.Label(box, text="", bg=theme.BG, fg=theme.MUTED,
                              font=theme.FONT_SMALL, anchor="w", justify="left",
                              wraplength=560)
-        # ツールが用意した入口 (launcher_check.bat など) があれば、どれを
-        # 使うかを見せる。**ランチャーの推測より優先する**ので、知らずに
-        # いると「設定の停止方法が効かない」ように見える
-        self.show_note(tool_entries.for_start(tool.start_command).describe())
+        # **どう設定するのがよいか**のヒント。起動ファイル・ポート・停止方法・
+        # 画面を変えるたびに出し直す (ツールの入口・config/app.json の
+        # ポート・隣の stop.bat / Start.vbs・ほかの行との重なりから)
+        self.hint_label = tk.Label(box, text="", bg=theme.BG,
+                                   fg=theme.STATE_COLORS["starting"],
+                                   font=theme.FONT_SMALL, anchor="w", justify="left",
+                                   wraplength=680)
+        self._probe_cache: tuple[str, dict] = ("", {})
+        self._hint_job = None
+        for var in (self.path_var, self.port_var, self.stop_var, self.ui_var,
+                    self.args_var):
+            var.trace_add("write", lambda *_: self._schedule_hints())
+        self.refresh_hints()
+
+    def _schedule_hints(self) -> None:
+        """打っているあいだは出し直さない (打ち終わってから)。"""
+        if self._hint_job is not None:
+            try:
+                self.hint_label.after_cancel(self._hint_job)
+            except tk.TclError:
+                pass
+        self._hint_job = self.hint_label.after(400, self.refresh_hints)
+
+    def draft(self) -> Tool:
+        """いま入っている値の Tool (確かめずに。ヒント用)。"""
+        raw_port = self.port_var.get().strip()
+        try:
+            port = int(raw_port) if raw_port else 0
+        except ValueError:
+            port = 0
+        return replace(self.tool,
+                       start_command=self.path_var.get().strip().strip('"'),
+                       start_args=self.args_var.get().strip(), port=port,
+                       stop_method=self.stop_var.get().strip() or "auto",
+                       ui_mode=self._ui_keys.get(self.ui_var.get(), ""))
+
+    def refresh_hints(self) -> None:
+        self._hint_job = None
+        tool = self.draft()
+        path = tool.start_command
+        if self._probe_cache[0] != path:
+            try:
+                found = tool_registry.probe_tool_folder(path) if path else {}
+            except Exception:                 # noqa: BLE001 - ヒントで止めない
+                found = {}
+            self._probe_cache = (path, found)
+        try:
+            hints = tool_registry.setting_hints(tool, probed=self._probe_cache[1])
+        except Exception:                     # noqa: BLE001 - ヒントで止めない
+            log.warning("設定のヒントを作れませんでした", exc_info=True)
+            hints = []
+        self.hints = hints
+        if hints:
+            self.hint_label.configure(text="\n".join(f"ヒント: {h}" for h in hints))
+            self.hint_label.pack(fill="x", pady=(2, 0))
+        else:
+            self.hint_label.pack_forget()
 
     def show_note(self, text: str) -> None:
         if text:
@@ -678,8 +734,7 @@ class _ToolRow:
         args, reason = tool_registry.recommend_start_args(path)
         if fileprobe.is_file(self.path_var.get()):
             self.args_var.set(args)
-        entries = tool_entries.for_start(path).describe()
-        self.show_note("\n".join(text for text in (reason, entries) if text))
+        self.show_note(reason)
 
     def _on_delete_toggled(self) -> None:
         if self.delete_var.get():
