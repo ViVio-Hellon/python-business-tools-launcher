@@ -84,30 +84,36 @@ class ProbeExeTests(LocalAreaTestCase):
             ' "server": {"port": 8741}}', encoding="utf-8")
         found = tool_registry.probe_tool_folder(str(path))
         self.assertEqual(found["app_id"], "nlm.kanban")
-        self.assertEqual(found["port"], 8741)
-        # ポートがあっても、Tauri なら自分の窓 (中にサーバーを持つ形)
         self.assertEqual(found["ui_mode"], "app")
         self.assertEqual(found["kind"], "tauri")
+        # app.json のポートはブラウザー版のもの。exe の行には入れない (1.7.1)
+        self.assertNotIn("port", found)
+        self.assertEqual(found["browser_port"], 8741)
 
-    def test_サーバーのexeはブラウザーのまま(self) -> None:
+    def test_exeの行にはブラウザー版のポートを入れない(self) -> None:
+        """現場の4ツールとも、exe 版とブラウザー版が同じ app.json を読み、
+        exe 版はそのポートで待ち受けない (各ツールの開発側の報告)。"""
         path = self.exe("server.exe")
         (path.parent / "config").mkdir()
         (path.parent / "config" / "app.json").write_text(
             '{"app_id": "nlm.daily", "server": {"port": 8733}}', encoding="utf-8")
         found = tool_registry.probe_tool_folder(str(path))
-        self.assertEqual(found["port"], 8733)
-        self.assertNotIn("ui_mode", found)
+        self.assertNotIn("port", found)
+        self.assertEqual(found["browser_port"], 8733)
+        self.assertEqual(found["ui_mode"], "app", "開く URL が無いのでアプリの窓")
 
     def test_起動引数を決める(self) -> None:
         args, reason = tool_registry.recommend_start_args(str(self.exe("app.exe")))
         self.assertEqual(args, "")
         self.assertIn("窓", reason)
 
+        # app.json にポートがあっても exe はアプリの窓として扱う (1.7.1)。
+        # Web サーバーの exe は、ポートと［画面］を手で入れる
         server = self.exe("server.exe", b"MZ...argparse --no-browser ...")
         (server.parent / "app.json").write_text('{"server": {"port": 8733}}',
                                                 encoding="utf-8")
         args, _ = tool_registry.recommend_start_args(str(server))
-        self.assertEqual(args, "--no-browser")
+        self.assertEqual(args, "")
 
     def test_画面の出し方を保存して読み戻す(self) -> None:
         tool_registry.save(Tool(app_id="exe.app", display_name="App",

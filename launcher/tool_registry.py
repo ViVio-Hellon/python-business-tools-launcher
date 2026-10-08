@@ -267,6 +267,12 @@ class Tool:
         """
         if not self.start_command.strip():
             return ""
+        from . import tool_entries
+
+        if tool_entries.for_tool(self).has_check:
+            # ツールが起動確認の入口を用意している。ポートが無くても、
+            # 起動・生死はその入口で確かめられる (ランチャー連携 §10)
+            return ""
         if self.is_app:
             if not self.health_url and self.entry_kind != "exe":
                 return ("Web サーバーを持たないアプリは、起動ファイルに exe を"
@@ -914,11 +920,19 @@ def probe_tool_folder(start_command: str) -> dict:
 
     from . import desktop
 
+    # **exe の隣の app.json のポートは、ブラウザー版のもの。** 現場の4ツール
+    # (all-tools・python-web-tools・CoilCalculator・coil-packing-tools) は
+    # どれも exe 版とブラウザー版が同じ設定ファイルを読み、exe 版 (デスクトップ
+    # 版) はそのポートで待ち受けない。入れると、起動確認を待ち続けたり、
+    # 止めるとき窓を閉じずに PID で止めにいったりする。exe 自身が待ち受ける
+    # ときだけ、手で入れてもらう
+    if "port" in found:
+        found["browser_port"] = found.pop("port")
     if "ui_mode" not in found:
         if desktop.looks_like_tauri(entry):
             found["ui_mode"] = UI_APP
             found["kind"] = "tauri"
-        elif "port" not in found:
+        else:
             found["ui_mode"] = UI_APP         # 開く画面 (URL) が無い
     if "display_name" not in found:
         found["display_name"] = desktop.file_description(entry) or entry.stem
@@ -1354,6 +1368,9 @@ def describe() -> str:
             lines.append(f"         終了: ツールの入口 {entries.stop}")
         if entries.problem:
             lines.append(f"         [注意] {entries.problem}")
+        if tool.entry_kind == "exe" and tool.port > 0 and not entries.has_check:
+            lines.append(f"         [注意] exe の行にポート {tool.port} があります。"
+                         "exe (デスクトップ版) が待ち受けないなら空にしてください")
         problem = tool.ui_problem()
         if problem:
             lines.append(f"         [注意] {problem}")

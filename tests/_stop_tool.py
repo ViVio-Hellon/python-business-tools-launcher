@@ -24,7 +24,16 @@ def main(argv: list[str]) -> int:
         with opener.open(request, timeout=5) as res:
             payload = json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        print(f"停止できません (HTTP {exc.code})")
+        # 本物 (python-web-tools の process_manager.py) と同じく、断られた理由を先に出す
+        try:
+            running = json.loads(exc.read().decode("utf-8")).get("running") or []
+        except (ValueError, OSError):
+            running = []
+        if running:
+            print(f"[--] field: 実行中の処理があります: {', '.join(running)}")
+        else:
+            print(f"停止できません (HTTP {exc.code})")
+        print("止められなかったものがあります。上のメッセージを確認してください。")
         return 1
     except (urllib.error.URLError, OSError):
         print("動いていませんでした")

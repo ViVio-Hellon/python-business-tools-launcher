@@ -174,6 +174,7 @@ class SettingsDialog:
                     ui_mode=found.get("ui_mode", ""))
         if found.get("kind") == "tauri":
             reason = "Tauri のアプリと見分けました。" + reason
+        reason = "\n".join(text for text in (reason, _port_note(found)) if text)
         hint = getattr(self, "_empty_hint", None)
         if hint is not None:
             hint.destroy()
@@ -511,6 +512,7 @@ class SettingsDialog:
 
         warnings = [_delivery_warning(tool) for tool in updated]
         warnings = [text for text in warnings if text] + _shared_port_warnings(updated)
+        warnings += [text for text in (_exe_port_warning(tool) for tool in updated) if text]
         if warnings and not messagebox.askyesno(
                 "設定",
                 "\n\n".join(warnings) + "\n\nこのまま保存しますか?",
@@ -697,12 +699,20 @@ class _ToolRow:
             initialdir=initial or None, filetypes=ENTRY_FILETYPES)
         if chosen:
             self.path_var.set(chosen)
-            if chosen.lower().endswith(".exe") and self.ui_var.get() == "自動":
+            note = ""
+            if chosen.lower().endswith(".exe"):
                 found = tool_registry.probe_tool_folder(chosen)
-                if found.get("ui_mode"):
+                if self.ui_var.get() == "自動" and found.get("ui_mode"):
                     self.ui_var.set(UI_LABELS[found["ui_mode"]])
+                # ブラウザー版のポートが残っていれば空にする (exe は待ち受けない)
+                if found.get("browser_port") and \
+                        self.port_var.get().strip() == str(found["browser_port"]):
+                    self.port_var.set("")
+                note = _port_note(found)
             # 起動ファイルが変われば、渡せる引数も変わる
             self.recommend_args()
+            if note:
+                self.show_note("\n".join(t for t in (self.note.cget("text"), note) if t))
 
     def label(self) -> str:
         """問題を知らせるときの呼び名。"""
@@ -754,6 +764,24 @@ class _ToolRow:
         if problem:
             return self.tool, problem
         return tool, ""
+
+
+def _port_note(found: dict) -> str:
+    """exe の行のポートを空にした理由 (ブラウザー版のポートだった)。"""
+    port = found.get("browser_port")
+    if not port:
+        return ""
+    return (f"ポートは空にしました。config/app.json の {port} はブラウザー版のもので、"
+            "exe は待ち受けません (exe 自身が待ち受けるときだけ入れてください)")
+
+
+def _exe_port_warning(tool: Tool) -> str:
+    """exe の行にポートがある。デスクトップ版なら空にすべき (現場の4ツールの報告)。"""
+    if not tool.enabled or tool.entry_kind != "exe" or tool.port <= 0:
+        return ""
+    return (f"{tool.display_name or tool.app_id}: exe の行にポート {tool.port} があります。"
+            "exe (デスクトップ版) がそのポートで待ち受けないなら空にしてください。"
+            "そのままだと、起動確認を待ち続けて「応答しません」と知らせます。")
 
 
 def _shared_port_warnings(tools: list[Tool]) -> list[str]:

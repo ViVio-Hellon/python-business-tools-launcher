@@ -154,6 +154,9 @@ class Status:
     incident: str = ""
     # そのツールの画面の出し方。"browser" / "app" (進み具合の窓が使う)
     ui_mode: str = ""
+    # 止めようとして**ツールに断られた** (実行中の処理・終了の確認)。
+    # バーは、利用者が止めようとしたツールなら、すぐ「強制終了しますか」を聞く
+    refused: bool = False
 
     @property
     def busy(self) -> bool:
@@ -277,7 +280,7 @@ class ToolManager:
              elapsed: float = 0.0, responding: bool = False,
              browser_open: Optional[bool] = None, phase: str = "",
              stage: str = "", timeout: float = 0.0,
-             incident: str = "") -> None:
+             incident: str = "", refused: bool = False) -> None:
         """知らせを出す。`who` は `Tool` か `RunningTool` (どのツールのことか)。"""
         app_id = getattr(who, "app_id", "") if who is not None else ""
         name = getattr(who, "display_name", "") if who is not None else ""
@@ -307,7 +310,7 @@ class ToolManager:
             phase=phase, stage=stage, timeout=timeout,
             running_ids=running_ids, starting_ids=starting_ids,
             stopping_ids=stopping_ids, focus_id=self._focus,
-            incident=incident, ui_mode=ui_mode))
+            incident=incident, ui_mode=ui_mode, refused=refused))
 
     def notify(self, detail: str, *, incident: str = "") -> None:
         """全体への案内を出す (起動ファイルを確かめられない、など)。
@@ -844,11 +847,12 @@ class ToolManager:
         if result.busy:
             # 実行中の処理がある。**止めずに知らせる** (基盤仕様書 2.8)。
             # 中断してよいかは利用者が決める
-            detail = (f"{name}で実行中の処理があります: "
+            detail = (f"{name}が終了を断りました: "
                       + "、".join(result.busy_jobs)
                       + "\n終了するときは［ツール停止］から「強制終了」を"
                         "選んでください")
-            if running.is_app:
+            if running.is_app and any(job.startswith("終了の確認")
+                                      for job in result.busy_jobs):
                 detail = (f"{name}は終了の確認を出しているようです。"
                           "アプリの窓で答えてください。\n"
                           "確かめずに終わらせるときは、［ツール停止］から"
@@ -863,7 +867,7 @@ class ToolManager:
                         cause="実行中の処理がある: " + "、".join(result.busy_jobs),
                         elapsed=time.monotonic() - began)
             self._set(State.RUNNING, self.summary(), running, detail=detail,
-                      responding=True)
+                      responding=True, refused=True)
             return False
 
         if not result.stopped:

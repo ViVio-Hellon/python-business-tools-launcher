@@ -280,6 +280,17 @@ class ManagerEntryTests(ManagerTestCase):
         self.assertTrue((Path(tool.start_command).parent / "pid.txt").exists(),
                         "ランチャーがツールを止めました (止め方はツールが決める)")
 
+    def test_入口があればポートが無くても起動できる(self) -> None:
+        """ポートを知っているのはツール自身。入口があればランチャーは要らない。"""
+        start = make_entry_tool(self.work_root, "nlm.noport", ready_after=0.3)
+        self.roots.append(start.parent)
+        tool_registry.save(tool_registry.Tool(
+            app_id="nlm.noport", display_name="資材ツール", start_command=str(start)))
+        tool = tool_registry.get("nlm.noport")
+        self.assertEqual(tool.ui_problem(), "")
+        self.start(tool)
+        self.assertEqual(self.manager.status.state, State.RUNNING, self.manager.status.detail)
+
     def test_入口が無いツールはこれまでどおり(self) -> None:
         tool = self.register("fake.legacy", "カレンダー")
         self.start(tool)

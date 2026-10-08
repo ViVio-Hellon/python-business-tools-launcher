@@ -232,7 +232,8 @@ def check(entries: Entries, *, timeout: Optional[float] = None) -> Check:
     return Check(UNKNOWN, "起動確認の入口がありません")
 
 
-def _run(path: str, folder: str, timeout: float) -> tuple[Optional[int], str, str]:
+def _run(path: str, folder: str, timeout: float,
+         args: tuple = ()) -> tuple[Optional[int], str, str]:
     """入口を実行する。`(終了コード, 出力, 失敗の理由)`。時間切れなら終了コードは None。
 
     **出力はパイプではなく一時ファイルで受ける。** 入口が起こした子
@@ -243,7 +244,7 @@ def _run(path: str, folder: str, timeout: float) -> tuple[Optional[int], str, st
     try:
         with tempfile.TemporaryFile() as out:
             proc = subprocess.Popen(
-                [path], cwd=folder or None,
+                [path, *args], cwd=folder or None,
                 stdin=subprocess.DEVNULL,      # `pause` で固まらせない
                 stdout=out, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
             try:
@@ -330,11 +331,17 @@ def _check_by_url(url: str, timeout: float) -> Check:
     return Check(READY)
 
 
-def run_stop(entries: Entries, *, timeout: Optional[float] = None) -> tuple[bool, str]:
-    """終了の入口を実行する。`(実行して終了コード 0 だったか, 説明)`。"""
+def run_stop(entries: Entries, *, timeout: Optional[float] = None,
+             force: bool = False) -> tuple[bool, str]:
+    """終了の入口を実行する。`(実行して終了コード 0 だったか, 説明)`。
+
+    利用者が強制終了 (中断) を選んだときは `--force` を付けて呼ぶ。
+    受け付けないツールは無視してよい。
+    """
     timeout = STOP_TIMEOUT_SEC if timeout is None else timeout
     name = Path(entries.stop).name
-    code, output, problem = _run(entries.stop, entries.folder, timeout)
+    code, output, problem = _run(entries.stop, entries.folder, timeout,
+                                 ("--force",) if force else ())
     if code is None:
         return False, problem
     output = output.strip()

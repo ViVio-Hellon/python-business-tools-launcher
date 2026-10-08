@@ -57,6 +57,8 @@ log = get_logger("process_manager")
 
 # 正常終了を頼んだあと、実際に落ちるのを待つ上限 (秒)
 GRACEFUL_WAIT_SEC = 20.0
+# stop.bat が 0 以外で終わったあと、止まったかを確かめる短い待ち (秒)
+STOP_DECLINED_CHECK_SEC = 2.0
 # PIDで止めたあと、消えるのを待つ上限 (秒)
 TERMINATE_WAIT_SEC = 8.0
 # ブラウザー画面が閉じるのを待つ上限 (秒)。後始末があるので少し長め
@@ -224,14 +226,18 @@ def stop(running: RunningTool, *, force: bool = False,
     # (停止要求・窓を閉じる・PID) は、利用者が強制終了を選んだときだけ続ける
     entries = tool_entries.for_record(running)
     if entries.stop:
-        outcome = _stop_by_entry(running, entries, timeout=timeout)
+        outcome = _stop_by_entry(running, entries, timeout=timeout, force=force)
         outcome.browser_closed = result.browser_closed
         if outcome.stopped or not force:
             return outcome
         log.warning("%s。強制終了を選ばれたので、ランチャーの止め方で続けます",
                     outcome.message)
 
-    if not is_running(running):
+    # アプリの窓のツールは、起動確認 (/api/health) に答えなくても**窓が
+    # 生きていれば動いている**。以前はここで「応答しない」とみなして PID で
+    # 止めにいっていた (設定のポートがブラウザー版のもので、exe は待ち受け
+    # ない場合。python-web-tools の報告)
+    if not is_running(running) and not (running.is_app and app_alive(running)):
         # 応答しない。プロセスだけ残っていないか確かめてから片付ける
         return _handle_unresponsive(running, result, force=force)
 
@@ -262,11 +268,15 @@ def stop(running: RunningTool, *, force: bool = False,
         # 画面を閉じたかどうかは、止め方の結果にも引き継ぐ。落とすと
         # 呼び出し側が「閉じた画面」の後始末をしない
         outcome.browser_closed = result.browser_closed
-        if outcome.busy:
+        if outcome.busy and not force:
             # 実行中の処理がある。**止めずに知らせる** (基盤仕様書 2.8)。
             # 中断してよいかは利用者が決める
             log.info("実行中の処理があるため止めませんでした: %s", outcome.busy_jobs)
             return outcome
+        if outcome.busy:
+            # 強制終了を選ばれたのに、まだ断られた。次の手へ
+            result.message = outcome.message
+            continue
         if outcome.stopped:
             log.info("停止完了: %s (%s)", running.app_id, outcome.method)
             return outcome
@@ -301,13 +311,14 @@ def _handle_unresponsive(running: RunningTool, result: StopResult, *,
 
 # --- 0. ツールが用意した終了の入口 ---------------------------------
 def _stop_by_entry(running: RunningTool, entries: "tool_entries.Entries", *,
-                   timeout: float) -> StopResult:
+                   timeout: float, force: bool = False) -> StopResult:
     """ツールの終了の入口を実行し、止まったことを確かめる。"""
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
     name = Path(entries.stop).name
     log.info("ツールの終了の入口に任せます: %s", entries.stop)
-    ok, message = tool_entries.run_stop(entries, timeout=max(timeout, 10.0))
+    ok, message = tool_entries.run_stop(entries, timeout=max(timeout, 10.0),
+                                        force=force)
     if not ok:
         # ツールが断った (0 以外)。**待たずにすぐ知らせる**
         stopped = False
@@ -391,6 +402,19 @@ def _stop_by_bat(running: RunningTool, *, force: bool,
     if completed.returncode != 0:
         log.info("stop.bat の戻り値は %s でした: %s",
                  completed.returncode, output.strip()[:400])
+        # **0 以外 = ツールが止めなかった** (実行中の処理がある、など)。
+        # 以前は戻り値を見ずに止まるのを待ち (30秒)、次の手へ進んでいた。
+        # 少しだけ確かめ、まだ動いていれば、理由を添えてすぐ返す。強制終了
+        # するかは利用者が決める (そのときは --force で呼び直す)
+        if _wait_stopped(running, STOP_DECLINED_CHECK_SEC):
+            result.stopped = True
+            result.method = "stop.bat"
+            result.message = "正常に終了しました"
+            return result
+        reason = _first_lines(output) or f"終了コード {completed.returncode}"
+        result.message = f"{script.name} が止めませんでした: {reason}"
+        result.busy_jobs = [reason]
+        return result
 
     if _wait_stopped(running, timeout):
         result.stopped = True
@@ -400,6 +424,12 @@ def _stop_by_bat(running: RunningTool, *, force: bool,
 
     result.message = "stop.bat を実行しましたが、まだ応答しています"
     return result
+
+
+def _first_lines(output: str, count: int = 2, limit: int = 160) -> str:
+    """出力のはじめの数行 (理由が先に出る stop.bat が多い。最後は案内の決まり文句)。"""
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    return " / ".join(lines[:count])[:limit]
 
 
 def _wait_stopped(running: RunningTool, timeout: float) -> bool:

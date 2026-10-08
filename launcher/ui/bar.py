@@ -101,6 +101,9 @@ class LauncherBar:
         self._polling = False
         # 閉じる処理の最中か。**× を続けて押しても2回走らせない**
         self._closing = False
+        # 利用者が［ツール停止］で止めようとしたツール。ツールに断られたら
+        # (実行中の処理・終了の確認)、**すぐ「強制終了しますか」を聞く**
+        self._stop_asked: set[str] = set()
         self._save_handle = None
         # 自分で動かしている最中か。**利用者のドラッグと区別する印**
         self._programmatic = False
@@ -572,7 +575,7 @@ class LauncherBar:
                     f"{only.display_name} を終了しますか?\n\n"
                     "ほかのツールやランチャーはそのまま使えます。",
                     parent=self.root):
-                self.manager.stop(only.app_id)
+                self._request_stop(only.app_id)
             return
 
         menu = tk.Menu(self.root, tearoff=0, bg=theme.UTIL_BG, fg=theme.FG,
@@ -588,7 +591,7 @@ class LauncherBar:
                         self._force_stop(target, label))
                 continue
             menu.add_command(label=f"{name} を止める",
-                             command=lambda target=app_id: self.manager.stop(target))
+                             command=lambda target=app_id: self._request_stop(target))
         for app_id in starting:
             name = self._names.get(app_id, app_id)
             menu.add_command(label=f"{name} の起動をやめる",
@@ -603,12 +606,30 @@ class LauncherBar:
         finally:
             menu.grab_release()
 
-    def _force_stop(self, app_id: str, name: str) -> None:
+    def _request_stop(self, app_id: str) -> None:
+        """利用者が止めると決めたツールを止める (断られたら、すぐ聞く)。"""
+        self._stop_asked.add(app_id)
+        self.manager.stop(app_id)
+
+    def _on_refused(self, status) -> None:
+        """止めようとしたツールに断られた。**その場で強制終了するかを聞く**
+        (ツールの言い分を添えて)。もう一度［ツール停止］を押させない。"""
+        app_id = status.app_id
+        if app_id not in self._stop_asked:
+            return                            # ランチャーを閉じるときの停止など
+        self._stop_asked.discard(app_id)
+        name = status.display_name or app_id
+        reason = (status.detail or "").splitlines()[0] if status.detail else ""
+        self.root.after_idle(lambda: self._force_stop(app_id, name, reason))
+
+    def _force_stop(self, app_id: str, name: str, reason: str = "") -> None:
         """断られたツールを強制終了する。**確かめてから。**"""
+        why = reason or f"{name} は終了の確認を出しているか、実行中の処理があります。"
         if messagebox.askyesno(
                 app_config.display_name(),
-                f"{name} は終了の確認を出しているか、実行中の処理があります。\n\n"
-                "強制終了しますか?\n(保存していない内容や、途中の処理は失われます)",
+                f"{why}\n\n"
+                f"{name} を強制終了 (中断) しますか?\n"
+                "(保存していない内容や、途中の処理は失われます)",
                 icon="warning", default="no", parent=self.root):
             trace.event("強制終了を選んだ", trace.WARNING,
                         tool=self.manager.running.get(app_id))
@@ -619,6 +640,7 @@ class LauncherBar:
         if messagebox.askyesno(app_config.display_name(),
                                f"{names} をすべて終了しますか?",
                                parent=self.root):
+            self._stop_asked.update(self.manager.running)
             self.manager.stop_all()
 
     def show_version(self) -> None:
@@ -803,6 +825,8 @@ class LauncherBar:
 
         self._last_detail = status.detail
         self._last_incident = status.incident
+        if getattr(status, "refused", False):
+            self._on_refused(status)
         if status.detail:
             # 読んでほしい案内がある。**目立たせる**
             self.detail_button.configure(text="詳細 ！", bg=theme.ATTENTION_BG,
