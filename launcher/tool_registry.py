@@ -682,6 +682,7 @@ def export_distribution(*, relative: bool = True) -> Path:
 
     return distribution.export_tools(all_tools(include_disabled=True),
                                      relative=relative,
+                                     bar_position_idle=idle_bar_position(),
                                      bar_position_active=active_bar_position(),
                                      log_dir=get_pc_setting(LOG_DIR_KEY))
 
@@ -1020,18 +1021,12 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
     else:
         forwards = False
     if not forwards:
-        hint = ""
-        sibling = path.with_name("start.bat")
-        if kind == ".vbs" and fileprobe.is_file(sibling) and _bat_forwards_args(sibling):
-            hint = "（同じフォルダーの start.bat を選ぶと、ランチャーが画面を閉じられます）"
-        return "", (f"{path.name} は引数をツールへ渡さないため、空にしました。"
-                    "画面はツールが自分で開きます" + hint)
+        return "", (f"起動引数は空にしました ({path.name} が引数をツールへ渡さないため)")
 
     if not _mentions_no_browser(path.parent):
-        return "", ("ツールの中に --no-browser が見つからないため、空にしました。"
-                    "画面はツールが自分で開きます")
-    return NO_BROWSER_ARG, ("ツールが --no-browser を受け付けるので入れました。"
-                            "画面はランチャーが開き、止めるとき閉じます")
+        return "", ("起動引数は空にしました (ツールが --no-browser を知らないため)")
+    return NO_BROWSER_ARG, ("起動引数に --no-browser を入れました (画面はランチャー専用の窓に"
+                            "開き、止めるときに閉じます)")
 
 
 def _recommend_exe_args(path: Path) -> tuple[str, str]:
@@ -1264,32 +1259,54 @@ def clear_pc_setting(key: str) -> None:
     log.info("PC設定を消しました: %s", key)
 
 
-# ツールを起動したあとのバーの位置 (［設定］で選ぶ)
+# バーの位置 (［設定］で選ぶ)。ランチャーを起動したとき・ツールを使っているとき
+BAR_POSITION_IDLE_KEY = "bar_position_idle"
 BAR_POSITION_ACTIVE_KEY = "bar_position_active"
 
 
-def active_bar_position() -> str:
-    """ツールを起動したあと、バーをどこへ寄せるか。
+def _bar_position(key: str, distributed: str, product: str, default: str) -> str:
+    """その端末の［設定］ → 配布先フォルダ → 製品の既定値、の順に見る
+    (**その端末で決めたものが優先**)。知らない値は飛ばす。"""
+    from .ui.geometry import POSITION_NAMES
 
-    その端末の［設定］ → 配布先フォルダ → 製品の既定値、の順に見る
-    (**その端末で決めたものが優先**)。知らない値は飛ばす。
-    """
-    from .ui.geometry import ACTIVE_ANCHORS, DEFAULT_ACTIVE_ANCHOR
-
-    for value in (get_pc_setting(BAR_POSITION_ACTIVE_KEY),
-                  distribution.bar_position_active(),
-                  str(app_config.ui_setting("position_active"))):
-        if value in ACTIVE_ANCHORS:
+    for value in (get_pc_setting(key), distributed, product):
+        if value in POSITION_NAMES:
             return value
-    return DEFAULT_ACTIVE_ANCHOR
+    return default
+
+
+def idle_bar_position() -> str:
+    """ランチャーを起動したとき (ツールを使っていないとき) のバーの位置。"""
+    from .ui.geometry import DEFAULT_IDLE_ANCHOR
+
+    return _bar_position(BAR_POSITION_IDLE_KEY, distribution.bar_position_idle(),
+                         str(app_config.ui_setting("position_idle")),
+                         DEFAULT_IDLE_ANCHOR)
+
+
+def active_bar_position() -> str:
+    """ツールを起動したあと (使っているあいだ) のバーの位置。"""
+    from .ui.geometry import DEFAULT_ACTIVE_ANCHOR
+
+    return _bar_position(BAR_POSITION_ACTIVE_KEY, distribution.bar_position_active(),
+                         str(app_config.ui_setting("position_active")),
+                         DEFAULT_ACTIVE_ANCHOR)
+
+
+def _set_bar_position(key: str, value: str) -> None:
+    from .ui.geometry import POSITION_NAMES
+
+    if value not in POSITION_NAMES:
+        raise ValueError(f"知らない位置です: {value}")
+    set_pc_setting(key, value)
+
+
+def set_idle_bar_position(value: str) -> None:
+    _set_bar_position(BAR_POSITION_IDLE_KEY, value)
 
 
 def set_active_bar_position(value: str) -> None:
-    from .ui.geometry import ACTIVE_ANCHORS
-
-    if value not in ACTIVE_ANCHORS:
-        raise ValueError(f"知らない位置です: {value}")
-    set_pc_setting(BAR_POSITION_ACTIVE_KEY, value)
+    _set_bar_position(BAR_POSITION_ACTIVE_KEY, value)
 
 
 def pc_mode() -> str:
@@ -1415,10 +1432,11 @@ def setting_hints(tool: Tool, probed: Optional[dict] = None) -> list[str]:
     entries = tool_entries.for_start(path)
     hints: list[str] = []
 
+    # 書き方の決まり: **何をすればよいか**を先に、理由はかっこの中に短く。
+    # ランチャーの中の言葉 (入口・自動の順・stop_bat) は使わない
     if entries.any:
-        hints.append("ツールが入口を用意しています (" + entries.describe().replace(
-            "ツールの入口: ", "") + ")。起動の確かめと停止はそれを使うので、"
-            "ポート・停止方法は自動のままでかまいません")
+        hints.append("このツールは、動いているかの確認と止め方をツール側で用意しています。"
+                     "ポート・停止方法・画面は「自動」のままで大丈夫です")
 
     app_port = int(found.get("port") or found.get("browser_port") or 0)
     roles = found.get("role_ports") or {}
@@ -1426,46 +1444,43 @@ def setting_hints(tool: Tool, probed: Optional[dict] = None) -> list[str]:
         browser_port = int(found.get("browser_port") or 0)
         if tool.port > 0 and not entries.has_check:
             if tool.port == browser_port:
-                hints.append(f"ポートは空にしてください。{tool.port} は config/app.json の"
-                             "ブラウザー版のポートで、exe 版は待ち受けません")
+                hints.append(f"ポートは空にしてください ({tool.port} はブラウザー版の番号で、"
+                             "exe 版では使いません)")
             else:
-                hints.append("exe 版のポートは、exe 自身が Web サーバーとして待ち受ける"
-                             "ときだけ入れます。デスクトップ版 (自分の窓) なら空に")
-        if tool.stop_method == "auto" and not entries.stop:
-            stop_bat = entry.with_name("stop.bat")
-            text = ("停止 (自動) は、窓に「閉じて」と頼みます (× と同じ)。窓に確認が"
-                    "出るツールは、利用者が答えるまで待ちます")
-            if fileprobe.is_file(stop_bat):
-                # 隣の stop.bat はブラウザー版のためのことが多い (exe 版を止めない・
-                # 窓を前に出すために exe を起動するものもある)。勧めはしない
-                text += ("。隣の stop.bat はブラウザー版用のことが多いので、停止方法は"
-                         "自動のままを勧めます (ツールの説明が exe 版に stop.bat を"
-                         "指定しているときだけ「stop_bat」に)")
-            hints.append(text)
+                hints.append("exe 版ならポートは空にしてください (exe 自身が Web サーバーに"
+                             "なるツールだけ入れます)")
+        if not entries.stop:
+            if tool.stop_method == "auto":
+                hints.append("停止方法は「自動」のままで大丈夫です (［ツール停止］で、窓の × を"
+                             "押したのと同じように閉じます)")
+            elif tool.stop_method == "stop_bat":
+                hints.append("停止方法は「自動」を勧めます (stop.bat はブラウザー版用のことが"
+                             "多く、exe 版の窓を止められないことがあります)")
     else:
         if kind == "bat" and entry.name.lower() == "start.bat" \
                 and fileprobe.is_file(entry.with_name("Start.vbs")):
-            hints.append("start.bat は診断用です。ふだんは隣の Start.vbs を勧めます "
-                         "(start.bat だとランチャーが画面を先に閉じてから止めるので、"
-                         "保存が閉じ際の送信頼みになります)")
+            hints.append("起動ファイルは、同じフォルダーの Start.vbs を選んでください "
+                         "(start.bat は、うまく起動しないときの原因調べ用です)")
         if kind == "vbs" and not tool.forwards_args:
-            hints.append("この Start.vbs は引数を渡さないので、画面はツールがふだんの"
-                         "ブラウザーに開きます (ランチャーからは前に出せません。"
-                         "押すと「動いています」と出ます)")
+            hints.append("画面は、ふだんのブラウザーのタブに開きます (ボタンを押しても、"
+                         "そのタブは前に出ません。タブを閉じるとツールは少しして終わります)")
+        elif tool.suppresses_browser and tool.resolved_ui_mode == UI_BROWSER:
+            hints.append("画面は、ランチャー専用の窓 (アドレスバーの無いブラウザー) に開きます。"
+                         "exe 版ではありません")
         if not entries.has_check:
             if roles:
                 listed = " / ".join(f"{name} {port}" for name, port in roles.items())
-                hints.append(f"役割ごとにポートが違います ({listed})。"
-                             "この PC の役割のポートにしてください")
+                hints.append(f"ポートは、この PC の役割の番号を入れてください ({listed})")
             elif tool.port <= 0 and app_port:
-                hints.append(f"ポートは config/app.json の {app_port} です")
+                hints.append(f"ポートは {app_port} を入れてください (config/app.json の番号)")
             elif app_port and tool.port != app_port:
-                hints.append(f"config/app.json のポートは {app_port} です "
-                             f"(いまは {tool.port})。違う番号で動かす PC でなければ合わせてください")
+                hints.append(f"ポートは {app_port} にしてください (config/app.json の番号。"
+                             f"いまは {tool.port})")
         if tool.stop_method == "auto" and not entries.stop:
             if fileprobe.is_file(entry.with_name("stop.bat")):
-                hints.append("停止 (自動) は隣の stop.bat を使います。ツールが断ったら"
-                             "理由を出し、強制終了するかを聞きます")
+                hints.append("停止方法は「自動」のままで大丈夫です (［ツール停止］で、ツールに"
+                             "付いている stop.bat を実行して止めます。保存していないものが"
+                             "あればツールが理由を出すので、強制終了するかを選べます)")
 
     # ほかの行とフォルダーが重なる (統合ツールの中のツールなど)
     folder = _normalize_folder(str(entry.parent))
@@ -1475,12 +1490,12 @@ def setting_hints(tool: Tool, probed: Optional[dict] = None) -> list[str]:
         theirs = _normalize_folder(other.resolved_work_dir)
         name = other.display_name or other.app_id
         if theirs and folder.startswith(theirs + "/"):
-            hints.append(f"このフォルダーは「{name}」のフォルダーの中です。中のツールは"
-                         f"「{name}」が自分で起こすなら、登録しないでください")
+            hints.append(f"このフォルダーは「{name}」の中にあります。「{name}」から"
+                         "使うものなら、ここには登録しないでください")
         elif theirs and theirs.startswith(folder + "/"):
             hints.append(f"「{name}」はこのツールのフォルダーの中にあります。"
-                         "このツールが中で起こすものなら、そちらは登録しないでください")
+                         f"このツールから使うものなら、「{name}」の行は消してください")
         elif theirs == folder:
             hints.append(f"「{name}」と同じフォルダーです。1台の PC には exe 版か"
-                         "ブラウザー版のどちらか1つを登録します")
+                         "ブラウザー版のどちらか1つだけを登録してください")
     return hints

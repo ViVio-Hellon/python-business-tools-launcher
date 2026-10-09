@@ -288,18 +288,20 @@ class UserMoveTests(unittest.TestCase):
 
 
 class ActivePositionTests(unittest.TestCase):
-    """ツールを起動したあとの置き場所は、上下×左中右の6通りから選べる。"""
+    """バーの置き場所は、画面中央と上下×左中右の6通りから選べる。"""
 
     def place(self, anchor: str) -> tuple[int, int]:
         return geometry.anchor_position(
             anchor, width=600, height=56, screen_width=1920, screen_height=1080,
             bottom_margin=48, edge_margin=16)
 
-    def test_6通りが選べる(self) -> None:
-        self.assertEqual(set(geometry.ACTIVE_ANCHORS), {
-            "top_left", "top_center", "top_right",
+    def test_画面中央と6通りが選べる(self) -> None:
+        """起動したとき・ツールを使っているときの、どちらもこの7通り (1.7.4)。"""
+        self.assertEqual(set(geometry.POSITION_NAMES), {
+            "center", "top_left", "top_center", "top_right",
             "bottom_left", "bottom_center", "bottom_right"})
-        self.assertEqual(geometry.ACTIVE_ANCHORS["top_right"], "右上")
+        self.assertEqual(geometry.POSITION_NAMES["top_right"], "右上")
+        self.assertEqual(geometry.POSITION_NAMES["center"], "画面中央")
 
     def test_上の3つは画面の上に寄る(self) -> None:
         self.assertEqual(self.place("top_left"), (16, 16))

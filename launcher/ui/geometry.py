@@ -24,16 +24,21 @@ SCREEN_MARGIN = 40
 ANCHORS = ("center", "bottom_left", "bottom_center", "bottom_right",
            "top_left", "top_center", "top_right")
 
-# ツールを起動したあとの置き場所として［設定］で選べるもの (と画面の呼び名)。
-# 起動直後は**いつも画面中央** (探さずに見つかる)
-ACTIVE_ANCHORS = {
+# ［設定］で選べる置き場所 (と画面の呼び名)。**ランチャーを起動したとき**と
+# **ツールを使っているとき**の2つを、どちらもこの7通りから選ぶ
+POSITION_NAMES = {
+    "center": "画面中央",
     "top_left": "左上", "top_center": "中央上", "top_right": "右上",
     "bottom_left": "左下", "bottom_center": "中央下", "bottom_right": "右下",
 }
+# 以前の名前 (ツールを使っているときの置き場所)。中身は同じ7通り
+ACTIVE_ANCHORS = POSITION_NAMES
+DEFAULT_IDLE_ANCHOR = "center"
 DEFAULT_ACTIVE_ANCHOR = "bottom_left"
 
-# 手で動かした位置を覚えておく鍵 (PC別設定の入れ物を借りる)。
-# **値があること自体が「手動」の印**。無ければ状態に合わせて自動で寄る
+# 以前、手で動かした位置を覚えていた鍵 (PC別設定の入れ物を借りる)。
+# 1.7.4 から覚えない (覚えると以後ずっと動かず、「設定どおりに動かない」に
+# なった)。残っていれば起動のときに消す
 POSITION_KEY = "bar_position"
 
 # 位置の覚え方の版。**以前の覚え方では、自分で動かしたぶんを手で置いた

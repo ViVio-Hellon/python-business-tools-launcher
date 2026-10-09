@@ -43,11 +43,7 @@ GC_MS = 10_000
 # 起動中の経過表示がなめらかに見える程度でよい
 DRAIN_MS = 120
 
-# 動かしたあと、位置を書くまでの待ち (ミリ秒)。
-# ドラッグ中は `<Configure>` が何十回も飛ぶので、止まってから書く
-MOVE_SAVE_MS = 600
-
-# 自分で動かしたあと、`<Configure>` を無視し続ける長さ (ミリ秒)。
+# 自分で動かしたあと、「動かしている最中」の印を外すまで (ミリ秒)。
 # `geometry()` の通知は少し遅れて届くので、余韻をもって戻す
 PROGRAMMATIC_TAIL_MS = 250
 
@@ -104,24 +100,18 @@ class LauncherBar:
         # 利用者が［ツール停止］で止めようとしたツール。ツールに断られたら
         # (実行中の処理・終了の確認)、**すぐ「強制終了しますか」を聞く**
         self._stop_asked: set[str] = set()
-        self._save_handle = None
-        # 自分で動かしている最中か。**利用者のドラッグと区別する印**
+        # 自分で動かしている最中か (動かし終わるまでの印)
         self._programmatic = False
         self._programmatic_handle = None
-        # 最後に自分で置いた場所。届いた「動いた」が自分のこだまか、
-        # 利用者のドラッグかを、**場所で**見分ける
         self._expected_xy = None
-        self._forget_untrusted_position()
-        # 利用者が手で置いたか。置いていれば自動の移動をやめる ──
-        # **利用者が決めた場所がいちばん強い**
-        self._manual = self._saved_position() is not None
+        # 以前の版が覚えた「手で置いた場所」は使わない。**位置はいつも
+        # ［設定］どおり** (起動したとき・ツールを使っているとき)。手で
+        # 動かしたぶんは、次に状態が変わるまでそのまま
+        self._forget_manual_position()
         self._anchor = ""
 
         self._build()
         self._place()
-        # 置いたあとで見張り始める。置いた瞬間の `<Configure>` を
-        # 「利用者が動かした」と取り違えない
-        self.root.bind("<Configure>", self._on_configure)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         # 起動の下ごしらえで決まった状態を出す (引き継いだツール・確かめられ
@@ -380,24 +370,18 @@ class LauncherBar:
             status.running_ids or status.starting_ids or status.stopping_ids)
         if active:
             return tool_registry.active_bar_position()
-        return geometry.normalize_anchor(
-            str(app_config.ui_setting("position_idle")), fallback="center")
+        return tool_registry.idle_bar_position()
 
     def _place(self) -> None:
         """最初の置き場所を決める (要件定義書 §5.1)。
 
         幅は画面いっぱいにしない。**業務画面を隠さない**ことが目的なので、
-        必要なぶんだけ取る。利用者が動かしてあれば、その位置を使う。
-
-        すでに動いているツールを引き継いだ状態で始まることがあるので、
-        中央と決め打ちにせず、いまの状態から決める。
+        必要なぶんだけ取る。場所は［設定］の「ランチャーを起動したとき」。
         """
         self._anchor = self._anchor_for(self.manager.status)
-        placement = self._placement(anchor=self._anchor,
-                                    saved=self._saved_position())
+        placement = self._placement(anchor=self._anchor)
         self._apply_geometry(placement.as_geometry())
-        log.info("バーを置きました: %s (%s%s)", placement.as_geometry(),
-                 self._anchor, " / 手動" if self._manual else "")
+        log.info("バーを置きました: %s (%s)", placement.as_geometry(), self._anchor)
 
     def _resize_to_content(self) -> None:
         """ボタンが増減したあと、幅だけ取り直す。
@@ -414,13 +398,11 @@ class LauncherBar:
     # 状態に合わせて寄る
     # --------------------------------------------------------------
     def _follow_state(self, status) -> None:
-        """状態が変わったら置き場所も合わせる。
+        """状態が変わったら、［設定］で選んだ置き場所へ寄る。
 
-        **利用者が手で置いていたら動かさない。** 自動の移動が利用者の
-        置き場所を上書きすると、動かすたびに戻されることになる。
+        **置き場所が変わるときだけ動かす。** 同じ置き場所のあいだは、手で
+        動かした位置をそのまま残す (見回りのたびに戻されると使えない)。
         """
-        if self._manual:
-            return
         anchor = self._anchor_for(status)
         if anchor == self._anchor:
             return
@@ -477,65 +459,20 @@ class LauncherBar:
         self._programmatic = False
 
     # --------------------------------------------------------------
-    # 動かした位置を覚える
+    # 以前の版が覚えた位置
     # --------------------------------------------------------------
-    def _saved_position(self):
-        try:
-            return geometry.parse_saved(tool_registry.get_pc_setting(POSITION_KEY))
-        except Exception:                     # noqa: BLE001 - 位置で起動を止めない
-            log.warning("保存した位置を読めませんでした", exc_info=True)
-            return None
+    def _forget_manual_position(self) -> None:
+        """以前の版が覚えた「手で置いた場所」を消す。
 
-    def _on_configure(self, event) -> None:
-        """利用者に動かされたら、少し待ってから覚える。"""
-        if event.widget is not self.root:
-            return                            # 中の部品の変化は関係ない
-        if self._programmatic:
-            return                            # 自分で動かしたぶんは覚えない
-        if self._save_handle is not None:
-            self.root.after_cancel(self._save_handle)
-        self._save_handle = self.root.after(MOVE_SAVE_MS, self._save_position)
-
-    def _save_position(self) -> None:
-        """手で置かれた場所を覚え、以後の自動移動をやめる。
-
-        **自分で置いた場所から動いていなければ覚えない。** 時間で見分ける
-        だけだと、遅れて届いた知らせ (Windows では窓が出た瞬間などに
-        起きる) を「利用者が動かした」と取り違え、以後ずっと中央に
-        居座ることになる。
-        """
-        self._save_handle = None
-        actual = geometry.parse_geometry_xy(self.root.geometry())
-        if not geometry.moved_by_user(self._expected_xy, actual):
-            return
-        try:
-            tool_registry.set_pc_setting(
-                POSITION_KEY, geometry.format_saved(*actual))
-        except Exception:                     # noqa: BLE001 - 覚えられなくても続ける
-            log.warning("位置を保存できませんでした", exc_info=True)
-            return
-        if not self._manual:
-            log.info("手で置かれたので、自動の移動をやめます: %s", actual)
-        self._manual = True
-        self._expected_xy = actual
-
-    def _forget_untrusted_position(self) -> None:
-        """以前の覚え方で覚えた位置を、1度だけ忘れる。
-
-        以前は、自分で動かしたぶんを手で置いたものと取り違えて覚える
-        ことがあった。その位置が残っていると、直したあとも自動で寄らない。
+        以前は手で動かすとその場所を覚え、以後は自動で寄らなかった。
+        少し触れただけでも固定され、「設定どおりに動かない」になった。
         """
         try:
-            if tool_registry.get_pc_setting(geometry.POSITION_RULE_KEY) \
-                    == geometry.POSITION_RULE:
-                return
             if tool_registry.get_pc_setting(POSITION_KEY):
                 tool_registry.clear_pc_setting(POSITION_KEY)
-                log.info("以前の版で覚えたバーの位置を忘れます (自動に戻します)")
-            tool_registry.set_pc_setting(geometry.POSITION_RULE_KEY,
-                                         geometry.POSITION_RULE)
+                log.info("以前の版で覚えたバーの位置を忘れます (［設定］どおりに戻します)")
         except Exception:                     # noqa: BLE001 - 位置で起動を止めない
-            log.warning("バーの位置の覚え方を確かめられませんでした", exc_info=True)
+            log.warning("バーの位置を確かめられませんでした", exc_info=True)
 
     # --------------------------------------------------------------
     # 操作
@@ -547,6 +484,9 @@ class LauncherBar:
         いれば画面を前に出す。
         """
         self._engaged = True
+        # ツールを押したら、［設定］の「ツールを使っているとき」へ寄せ直す
+        # (手で動かしていても。押すたびに置き場所がそろう)
+        self._anchor = ""
         self._focus_id = app_id
         if app_id in self.manager.starting_ids:
             # 起動の最中にもう一度押された。2つ目は起こさない (manager)。
@@ -662,11 +602,9 @@ class LauncherBar:
             self._build_tool_buttons()
             # ツールが増えたぶん、窓を広げないとボタンが切れる
             self._resize_to_content()
-            # 設定画面で「自動に戻す」や、起動後の位置が変わったかもしれない
-            self._manual = self._saved_position() is not None
-            if not self._manual:
-                self._anchor = ""             # 新しい決まりで寄せ直す
-                self._follow_state(self.manager.status)
+            # 置き場所が変わったかもしれない。新しい決まりで寄せ直す
+            self._anchor = ""
+            self._follow_state(self.manager.status)
 
     def show_detail(self) -> None:
         """［詳細］案内と障害記録を、**ランチャーの中で**読む。

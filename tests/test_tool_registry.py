@@ -587,15 +587,17 @@ class RecommendStartArgsTests(LocalAreaTestCase):
                         python="print('hello')\n")
         args, reason = tool_registry.recommend_start_args(str(bat))
         self.assertEqual(args, "")
-        self.assertIn("見つからない", reason)
+        self.assertIn("--no-browser を知らない", reason)
 
-    def test_VBSを選んだら隣のstartbatを勧める(self) -> None:
+    def test_VBSを選んでも診断用のstartbatは勧めない(self) -> None:
+        """start.bat は診断用 (各ツールの報告)。勧めるのは Start.vbs のほう。"""
         self.make("start.bat", "@echo off\r\npython app.py %*\r\n",
                   python='"--no-browser"\n')
         vbs = self.make("Start.vbs", 'shell.Run "pythonw app.py", 0, False\r\n')
         args, reason = tool_registry.recommend_start_args(str(vbs))
         self.assertEqual(args, "")
-        self.assertIn("start.bat を選ぶと", reason)
+        self.assertIn("引数をツールへ渡さない", reason)
+        self.assertNotIn("start.bat", reason)
 
     def test_仮想環境の中までは探さない(self) -> None:
         """ライブラリの中の --no-browser を、ツールのものと取り違えない。"""

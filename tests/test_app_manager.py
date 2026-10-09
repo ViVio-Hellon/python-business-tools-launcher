@@ -616,16 +616,42 @@ class MonitorTests(ManagerTestCase):
         running = self.manager.running[tool.app_id]
         process_manager._stop_by_api(running, force=True, timeout=10)
 
-        # **1回では断じない。** スリープ復帰や重い処理中に、動いている
-        # ツールを落ちた扱いにしないため (tests/test_resilience.py)
-        limit = int(app_config.ui_setting("health_failures_before_dead"))
-        for _ in range(limit - 1):
-            self.manager.poll_health()
-            self.assertIn(tool.app_id, self.manager.running)
-
+        # ポートが閉じ、ツールのプロセスも無い = 終わったのは確か。1回で気づく
+        # (応答だけ途切れて動いているものは、回数を待つ: tests/test_resilience.py)
         self.assertFalse(self.manager.poll_health())
         self.assertEqual(self.manager.status.state, State.ERROR)
         self.assertIn("終了しました", self.manager.status.message)
+
+    def test_応答しないがプロセスが残っていれば1回では外さない(self) -> None:
+        from launcher import app_config
+
+        tool = self.register("fake.hang", "日報")
+        self.start(tool)
+        limit = int(app_config.ui_setting("health_failures_before_dead"))
+        with mock.patch.object(process_manager, "is_running", return_value=False):
+            for _ in range(limit - 1):
+                self.manager.poll_health()
+                self.assertIn(tool.app_id, self.manager.running)
+
+    def test_閉じて終わったツールは次の見回りで外し説明は出さない(self) -> None:
+        """画面を閉じてからしばらく「動いています」と出たままだった (現場の報告)。"""
+        tool = self.register_closed_by_user("fake.closed", "資材ツール")
+        self.start(tool)
+        running = self.manager.running[tool.app_id]
+        process_manager._stop_by_api(running, force=True, timeout=10)
+        process_manager._wait_pid_gone(running.pid, 5)
+        self.manager.poll_health()
+        self.assertNotIn(tool.app_id, self.manager.running)
+        status = self.manager.status
+        self.assertNotEqual(status.state, State.ERROR)
+        self.assertEqual(status.message, "資材ツールは終了しました")
+        self.assertEqual(status.detail, "")
+
+    def register_closed_by_user(self, app_id: str, name: str):
+        """画面はツールがふだんのブラウザーに開く形 (Start.vbs が引数を渡さない)。"""
+        tool = self.register(app_id, name)
+        tool_registry.save(replace(tool, start_args=""))
+        return tool_registry.get(app_id)
 
     def test_ランチャー外で動いているツールをすべて引き継ぐ(self) -> None:
         """要件定義書 §9。記録が無くても二重起動させない。"""

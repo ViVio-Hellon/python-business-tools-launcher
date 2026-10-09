@@ -901,7 +901,7 @@ class ActiveBarPositionTests(_Base):
         tool_registry.set_active_bar_position("top_right")
         tool_registry.export_distribution()
         self.assertEqual(self.read_settings()["bar"],
-                         {"position_active": "top_right"})
+                         {"position_idle": "center", "position_active": "top_right"})
 
         # 配った先 (その端末では決めていない)
         tool_registry.clear_pc_setting(tool_registry.BAR_POSITION_ACTIVE_KEY)

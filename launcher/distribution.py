@@ -269,12 +269,21 @@ def absolute_entries() -> list[str]:
                 str(item["start_command"]))]
 
 
-def bar_position_active() -> str:
-    """配布先フォルダに書かれた「ツールを起動したあとのバーの位置」。無ければ空。"""
+def _bar_setting(name: str) -> str:
     data, _ = load()
     bar = (data or {}).get("bar")
-    value = bar.get("position_active") if isinstance(bar, dict) else ""
+    value = bar.get(name) if isinstance(bar, dict) else ""
     return value if isinstance(value, str) else ""
+
+
+def bar_position_idle() -> str:
+    """配布先フォルダに書かれた「ランチャーを起動したときのバーの位置」。無ければ空。"""
+    return _bar_setting("position_idle")
+
+
+def bar_position_active() -> str:
+    """配布先フォルダに書かれた「ツールを使っているときのバーの位置」。無ければ空。"""
+    return _bar_setting("position_active")
 
 
 def log_dir() -> str:
@@ -286,7 +295,8 @@ def log_dir() -> str:
 
 
 def export_tools(registry_tools, *, relative: bool = True,
-                 bar_position_active: str = "", log_dir: str = "") -> Path:
+                 bar_position_idle: str = "", bar_position_active: str = "",
+                 log_dir: str = "") -> Path:
     """端末の設定から配布先フォルダを作る (作り直す)。
 
     **パスワードには触らない** (別のファイル)。作り直すたびに鍵が
@@ -317,10 +327,14 @@ def export_tools(registry_tools, *, relative: bool = True,
         "launcher_version": app_config.version(),
         "tools": items,
     }
+    bar = {}
+    if bar_position_idle:
+        bar["position_idle"] = bar_position_idle
     if bar_position_active:
-        # 端末ごとの位置 (手で動かした場所) ではなく、**ツールを起動した
-        # あとにどこへ寄るか**の決まりだけを配る
-        data["bar"] = {"position_active": bar_position_active}
+        bar["position_active"] = bar_position_active
+    if bar:
+        # **どこへ寄るか**の決まりを配る (起動したとき・ツールを使っているとき)
+        data["bar"] = bar
     if log_dir:
         # 共有フォルダーを書いておけば、配った全端末の記録が1か所に集まる
         # (端末ごとに、端末名のフォルダーに分けて書く)

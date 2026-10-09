@@ -73,8 +73,8 @@ class AllToolsTests(HintTestCase):
         for start in ("統合ツール.exe", "Start.vbs"):
             with self.subTest(start=start):
                 text = self.hints(self.root / start)
-                self.assertIn("ツールが入口を用意しています", text)
-                self.assertIn("自動のままでかまいません", text)
+                self.assertIn("止め方をツール側で用意しています", text)
+                self.assertIn("「自動」のままで大丈夫です", text)
                 self.assertNotIn("ポートは空にしてください", text)
 
     def test_中のツールは登録しないよう知らせる(self) -> None:
@@ -84,8 +84,8 @@ class AllToolsTests(HintTestCase):
         tool_registry.save(Tool(app_id="nlm.all-tools", display_name="統合ツール",
                                 start_command=str(self.root / "統合ツール.exe")))
         text = self.hints(inner / "Start.vbs", app_id="nlm.nippou", port=8733)
-        self.assertIn("「統合ツール」のフォルダーの中です", text)
-        self.assertIn("登録しないでください", text)
+        self.assertIn("「統合ツール」の中にあります", text)
+        self.assertIn("ここには登録しないでください", text)
 
 
 class PackagingToolTests(HintTestCase):
@@ -101,8 +101,8 @@ class PackagingToolTests(HintTestCase):
 
     def test_exeの行にブラウザー版のポートがあれば空にするよう言う(self) -> None:
         text = self.hints(self.root / "梱包資材総合ツール.exe", port=8713)
-        self.assertIn("ポートは空にしてください。8713 は config/app.json のブラウザー版", text)
-        self.assertIn("窓に「閉じて」と頼みます", text)
+        self.assertIn("ポートは空にしてください (8713 はブラウザー版の番号", text)
+        self.assertIn("窓の × を押したのと同じように閉じます", text)
 
     def test_exeの行がポート空ならポートのことは言わない(self) -> None:
         text = self.hints(self.root / "梱包資材総合ツール.exe", port=0)
@@ -110,13 +110,13 @@ class PackagingToolTests(HintTestCase):
 
     def test_Startvbsでは役割のポートと画面の開き方を言う(self) -> None:
         text = self.hints(self.root / "Start.vbs")
-        self.assertIn("役割ごとにポートが違います (field 8713 / material 8723)", text)
-        self.assertIn("ふだんのブラウザーに開きます", text)
-        self.assertIn("隣の stop.bat を使います", text)
+        self.assertIn("この PC の役割の番号を入れてください (field 8713 / material 8723)", text)
+        self.assertIn("ふだんのブラウザーのタブに開きます", text)
+        self.assertIn("ツールに付いている stop.bat を実行して止めます", text)
 
     def test_startbatならStartvbsを勧める(self) -> None:
         text = self.hints(self.root / "start.bat")
-        self.assertIn("start.bat は診断用です。ふだんは隣の Start.vbs を勧めます", text)
+        self.assertIn("同じフォルダーの Start.vbs を選んでください", text)
 
 
 class CoilCalculatorTests(HintTestCase):
@@ -127,8 +127,18 @@ class CoilCalculatorTests(HintTestCase):
                          app_id="nlm.coil-calculator", vbs=VBS_ARGS, entries=True,
                          server={"port": 8741, "port_retry": 5})
         text = self.hints(root / "Start.vbs")
-        self.assertIn("ツールが入口を用意しています", text)
-        self.assertNotIn("ふだんのブラウザーに開きます", text)
+        self.assertIn("止め方をツール側で用意しています", text)
+        self.assertNotIn("ふだんのブラウザーのタブに開きます", text)
+
+    def test_ランチャー専用の窓はexeではないと言う(self) -> None:
+        """アドレスバーの無い専用の窓は、exe 版の窓と見分けにくい (現場の報告)。"""
+        root = make_tool(self.work_root, "CoilCalculator", exe="CoilCalculator.exe",
+                         app_id="nlm.coil-calculator", vbs=VBS_ARGS, entries=True,
+                         server={"port": 8741, "port_retry": 5})
+        text = self.hints(root / "Start.vbs", start_args="--no-browser")
+        self.assertIn("ランチャー専用の窓 (アドレスバーの無いブラウザー) に開きます", text)
+        self.assertIn("exe 版ではありません", text)
+        self.assertNotIn("ランチャー専用の窓", self.hints(root / "Start.vbs"))
 
 
 class CoilPackingTests(HintTestCase):
@@ -142,12 +152,16 @@ class CoilPackingTests(HintTestCase):
 
     def test_exe版は窓に頼むことを言う(self) -> None:
         text = self.hints(self.root / "コイル梱包ツール.exe", port=0)
-        self.assertIn("窓に「閉じて」と頼みます", text)
+        self.assertIn("窓の × を押したのと同じように閉じます", text)
+
+    def test_exe版でstop_batを選ぶと自動を勧める(self) -> None:
+        text = self.hints(self.root / "コイル梱包ツール.exe", port=0, stop_method="stop_bat")
+        self.assertIn("停止方法は「自動」を勧めます", text)
 
     def test_ポートがappjsonと違えば言う(self) -> None:
         text = self.hints(self.root / "Start.vbs", port=8750)
-        self.assertIn("config/app.json のポートは 8740 です (いまは 8750)", text)
-        self.assertNotIn("config/app.json のポートは",
+        self.assertIn("ポートは 8740 にしてください (config/app.json の番号。いまは 8750)", text)
+        self.assertNotIn("ポートは 8740 に",
                          self.hints(self.root / "Start.vbs", port=8740))
 
     def test_起動ファイルが無ければ選ぶよう言う(self) -> None:
@@ -227,7 +241,7 @@ class SettingsRowTests(HintTestCase):
         self.assertNotIn("ポートは空に", row.hint_label.cget("text"))
         row.path_var.set(str(self.folder / "start.bat"))
         row.refresh_hints()
-        self.assertIn("隣の Start.vbs を勧めます", row.hint_label.cget("text"))
+        self.assertIn("同じフォルダーの Start.vbs を選んでください", row.hint_label.cget("text"))
 
 
 if __name__ == "__main__":

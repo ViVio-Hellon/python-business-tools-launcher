@@ -214,46 +214,34 @@ class SettingsDialog:
     def _build_bar_position(self) -> None:
         """バーの置き場所 (要件定義書 §5.1)。
 
-        起動した直後は**いつも画面中央** (探さずに見つかる)。ツールを
-        起動したら、ここで選んだ場所へ寄る。**手で動かすとそちらが優先
-        される**ので、自動に戻す道もここに用意する。
+        **ランチャーを起動したとき**と**ツールを使っているとき**を、それぞれ
+        7通り (画面中央・上下 × 左中右) から選ぶ。手で動かしても覚えない
+        (次に状態が変わると、ここで選んだ場所へ戻る)。
         """
-        # 鍵と呼び名は tkinter に触らない `geometry` が持つ。`bar` から
-        # 取ると、`bar` → `settings_dialog` → `bar` の輪ができる
-        from .geometry import ACTIVE_ANCHORS, POSITION_KEY, parse_saved
+        # 呼び名は tkinter に触らない `geometry` が持つ。`bar` から取ると、
+        # `bar` → `settings_dialog` → `bar` の輪ができる
+        from .geometry import POSITION_NAMES
 
-        self._position_key = POSITION_KEY
-        self._anchor_names = dict(ACTIVE_ANCHORS)
-        saved = parse_saved(tool_registry.get_pc_setting(POSITION_KEY))
-        self.reset_position = tk.BooleanVar(value=False)
-
+        self._anchor_names = dict(POSITION_NAMES)
+        names = list(self._anchor_names.values())
         frame = tk.Frame(self.top, bg=theme.BG)
         frame.pack(fill="x", padx=16, pady=(10, 0))
-        tk.Label(frame, text="ツールを起動したあとのバーの位置", bg=theme.BG,
-                 fg=theme.FG, font=theme.FONT_BOLD).pack(side="left")
-        current = tool_registry.active_bar_position()
+        tk.Label(frame, text="バーの位置", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD).pack(side="left")
+        self.idle_position_var = tk.StringVar(
+            value=self._anchor_names[tool_registry.idle_bar_position()])
         self.active_position_var = tk.StringVar(
-            value=self._anchor_names.get(current, "左下"))
-        ttk.Combobox(frame, textvariable=self.active_position_var, width=8,
-                     values=list(self._anchor_names.values()), state="readonly",
-                     font=theme.FONT).pack(side="left", padx=(10, 0))
-        tk.Label(frame, text="(起動した直後はいつも画面中央)", bg=theme.BG,
-                 fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left",
-                                                             padx=(8, 0))
-
-        if saved is None:
-            return
-        manual = tk.Frame(self.top, bg=theme.BG)
-        manual.pack(fill="x", padx=16, pady=(4, 0))
-        tk.Label(manual, text=f"いまは手で置いた場所（{saved[0]}, {saved[1]}）"
-                              "に固定しています",
-                 bg=theme.BG, fg=theme.MUTED,
-                 font=theme.FONT_SMALL).pack(side="left")
-        tk.Checkbutton(manual, text="自動に戻す", variable=self.reset_position,
-                       bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
-                       activebackground=theme.BG, activeforeground=theme.FG,
-                       font=theme.FONT_SMALL, bd=0,
-                       highlightthickness=0).pack(side="left", padx=(10, 0))
+            value=self._anchor_names[tool_registry.active_bar_position()])
+        for text, var in (("ランチャーを起動したとき", self.idle_position_var),
+                          ("ツールを使っているとき", self.active_position_var)):
+            tk.Label(frame, text=text, bg=theme.BG, fg=theme.FG,
+                     font=theme.FONT_SMALL).pack(side="left", padx=(12, 4))
+            ttk.Combobox(frame, textvariable=var, width=8, values=names,
+                         state="readonly", font=theme.FONT).pack(side="left")
+        tk.Label(self.top, text="(手で動かした位置は、次にツールを起動・停止すると"
+                                "ここで選んだ場所に戻ります)",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                 anchor="w").pack(fill="x", padx=16)
 
     def _build_log_dir(self) -> None:
         """ログの出力先 (後追い・なぜなぜ分析の記録)。
@@ -536,17 +524,19 @@ class SettingsDialog:
         tool_entries.forget()                 # 起動ファイルが変われば入口も変わる
         mode_before = tool_registry.pc_mode()
         tool_registry.set_pc_mode(self.mode_var.get().strip())
-        if self.reset_position.get():
-            tool_registry.clear_pc_setting(self._position_key)
-        chosen = {name: key for key, name in self._anchor_names.items()}.get(
-            self.active_position_var.get())
+        keys = {name: key for key, name in self._anchor_names.items()}
         changes = tool_registry.describe_changes(
             self._before_tools, tool_registry.all_tools(include_disabled=True))
-        if chosen and chosen != tool_registry.active_bar_position():
-            changes.append(f"起動後のバーの位置「{self.active_position_var.get()}」")
-            tool_registry.set_active_bar_position(chosen)
-        if self.reset_position.get():
-            changes.append("バーの位置を自動に戻す")
+        for label, var, current, store in (
+                ("ランチャーを起動したときのバーの位置", self.idle_position_var,
+                 tool_registry.idle_bar_position, tool_registry.set_idle_bar_position),
+                ("ツールを使っているときのバーの位置", self.active_position_var,
+                 tool_registry.active_bar_position,
+                 tool_registry.set_active_bar_position)):
+            chosen = keys.get(var.get())
+            if chosen and chosen != current():
+                changes.append(f"{label}「{var.get()}」")
+                store(chosen)
         if tool_registry.pc_mode() != mode_before:
             changes.append(f"このPCのモード「{mode_before or '(空)'}」→"
                            f"「{tool_registry.pc_mode() or '(空)'}」")
@@ -826,8 +816,7 @@ def _port_note(found: dict) -> str:
     port = found.get("browser_port")
     if not port:
         return ""
-    return (f"ポートは空にしました。config/app.json の {port} はブラウザー版のもので、"
-            "exe は待ち受けません (exe 自身が待ち受けるときだけ入れてください)")
+    return f"ポートは空にしました ({port} はブラウザー版の番号で、exe 版では使いません)"
 
 
 def _exe_port_warning(tool: Tool) -> str:

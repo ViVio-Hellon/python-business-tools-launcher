@@ -202,6 +202,8 @@ class ToolManager:
         # 起こしかけのツールを「外で動いていたもの」と取り違えて引き継ぎ、
         # 準備ができる前に画面を開いてしまう
         self._selecting: set[str] = set()
+        # 確認口が「すでに動いている」と答えたときの、その答えの文 (押した人に出す)
+        self._existing_notes: dict[str, str] = {}
         # 起動を待っている最中に「やめる」と言われたツール
         self._cancelled: set[str] = set()
         # 画面が開いていたか (前回の見回り)。変わったときだけ知らせる
@@ -534,9 +536,19 @@ class ToolManager:
                 self._failures[tool.app_id] = 0
             runtime_state.put(found)
             log.info("すでに動いていたツールを引き継ぎます: %s", found.summary())
+            note = self._existing_notes.pop(tool.app_id, "")
             trace.event("引き継ぎ", trace.INFO, tool=found, op=op,
-                        cause="押したときにはもう動いていた (起動せずに前に出す)")
+                        cause="押したときにはもう動いていた (起動せずに前に出す)",
+                        detail=note)
             self._show(tool, found, op)
+            status = self.status
+            if note and status.state == State.RUNNING and not status.detail:
+                # **何が動いていたのか**を出す。設定は Start.vbs (ブラウザー版) でも、
+                # 先にデスクトップ版 (exe) が開いていれば、その窓が前に出る。
+                # 黙っていると「Start.vbs なのに exe で開いた」に見える (現場の報告)
+                self._set(State.RUNNING,
+                          f"{tool.display_name}はすでに動いていました: {note}", tool,
+                          responding=True)
             return
         conflict = self._port_taken_by_other(tool)
         if conflict:
@@ -589,6 +601,8 @@ class ToolManager:
             answer = tool_entries.check(entries)
             if not answer.alive:
                 return None
+            # 何が動いているか (「デスクトップ版 … が動いています」など)。押した人に出す
+            self._existing_notes[tool.app_id] = answer.note.strip()
             return _running_by_entries(tool, confirmed=answer.ready, answer=answer)
         # 待ち受けが無いのに当たりにいかない (Windows では断られるまで
         # 1〜2 秒かかり、押すたびに待たせる)
@@ -1747,11 +1761,35 @@ class ToolManager:
             # --- 応答が無い ---
             count = self._failures.get(app_id, 0) + 1
             self._failures[app_id] = count
-            if count < limit:
+            if count < limit and not self._surely_ended(running, by_entry):
                 log.info("応答がありません (%d/%d): %s", count, limit, app_id)
                 continue                      # まだ判断しない
             self._lost(running, count)
         return bool(self._running)
+
+    def _surely_ended(self, running: RunningTool, by_entry: bool) -> bool:
+        """応答が無いうえに、**終わったことが確か**か。確かなら回数を待たない。
+
+        画面 (タブ) を閉じたツールは自分で終わる。応答が一時的に途切れた
+        だけかもしれないので、ふだんは数回続けて答えないのを待つ (5秒 × 3回)。
+        ただ、それでは閉じてからしばらく「動いています」と出たままになる
+        (現場の報告)。次のどれかなら、1回で終わったと決める:
+
+        * ツールの確認口が「動いていない」(1) と答えた
+        * ポートが閉じていて、ツールのフォルダーから起動したプロセスも無い
+        """
+        try:
+            if by_entry:
+                answer = tool_entries.check(tool_entries.for_record(running))
+                return answer.state == tool_entries.STOPPED
+            if running.port <= 0 or not _own_folder(running):
+                return False                  # 確かめる手がかりが無い
+            if health.is_port_accepting(running.port):
+                return False
+            return not self._tool_alive(running)
+        except Exception:                     # noqa: BLE001 - 分からなければ待つ
+            log.warning("終わったかを確かめられませんでした", exc_info=True)
+            return False
 
     def _watch_unconfirmed(self, running: RunningTool, answered: bool) -> None:
         """起動確認がまだ取れていないツール (窓が出た・動いているので起動
@@ -1954,12 +1992,9 @@ class ToolManager:
                     if running.browser_managed else
                     "ツールが応答しなくなった (画面はツール側の管理)",
                     detail=f"応答なし {count}回")
-        # 画面を閉じたので、ツールが自分で終わった。ふつうのこと
-        self._set(self._settled_state(), f"{name}は終了しました", running,
-                  detail=("画面を閉じると、ツールは自分で終了します。\n"
-                          "続けて使うときは、もう一度ボタンを押してください。"
-                          + ("" if running.browser_managed else
-                             "\n画面 (タブ) が残っていれば、手で閉じてください。")))
+        # 画面を閉じたので、ツールが自分で終わった。ふつうのこと。**説明は
+        # 出さない** ── 閉じたのは利用者なので、バーの1行で足りる
+        self._set(self._settled_state(), f"{name}は終了しました", running)
 
     def _record_lost(self, running: RunningTool, count: int) -> str:
         """思わぬ停止の障害記録。「落ちた」か「固まった」かを分けておく。"""
