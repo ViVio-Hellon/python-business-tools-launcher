@@ -36,7 +36,9 @@ log = get_logger("ui.settings")
 
 # ダイアログの高さの上限。ツールが増えても画面からはみ出さないよう、
 # ここを超えたら中身を巻物にする
-MAX_BODY_HEIGHT = 460
+MAX_BODY_HEIGHT = 900
+# 画面の高さのうち、巻物以外 (見出し・［保存］・窓の枠・タスクバー) に残すぶん
+BODY_SCREEN_MARGIN = 230
 
 # 起動ファイルを選ぶダイアログの種類
 ENTRY_FILETYPES = [("起動ファイル", "*.bat *.vbs *.exe"),
@@ -83,7 +85,16 @@ class SettingsDialog:
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(fill="x", padx=16, pady=(0, 10))
 
-        self.body = self._scrollable_body()
+        # ［保存］［キャンセル］は**いつも窓の下に見えている**。先に下へ置き、
+        # 残りを巻物にする (ヒントが増えると、最後に置いた［保存］が画面の
+        # 外へ押し出されていた)
+        self._build_buttons()
+        inner = self._scrollable_body()
+        self.body = tk.Frame(inner, bg=theme.BG)
+        self.body.pack(fill="x")
+        # ツールの行より下の設定。これも巻物の中 (行を足しても下に来る)
+        self.area = tk.Frame(inner, bg=theme.BG)
+        self.area.pack(fill="x")
         tools = tool_registry.all_tools(include_disabled=True)
         # 開いたときの設定。保存したとき**何が変わったか**を記録に残す
         self._before_tools = list(tools)
@@ -107,40 +118,53 @@ class SettingsDialog:
         self._build_bar_position()
         self._build_log_dir()
         self._build_distribution()
-        self._build_buttons()
 
     def _scrollable_body(self) -> tk.Frame:
-        """ツールが増えても画面に収まるよう、中身を巻物にする。"""
+        """ツールの行と下の設定を巻物にする。窓は画面の高さに収める。"""
         container = tk.Frame(self.top, bg=theme.BG)
         container.pack(fill="both", expand=True, padx=10)
 
-        canvas = tk.Canvas(container, bg=theme.BG, highlightthickness=0,
-                           height=MAX_BODY_HEIGHT)
+        canvas = tk.Canvas(container, bg=theme.BG, highlightthickness=0)
         scroll = ttk.Scrollbar(container, orient="vertical",
                                command=canvas.yview)
         inner = tk.Frame(canvas, bg=theme.BG)
 
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=scroll.set)
+        self._canvas, self._inner = canvas, inner
 
-        def on_configure(_event=None) -> None:
+        def on_inner(_event=None) -> None:
             canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfigure(window, width=canvas.winfo_width())
-            # 中身が収まるなら巻物の高さを縮める。4つしか無いのに
-            # 空白の広い画面を出さない
-            needed = min(inner.winfo_reqheight(), MAX_BODY_HEIGHT)
-            canvas.configure(height=needed)
+            # 中身が収まるなら巻物の高さを縮める (空白の広い画面を出さない)
+            canvas.configure(height=min(inner.winfo_reqheight(), self._max_body_height()),
+                             width=max(canvas.winfo_reqwidth(), inner.winfo_reqwidth()))
 
-        inner.bind("<Configure>", on_configure)
-        canvas.bind("<Configure>", on_configure)
+        def on_canvas(_event=None) -> None:
+            canvas.itemconfigure(window, width=canvas.winfo_width())
+
+        def on_wheel(event) -> None:
+            if inner.winfo_reqheight() > canvas.winfo_height():
+                canvas.yview_scroll(-1 * (event.delta // 120 or (1 if event.delta > 0 else -1)),
+                                    "units")
+
+        inner.bind("<Configure>", on_inner)
+        canvas.bind("<Configure>", on_canvas)
+        # ホイールで巻く。窓の上にいるあいだだけ (ほかの窓のホイールを奪わない)
+        self.top.bind("<Enter>", lambda _e: self.top.bind_all("<MouseWheel>", on_wheel))
+        self.top.bind("<Leave>", lambda _e: self.top.unbind_all("<MouseWheel>"))
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         return inner
 
+    def _max_body_height(self) -> int:
+        """巻物に使える高さ。画面の高さから、見出しと［保存］のぶんを引く。"""
+        screen = self.top.winfo_screenheight()
+        return max(200, min(MAX_BODY_HEIGHT, screen - BODY_SCREEN_MARGIN))
+
     def _build_add_button(self) -> None:
         """5個目以降のツールを足す (要件定義書 §14)。"""
-        frame = tk.Frame(self.top, bg=theme.BG)
-        frame.pack(fill="x", padx=16, pady=(6, 0))
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(6, 0))
         tk.Button(frame, text="＋ ツールを追加", command=self.add_tool,
                   bg=theme.BUTTON_BG, fg=theme.FG, relief="flat", bd=0,
                   padx=14, pady=5, font=theme.FONT_SMALL,
@@ -200,8 +224,8 @@ class SettingsDialog:
         値を預かるだけで、中身は解釈しない。どのモードがあるかは
         各業務ツール側の要件なので、自由に入力できる形にしてある。
         """
-        frame = tk.Frame(self.top, bg=theme.BG)
-        frame.pack(fill="x", padx=16, pady=(12, 0))
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(12, 0))
         tk.Label(frame, text="このPCのモード", bg=theme.BG, fg=theme.FG,
                  font=theme.FONT_BOLD).pack(side="left")
         self.mode_var = tk.StringVar(value=tool_registry.pc_mode())
@@ -224,8 +248,8 @@ class SettingsDialog:
 
         self._anchor_names = dict(POSITION_NAMES)
         names = list(self._anchor_names.values())
-        frame = tk.Frame(self.top, bg=theme.BG)
-        frame.pack(fill="x", padx=16, pady=(10, 0))
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(10, 0))
         tk.Label(frame, text="バーの位置", bg=theme.BG, fg=theme.FG,
                  font=theme.FONT_BOLD).pack(side="left")
         self.idle_position_var = tk.StringVar(
@@ -238,10 +262,10 @@ class SettingsDialog:
                      font=theme.FONT_SMALL).pack(side="left", padx=(12, 4))
             ttk.Combobox(frame, textvariable=var, width=8, values=names,
                          state="readonly", font=theme.FONT).pack(side="left")
-        tk.Label(self.top, text="(手で動かした位置は、次にツールを起動・停止すると"
+        tk.Label(self.area, text="(手で動かした位置は、次にツールを起動・停止すると"
                                 "ここで選んだ場所に戻ります)",
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
-                 anchor="w").pack(fill="x", padx=16)
+                 anchor="w").pack(fill="x", padx=6)
 
     def _build_log_dir(self) -> None:
         """ログの出力先 (後追い・なぜなぜ分析の記録)。
@@ -253,8 +277,8 @@ class SettingsDialog:
         self._log_dir_before = tool_registry.get_pc_setting(trace.LOG_DIR_KEY)
         self.log_dir_var = tk.StringVar(value=self._log_dir_before)
 
-        frame = tk.Frame(self.top, bg=theme.BG)
-        frame.pack(fill="x", padx=16, pady=(12, 0))
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(12, 0))
         tk.Label(frame, text="ログの出力先", bg=theme.BG, fg=theme.FG,
                  font=theme.FONT_BOLD).pack(side="left")
         tk.Entry(frame, textvariable=self.log_dir_var, width=40,
@@ -272,15 +296,15 @@ class SettingsDialog:
                      "共有フォルダーを指定すると、端末名のフォルダー "
                      f"({trace.computer_name()}) に分けて書きます"
                      " (全端末の記録が1か所に集まります)"):
-            tk.Label(self.top, text=text, bg=theme.BG, fg=theme.MUTED,
+            tk.Label(self.area, text=text, bg=theme.BG, fg=theme.MUTED,
                      font=theme.FONT_SMALL, anchor="w", justify="left",
-                     wraplength=640).pack(fill="x", padx=16, pady=(4, 0))
+                     wraplength=640).pack(fill="x", padx=6, pady=(4, 0))
         dest = trace.destination()
-        tk.Label(self.top, text=f"いまの書き先: {dest.describe()}",
+        tk.Label(self.area, text=f"いまの書き先: {dest.describe()}",
                  bg=theme.BG,
                  fg=theme.STATE_COLORS["error"] if dest.problem else theme.MUTED,
                  font=theme.FONT_SMALL, anchor="w", justify="left",
-                 wraplength=640).pack(fill="x", padx=16, pady=(2, 0))
+                 wraplength=640).pack(fill="x", padx=6, pady=(2, 0))
 
     def browse_log_dir(self) -> None:
         current = self.log_dir_var.get().strip()
@@ -319,16 +343,16 @@ class SettingsDialog:
         では起動時に読み込まれる (**その端末にすでにある設定が優先**)。
         **手で JSON を書かせない**ための入口。
         """
-        frame = tk.Frame(self.top, bg=theme.BG)
-        frame.pack(fill="x", padx=16, pady=(12, 0))
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(12, 0))
         tk.Label(frame, text="配布先フォルダ", bg=theme.BG, fg=theme.FG,
                  font=theme.FONT_BOLD).pack(side="left")
         tk.Label(frame, text=distribution.state_text(), bg=theme.BG,
                  fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(side="left", padx=(10, 0))
 
-        actions = tk.Frame(self.top, bg=theme.BG)
-        actions.pack(fill="x", padx=16, pady=(4, 0))
+        actions = tk.Frame(self.area, bg=theme.BG)
+        actions.pack(fill="x", padx=6, pady=(4, 0))
         self._action_button(actions, "配布先フォルダを作る",
                             self.export_distribution).pack(side="left")
         reload = self._action_button(actions, "配布先フォルダの内容で置き換える",
@@ -342,14 +366,14 @@ class SettingsDialog:
         # 配った先でもツールがランチャーと同じ並びに置かれるなら、相対
         # パスにしておくとドライブ名やフォルダー名が違っても動く
         self.relative_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(self.top,
+        tk.Checkbutton(self.area,
                        text="起動ファイルはランチャーのフォルダーからの相対パスで"
                             "書く (配る先でも同じ並びに置く場合)",
                        variable=self.relative_var,
                        bg=theme.BG, fg=theme.MUTED, selectcolor=theme.BUTTON_BG,
                        activebackground=theme.BG, activeforeground=theme.FG,
                        font=theme.FONT_SMALL, bd=0, highlightthickness=0,
-                       anchor="w").pack(fill="x", padx=16, pady=(4, 0))
+                       anchor="w").pack(fill="x", padx=6, pady=(4, 0))
 
     @staticmethod
     def _action_button(parent: tk.Widget, text: str, command) -> tk.Button:
@@ -442,7 +466,7 @@ class SettingsDialog:
 
     def _build_buttons(self) -> None:
         frame = tk.Frame(self.top, bg=theme.BG)
-        frame.pack(fill="x", padx=16, pady=14)
+        frame.pack(side="bottom", fill="x", padx=16, pady=(8, 12))
         tk.Button(frame, text="キャンセル", command=self.cancel,
                   bg=theme.BUTTON_BG, fg=theme.MUTED, relief="flat", bd=0,
                   padx=16, pady=6, font=theme.FONT,
@@ -453,12 +477,18 @@ class SettingsDialog:
                   cursor="hand2").pack(side="right", padx=(0, 8))
 
     def _center_on(self, parent: tk.Misc) -> None:
+        """バーの近くに出す。**窓全体 (［保存］まで) が画面に収まる**ように置く。"""
         self.top.update_idletasks()
         width = self.top.winfo_reqwidth()
         height = self.top.winfo_reqheight()
+        screen_w = self.top.winfo_screenwidth()
+        screen_h = self.top.winfo_screenheight()
         x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+        x = min(max(0, x), max(0, screen_w - width))
         y = max(20, parent.winfo_rooty() - height - 20)
-        self.top.geometry(f"+{max(0, x)}+{y}")
+        # バーが画面の上にあると「バーの上」に入りきらない。下に切れないよう寄せる
+        y = max(0, min(y, screen_h - height - 60))
+        self.top.geometry(f"+{x}+{y}")
 
     # --------------------------------------------------------------
     def save(self) -> None:
@@ -660,6 +690,10 @@ class _ToolRow:
                                    fg=theme.STATE_COLORS["starting"],
                                    font=theme.FONT_SMALL, anchor="w", justify="left",
                                    wraplength=680)
+        # 折り返しは**行の幅に合わせる** (決め打ちの幅だと、窓が狭いとき右が切れた)
+        for label in (self.note, self.hint_label):
+            label.bind("<Configure>", lambda e, w=label: w.configure(
+                wraplength=max(200, e.width - 8)))
         self._probe_cache: tuple[str, dict] = ("", {})
         self._hint_job = None
         for var in (self.path_var, self.port_var, self.stop_var, self.ui_var,
@@ -706,7 +740,7 @@ class _ToolRow:
             hints = []
         self.hints = hints
         if hints:
-            self.hint_label.configure(text="\n".join(f"ヒント: {h}" for h in hints))
+            self.hint_label.configure(text="\n".join(_hint_line(h) for h in hints))
             self.hint_label.pack(fill="x", pady=(2, 0))
         else:
             self.hint_label.pack_forget()
@@ -809,6 +843,16 @@ class _ToolRow:
         if problem:
             return self.tool, problem
         return tool, ""
+
+
+def _hint_line(text: str) -> str:
+    """ヒント1つを画面の1行に。**半角の空白で折り返させない。**
+
+    Tk は空白の位置で折り返すので、「ヒント: 」や「 (」のところで改行されて
+    「ヒント:」だけの行ができていた。全角にして、文字の途中で折り返させる。
+    """
+    return "ヒント：" + (text.replace(" (", "（").replace(") ", "）")
+                        .replace("(", "（").replace(")", "）"))
 
 
 def _port_note(found: dict) -> str:

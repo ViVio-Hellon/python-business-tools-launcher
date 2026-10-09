@@ -9,6 +9,8 @@
 * バーの位置が設定どおりに動かない (手で触れると、その場所に固定されていた)。
   「ランチャーを起動したとき」「ツールを使っているとき」を両方選べるようにし、
   手で動かした位置は覚えない
+* (1.7.6) ［設定］の［保存］が消えた。ヒントが増えて窓が画面より高くなり、
+  最後に置いた［保存］が画面の外へ押し出されていた
 """
 from __future__ import annotations
 
@@ -188,6 +190,68 @@ class BarPositionTests(ManagerTestCase):
         bar._render(Status(state=State.IDLE))
         self.settle(bar)
         self.assertEqual(self.xy(bar), self.expected(bar, "center"))
+
+
+@unittest.skipUnless(_have_tk(), "tkinter と画面が要る")
+class SettingsDialogFitTests(ManagerTestCase):
+    """ヒントの多い4行を入れても、［保存］が画面の中に見えている。"""
+
+    def setUp(self) -> None:
+        from _isolation import release_tk
+
+        self.addCleanup(release_tk, self)
+        super().setUp()
+
+    def test_ヒントが多くても保存が画面の中に見える(self) -> None:
+        import tkinter as tk
+        from unittest import mock
+
+        from test_setting_hints import make_tool
+
+        from launcher.ui import settings_dialog
+
+        for order, name in enumerate(("資材ツール", "コイル梱包", "日報", "看板", "点検")):
+            root = make_tool(self.work_root, name, exe=f"{name}.exe",
+                             app_id=f"nlm.t{order}",
+                             server={"roles": {"field": {"port": 8713},
+                                               "material": {"port": 8723}}})
+            tool_registry.save(tool_registry.Tool(
+                app_id=f"nlm.t{order}", display_name=name, port=8750,
+                start_command=str(root / "start.bat"), order_no=order + 1))
+        parent = tk.Tk()
+        self.addCleanup(parent.destroy)
+        parent.geometry("600x56+300+10")      # バーを画面の上に置いた場合
+        parent.update()
+        seen = {}
+
+        def look(top) -> None:
+            top.update()
+            seen["top"] = (top.winfo_rooty(), top.winfo_height(), top.winfo_screenheight())
+            save = [w for w in _walk(top) if isinstance(w, tk.Button)
+                    and w.cget("text") == "保存"][0]
+            seen["save"] = (save.winfo_rooty(), save.winfo_height(), save.winfo_ismapped())
+            hints = [w for w in _walk(top) if isinstance(w, tk.Label)
+                     and str(w.cget("text")).startswith("ヒント")]
+            seen["hint"] = hints[0].cget("text")
+            top.destroy()
+
+        with mock.patch.object(tk.Toplevel, "wait_window", look), \
+                mock.patch.object(tk.Toplevel, "grab_set", lambda self: None):
+            settings_dialog.SettingsDialog(parent)
+        y, height, screen = seen["top"]
+        self.assertLessEqual(y + height, screen, "設定の窓が画面の下にはみ出しています")
+        save_y, save_h, mapped = seen["save"]
+        self.assertTrue(mapped)
+        self.assertLessEqual(save_y + save_h, screen, "［保存］が画面の外です")
+        # 「ヒント:」だけの行を作らない (半角の空白で折り返させない)
+        self.assertTrue(seen["hint"].startswith("ヒント："), seen["hint"])
+        self.assertNotIn(" (", seen["hint"])
+
+
+def _walk(widget):
+    for child in widget.winfo_children():
+        yield child
+        yield from _walk(child)
 
 
 if __name__ == "__main__":

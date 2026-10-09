@@ -244,7 +244,7 @@ class SettingsRowTests(HintTestCase):
 
     def test_行にヒントが出て値を変えると出し直す(self) -> None:
         row = self.row("梱包資材総合ツール.exe", 8713)
-        self.assertIn("ヒント: ポートは空にしてください", row.hint_label.cget("text"))
+        self.assertIn("ヒント：ポートは空にしてください", row.hint_label.cget("text"))
         self.assertTrue(row.hint_label.winfo_ismapped())
         row.port_var.set("")
         row.refresh_hints()
