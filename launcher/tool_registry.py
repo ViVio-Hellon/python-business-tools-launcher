@@ -991,11 +991,11 @@ _BAT_ARGS = re.compile(r"%\*|%[1-9]")
 def recommend_start_args(start_command: str) -> tuple[str, str]:
     """起動引数に何を入れればよいか。`(起動引数, 理由)`。
 
-    **利用者に考えさせない。** `--no-browser` を入れるのは、次の2つが
-    そろったときだけ:
+    **利用者に考えさせない。** `Start.vbs` (`.vbs`) はブラウザー版なので、
+    いつも空 (画面はふだんのブラウザーのタブ。1.7.5)。ほかで `--no-browser`
+    を入れるのは、次の2つがそろったときだけ:
 
-    * 起動ファイルが引数をツールへ渡す (`.bat` の `%*`、`.vbs` の
-      `WScript.Arguments`)
+    * 起動ファイルが引数をツールへ渡す (`.bat` の `%*`、exe)
     * ツールが `--no-browser` を知っている (ツールのフォルダーの `.py` に
       その文字がある)
 
@@ -1015,8 +1015,13 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
     if kind == ".exe":
         return _recommend_exe_args(path)
     if kind == ".vbs":
-        forwards = _vbs_forwards_args(str(path))
-    elif kind == ".bat":
+        # Start.vbs はブラウザー版。画面は**ふだんのブラウザーのタブ**に開く
+        # (利用者が決めた)。引数を渡す Start.vbs でも --no-browser は入れない ──
+        # 入れるとランチャー専用の窓 (アドレスバーの無いブラウザー) になり、
+        # exe 版の窓と見分けがつかない (現場の報告)
+        return "", ("起動引数は空にしました (Start.vbs はブラウザー版です。"
+                    "画面はツールが、ふだんのブラウザーのタブに開きます)")
+    if kind == ".bat":
         forwards = _bat_forwards_args(path)
     else:
         forwards = False
@@ -1461,12 +1466,15 @@ def setting_hints(tool: Tool, probed: Optional[dict] = None) -> list[str]:
                 and fileprobe.is_file(entry.with_name("Start.vbs")):
             hints.append("起動ファイルは、同じフォルダーの Start.vbs を選んでください "
                          "(start.bat は、うまく起動しないときの原因調べ用です)")
-        if kind == "vbs" and not tool.forwards_args:
+        if kind == "vbs" and tool.suppresses_browser:
+            hints.append("起動引数の --no-browser を消すと、ふだんのブラウザーのタブで開きます "
+                         "(いまはランチャー専用の窓 (アドレスバーの無いブラウザー) に開きます。"
+                         "exe 版ではありません)")
+        elif kind == "vbs":
             hints.append("画面は、ふだんのブラウザーのタブに開きます (ボタンを押しても、"
                          "そのタブは前に出ません。タブを閉じるとツールは少しして終わります)")
         elif tool.suppresses_browser and tool.resolved_ui_mode == UI_BROWSER:
-            hints.append("画面は、ランチャー専用の窓 (アドレスバーの無いブラウザー) に開きます。"
-                         "exe 版ではありません")
+            hints.append("画面は、ランチャー専用の窓 (アドレスバーの無いブラウザー) に開きます")
         if not entries.has_check:
             if roles:
                 listed = " / ".join(f"{name} {port}" for name, port in roles.items())

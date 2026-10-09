@@ -596,7 +596,7 @@ class RecommendStartArgsTests(LocalAreaTestCase):
         vbs = self.make("Start.vbs", 'shell.Run "pythonw app.py", 0, False\r\n')
         args, reason = tool_registry.recommend_start_args(str(vbs))
         self.assertEqual(args, "")
-        self.assertIn("引数をツールへ渡さない", reason)
+        self.assertIn("Start.vbs はブラウザー版です", reason)
         self.assertNotIn("start.bat", reason)
 
     def test_仮想環境の中までは探さない(self) -> None:

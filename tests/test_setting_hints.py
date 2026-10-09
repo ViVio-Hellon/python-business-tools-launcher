@@ -122,23 +122,33 @@ class PackagingToolTests(HintTestCase):
 class CoilCalculatorTests(HintTestCase):
     """CoilCalculator: 入口あり。Start.vbs は引数を渡す。"""
 
-    def test_引数を渡すStartvbsでは画面の開き方を言わない(self) -> None:
+    def test_入口があれば自動のままでよいと言う(self) -> None:
         root = make_tool(self.work_root, "CoilCalculator", exe="CoilCalculator.exe",
                          app_id="nlm.coil-calculator", vbs=VBS_ARGS, entries=True,
                          server={"port": 8741, "port_retry": 5})
         text = self.hints(root / "Start.vbs")
         self.assertIn("止め方をツール側で用意しています", text)
-        self.assertNotIn("ふだんのブラウザーのタブに開きます", text)
 
-    def test_ランチャー専用の窓はexeではないと言う(self) -> None:
-        """アドレスバーの無い専用の窓は、exe 版の窓と見分けにくい (現場の報告)。"""
+    def test_Startvbsにnobrowserがあれば消すよう言う(self) -> None:
+        """アドレスバーの無い専用の窓は、exe 版の窓と見分けにくい (現場の報告)。
+        Start.vbs の画面は、ふだんのブラウザーのタブにする (利用者が決めた)。"""
         root = make_tool(self.work_root, "CoilCalculator", exe="CoilCalculator.exe",
                          app_id="nlm.coil-calculator", vbs=VBS_ARGS, entries=True,
                          server={"port": 8741, "port_retry": 5})
         text = self.hints(root / "Start.vbs", start_args="--no-browser")
-        self.assertIn("ランチャー専用の窓 (アドレスバーの無いブラウザー) に開きます", text)
+        self.assertIn("起動引数の --no-browser を消すと、ふだんのブラウザーのタブで開きます", text)
         self.assertIn("exe 版ではありません", text)
-        self.assertNotIn("ランチャー専用の窓", self.hints(root / "Start.vbs"))
+        plain = self.hints(root / "Start.vbs")
+        self.assertNotIn("ランチャー専用の窓", plain)
+        self.assertIn("ふだんのブラウザーのタブに開きます", plain)
+
+    def test_自動は引数を渡すStartvbsでも空にする(self) -> None:
+        root = make_tool(self.work_root, "CoilCalculator", exe="CoilCalculator.exe",
+                         app_id="nlm.coil-calculator", vbs=VBS_ARGS, entries=True,
+                         server={"port": 8741, "port_retry": 5})
+        args, reason = tool_registry.recommend_start_args(str(root / "Start.vbs"))
+        self.assertEqual(args, "")
+        self.assertIn("ふだんのブラウザーのタブに開きます", reason)
 
 
 class CoilPackingTests(HintTestCase):
