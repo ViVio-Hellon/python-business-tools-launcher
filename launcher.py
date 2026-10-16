@@ -50,8 +50,77 @@ if not sys.pycache_prefix:
     except Exception:                         # noqa: BLE001 - 失敗しても起動は続ける
         pass
 
-from launcher import app_config  # noqa: E402
-from launcher.logging_utils import configure_logging, get_logger  # noqa: E402
+# ランチャーの部品。**欠けていれば名指しする** ── フォルダーのコピーが途中で
+# 止まった・ウイルス対策ソフトに消された、などで一部が無いと、読み込みの途中で
+# 落ちる。`Start.vbs` (pythonw) から起動していると何も見えないまま消えるので、
+# 何が無くて、どうすればよいか (フォルダーを丸ごと入れ直す) を出す。
+# 部品を足したら、ここにも足す (`tests/test_launcher_parts.py` が確かめる)
+ESSENTIAL_FILES = (
+    "launcher.py", "boot.py", "launch_guard.py", "app_manager.py",
+    "process_manager.py", "Start.vbs", "stop.bat", "config/launcher.json",
+    "launcher/__init__.py", "launcher/admin_lock.py", "launcher/app_config.py",
+    "launcher/browser.py", "launcher/desktop.py", "launcher/distribution.py",
+    "launcher/fileprobe.py", "launcher/health.py", "launcher/logging_utils.py",
+    "launcher/runtime_state.py", "launcher/startup_progress.py",
+    "launcher/tool_entries.py", "launcher/tool_registry.py", "launcher/trace.py",
+    "launcher/version_info.py",
+    "launcher/ui/__init__.py", "launcher/ui/bar.py", "launcher/ui/geometry.py",
+    "launcher/ui/password.py", "launcher/ui/progress_window.py",
+    "launcher/ui/record_viewer.py", "launcher/ui/settings_dialog.py",
+    "launcher/ui/splash.py", "launcher/ui/texts.py", "launcher/ui/theme.py",
+    "launcher/ui/version_dialog.py",
+)
+
+TITLE_FALLBACK = "業務ツール統合ランチャー"
+
+
+def missing_parts() -> list[str]:
+    """ランチャーのフォルダーに無い部品。"""
+    return [name for name in ESSENTIAL_FILES if not (APP_ROOT / name).is_file()]
+
+
+def broken_install_text(exc: BaseException) -> tuple[str, str]:
+    """組み立てられなかったときの `(何が起きたか, どうすればよいか)`。"""
+    missing = missing_parts()
+    if not missing and not isinstance(exc, ImportError):
+        return (f"ランチャーを組み立てられませんでした: {type(exc).__name__}: {exc}",
+                "障害記録を開発担当へ渡してください。")
+    found = ("見つからない部品: " + "、".join(missing) if missing
+             else f"読み込めなかった部品: {exc}")
+    return ("ランチャーの部品が足りないため、起動できませんでした",
+            f"{found}\n\n"
+            "ランチャーのフォルダーの一部が欠けています (コピーが途中で止まった、"
+            "ウイルス対策ソフトに消された など)。\n"
+            f"ランチャーのフォルダー ({APP_ROOT}) を、配布元から丸ごと入れ直してください。\n"
+            "登録したツールの設定はこの端末 (ローカル領域) に残っているので、"
+            "入れ直しても消えません。")
+
+
+def _report_broken_install(exc: BaseException) -> None:
+    """設定や記録の部品も読めないときの、最後の伝え方 (標準ライブラリだけ)。"""
+    message, hint = broken_install_text(exc)
+    print(f"\n[エラー] {message}\n{hint}", file=sys.stderr)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(f"{TITLE_FALLBACK} - 起動できませんでした",
+                             f"{message}\n\n{hint}")
+        root.destroy()
+    except Exception:                         # noqa: BLE001 - 伝え方で落ちない
+        pass
+
+
+try:
+    from launcher import app_config  # noqa: E402
+    from launcher.logging_utils import configure_logging, get_logger  # noqa: E402
+except Exception as _exc:                     # noqa: BLE001 - 部品が足りない
+    if __name__ == "__main__":
+        _report_broken_install(_exc)
+        raise SystemExit(1)
+    raise
 
 # 動かせる最低の Python。標準ライブラリだけで書いてあるので低くてよい
 MIN_PYTHON = (3, 9)
@@ -215,6 +284,10 @@ def start() -> int:
             exc=exc)
         trace.event("ランチャー終了", trace.FAILED,
                     cause=f"{type(exc).__name__}: {exc}", incident=path)
+        try:
+            exc.launcher_incident = path      # 伝えるとき、障害記録を重ねて書かない
+        except Exception:                     # noqa: BLE001
+            pass
         raise
     finally:
         launch_guard.remove_lock()
@@ -243,8 +316,10 @@ def _show_message(title: str, body: str) -> bool:
         return False
 
 
-def report_failure(error: StartupError) -> None:
+def report_failure(error: StartupError, *, incident: str = "") -> None:
     """コンソール・ダイアログ・ブラウザーの順に伝える。
+
+    `incident` はもう書いてある障害記録 (渡せば重ねて書かない)。
 
     `Start.vbs` から起動された場合、標準出力は誰にも見えない。
     tkinter が無いことが理由のときはダイアログも出せないので、
@@ -266,14 +341,14 @@ def report_failure(error: StartupError) -> None:
         get_logger("launcher").error("起動に失敗: %s / %s", error, error.hint)
     except Exception:                         # noqa: BLE001
         pass
-    incident = ""
     try:
         from launcher import trace
-        incident = trace.incident(
-            "ランチャーを起動できなかった",
-            whys=[str(error)], hints=[error.hint] if error.hint else [])
-        trace.event("ランチャー起動", trace.FAILED, cause=str(error),
-                    detail=error.hint, incident=incident)
+        if not incident:
+            incident = trace.incident(
+                "ランチャーを起動できなかった",
+                whys=[str(error)], hints=[error.hint] if error.hint else [])
+            trace.event("ランチャー起動", trace.FAILED, cause=str(error),
+                        detail=error.hint, incident=incident)
     except Exception:                         # noqa: BLE001 - 伝え方で落ちない
         pass
 
@@ -438,6 +513,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\n中断しました")
         return 0
+    except Exception as exc:                  # noqa: BLE001 - 黙って消えない
+        # 組み立ての途中で落ちた (部品が足りない・設定が壊れた など)。以前は
+        # 障害記録だけ書いて終わり、Start.vbs (pythonw) からだと**何も見えずに
+        # 消えていた**。何が無くて、どうすればよいかを出す
+        message, hint = broken_install_text(exc)
+        report_failure(StartupError(message, hint),
+                       incident=getattr(exc, "launcher_incident", ""))
+        return 1
 
 
 def _describe_records() -> str:

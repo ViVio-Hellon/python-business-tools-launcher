@@ -70,6 +70,8 @@ COMMAND_TIMEOUT_SEC = 8.0
 APP_CLOSE_WAIT_SEC = 10.0
 # 強制終了のときに、先に窓を閉じてもらう猶予 (秒)
 APP_CLOSE_WAIT_FORCE_SEC = 3.0
+# 「止めた」と答えたあと、ツールのプロセスが消えるのを待つ上限 (秒)
+LEFTOVER_WAIT_SEC = 8.0
 
 # Windowsで子プロセスのコンソールを出さないための旗。
 # 他のOSでは 0 になり、`creationflags=0` は何もしないのと同じ
@@ -91,6 +93,8 @@ class StopResult:
     # ブラウザー画面を閉じられたか (要件定義書 §8.3)。
     # 閉じられない形で開いていたときは False のまま
     browser_closed: bool = False
+    # 「止めた」と答えたのに残っていたプロセス (PID)。強制終了で止める
+    leftover: list[int] = field(default_factory=list)
 
     @property
     def busy(self) -> bool:
@@ -209,7 +213,21 @@ def stop(running: RunningTool, *, force: bool = False,
     `on_backend` は、画面を閉じ終えて**バックエンドを止めにかかる直前**に
     呼ぶ。画面に「〜を終了しています」を、終わってからではなく
     始めるときに出すため。
+
+    **止まったと言う前に、ツールのプロセスが消えたことを確かめる**
+    (`_confirm_gone`)。ツールの答え (終了の入口・stop.bat の 0・起動確認が
+    答えなくなった) だけで「止まった」としていたので、答えたあとも Python が
+    残ると、フォルダーを消せないまま「正常に終了しました」と出ていた
+    (all-tools の報告: 本体を組み立てられず待機画面で残った Python)。
     """
+    outcome = _stop_chain(running, force=force, timeout=timeout,
+                          on_backend=on_backend)
+    return _confirm_gone(running, outcome, force=force)
+
+
+def _stop_chain(running: RunningTool, *, force: bool, timeout: float,
+                on_backend: Optional[Callable[[], None]]) -> StopResult:
+    """止め方を順に試す (`stop` の本体)。"""
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
     log.info("停止開始: %s (force=%s)", running.summary(), force)
@@ -296,6 +314,118 @@ def stop(running: RunningTool, *, force: bool = False,
         result.message = "止める方法がありませんでした"
     log.warning("停止できませんでした: %s — %s", running.app_id, result.message)
     return result
+
+
+# --- 止まったことを、プロセスで確かめる ----------------------------
+def tool_processes(running: RunningTool) -> set[int]:
+    """そのツールのプロセスのうち、いま動いているもの。
+
+    * ツールのフォルダーから起動したプロセス (`desktop.processes_in_folder`。
+      `tools\\nippou` のような中のフォルダーも含む)。ほかの登録済みツールと
+      フォルダーを分け合っていれば、フォルダーでは見分けない
+    * 記録した PID (本体・起動ファイル・窓) で、照合できたもの
+
+    **子・孫はたどらない。** ツールが既定のブラウザーを起こすと、そのブラウザーは
+    ツールの子になる。たどると利用者のブラウザーまで止めてしまう (§8.3.3)。
+    """
+    found: set[int] = set()
+    folder = app_folder(running)
+    if folder and not _shared(folder, running.app_id):
+        found |= set(desktop.processes_in_folder(folder))
+    for pid in {running.pid, running.launch_pid, running.window_pid}:
+        if pid and pid not in found and _is_alive(pid) \
+                and verify_process(pid, running).ok:
+            found.add(pid)
+    return found - desktop.protected_pids()
+
+
+def _shared(folder: str, app_id: str) -> bool:
+    try:
+        from launcher import tool_registry
+
+        return tool_registry.shared_folder(folder, app_id)
+    except Exception:                         # noqa: BLE001 - 分からなければ使わない
+        log.warning("フォルダーをほかのツールと分け合っているか確かめられませんでした",
+                    exc_info=True)
+        return True
+
+
+def _alive_among(pids: set[int], timeout: float) -> set[int]:
+    """`timeout` 秒待っても残っているもの。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        left = {pid for pid in pids if _is_alive(pid)}
+        if not left or time.monotonic() >= deadline:
+            return left
+        time.sleep(0.2)
+
+
+def describe_pids(pids) -> str:
+    """「python.exe PID 1234、…」。"""
+    parts = []
+    for pid in sorted(pids):
+        image = Path(desktop.process_image(pid) or "").name
+        parts.append(f"{image} PID {pid}" if image else f"PID {pid}")
+    return "、".join(parts)
+
+
+def _confirm_gone(running: RunningTool, outcome: StopResult, *,
+                  force: bool) -> StopResult:
+    """「止まった」と言う前に、ツールのプロセスが残っていないか確かめる。
+
+    残っていれば少し待つ (終わりかけ)。それでも残っていれば:
+
+    * 強制終了でない → **「止まった」とは言わない。** 残っている PID を添えて
+      返し、強制終了するかは利用者が選ぶ (バーはその場で聞く)
+    * 強制終了 → 残っているものを1つずつ止める (照合したものだけ・子は
+      たどらない)。それでも消えなければ「止められませんでした」
+    """
+    if not outcome.stopped:
+        return outcome
+    try:
+        left = tool_processes(running)
+    except Exception:                         # noqa: BLE001 - 確かめられなければ答えを信じる
+        log.warning("止まったかをプロセスで確かめられませんでした", exc_info=True)
+        return outcome
+    left = _alive_among(left, LEFTOVER_WAIT_SEC) if left else set()
+    if not left:
+        return outcome
+    names = describe_pids(left)
+    name = running.display_name or running.app_id
+    if not force:
+        log.warning("%s は止まったと答えましたが、プロセスが残っています: %s",
+                    running.app_id, names)
+        outcome.stopped = False
+        outcome.leftover = sorted(left)
+        outcome.message = f"{name}のプロセスが残っています ({names})"
+        outcome.busy_jobs = [outcome.message]
+        return outcome
+    log.warning("%s のプロセスが残っているので止めます: %s", running.app_id, names)
+    left = stop_leftovers(running, left)
+    if left:
+        outcome.stopped = False
+        outcome.leftover = sorted(left)
+        outcome.message = f"{name}のプロセスを止められませんでした ({describe_pids(left)})"
+        return outcome
+    outcome.message = (outcome.message or "終了しました") + \
+        f" (残っていたプロセスも止めました: {names})"
+    return outcome
+
+
+def stop_leftovers(running: RunningTool,
+                   pids: Optional[set[int]] = None) -> set[int]:
+    """ツールのプロセス (`tool_processes`) を1つずつ止める。止まらなかったものを返す。
+
+    照合したもの (ツールのフォルダーから起動した・記録した PID) だけを止め、
+    **子・孫はたどらない** (ツールが起こした利用者のブラウザーを巻き込まない)。
+    """
+    targets = set(pids) if pids is not None else tool_processes(running)
+    targets -= desktop.protected_pids()
+    if not targets:
+        return set()
+    for pid in sorted(targets, reverse=True):
+        _terminate(pid, force=True, tree=False)
+    return _alive_among(targets, TERMINATE_WAIT_SEC)
 
 
 def _handle_unresponsive(running: RunningTool, result: StopResult, *,
@@ -1011,7 +1141,7 @@ def _command_line_windows(pid: int) -> str:
         return ""
 
 
-def _terminate(pid: int, *, force: bool) -> bool:
+def _terminate(pid: int, *, force: bool, tree: bool = True) -> bool:
     """1つのプロセス (と、その子・孫) を止める。要求を出せたかを返す。
 
     子まで止めるのは、`start.bat` から起こした `cmd.exe` の下にPythonが
@@ -1029,7 +1159,8 @@ def _terminate(pid: int, *, force: bool) -> bool:
         log.error("ランチャー自身 (またはそれを起こしたプロセス) は止めません: pid=%s",
                   pid)
         return False
-    targets = sorted((desktop.process_tree(pid) | {pid}) - protected)
+    targets = sorted(((desktop.process_tree(pid) if tree else set()) | {pid})
+                     - protected)
     if os.name == "nt":
         command = ["taskkill"]
         for target in targets:

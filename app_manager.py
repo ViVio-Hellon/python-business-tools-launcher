@@ -866,8 +866,15 @@ class ToolManager:
                       + "、".join(result.busy_jobs)
                       + "\n終了するときは［ツール停止］から「強制終了」を"
                         "選んでください")
-            if running.is_app and any(job.startswith("終了の確認")
-                                      for job in result.busy_jobs):
+            if result.leftover:
+                # ツールは「止めた」と答えたのに、プロセスが残っている。**止まったとは
+                # 言わない** ── 残っているとツールのフォルダーを消せない (all-tools の報告)
+                detail = (f"{name}は止まったと答えましたが、プロセスが残っています"
+                          f" ({process_manager.describe_pids(result.leftover)})\n"
+                          "残っていると、ツールのフォルダーを消したり入れ替えたりできません。\n"
+                          "［ツール停止］から「強制終了」を選ぶと、残っているプロセスを止めます。")
+            elif running.is_app and any(job.startswith("終了の確認")
+                                        for job in result.busy_jobs):
                 detail = (f"{name}は終了の確認を出しているようです。"
                           "アプリの窓で答えてください。\n"
                           "確かめずに終わらせるときは、［ツール停止］から"
@@ -1126,14 +1133,12 @@ class ToolManager:
             return
 
         if payload is None and how in ("failed", "cancelled") and entries.has_check:
-            # 起動確認の入口が「使える」と言わなかった。**起こしたものは
-            # 片付けない** (止め方はツールが決める)。次に押したときは、
-            # 入口が「動いている」と言えば起動し直さない
+            # 起動確認の入口が「使える」と言わなかった。残ったプロセスは
+            # 置き去りにしない (`_settle_failed_start`)
             self._report_entry_failure(tool, proc, entries, early_exit, seen,
                                        time.monotonic() - started, op=op,
                                        timeout=timeout)
-            with self._lock:
-                self._processes.pop(tool.app_id, None)
+            self._settle_failed_start(tool, proc, entries, seen, op=op)
             return
 
         if payload is None:
@@ -1151,20 +1156,15 @@ class ToolManager:
                                 cause="すでに動いていた同じアプリへ引き渡された")
                     self._show(tool, found, op)
                     return
-            pids = desktop.related_pids(_own_folder(tool), {proc.pid}) \
-                if not tool.is_app else set()
             self._report_start_failure(tool, proc, early_exit,
                                        time.monotonic() - started, op=op,
                                        last_payload=seen.get("payload"),
                                        timeout=timeout)
-            if pids and early_exit.get("code") is None \
-                    and not desktop.has_window(pids):
-                # 応答しないまま動いている。**残すと、次に押したとき2つ目を
-                # 起こす** (ポートの取り合い)。起こしたものは片付ける
-                # (窓を出しているものは、利用者が見ているので落とさない)
-                self._kill_started(tool, proc)
-            with self._lock:
-                self._processes.pop(tool.app_id, None)
+            if tool.is_app:
+                with self._lock:
+                    self._processes.pop(tool.app_id, None)
+            else:
+                self._settle_failed_start(tool, proc, entries, seen, op=op)
             return
 
         if how == "entry":
@@ -1389,6 +1389,97 @@ class ToolManager:
                 return "failed", None, ""
             time.sleep(0.25)
 
+    def _settle_failed_start(self, tool: Tool, proc: subprocess.Popen,
+                             entries: "tool_entries.Entries", seen: dict, *,
+                             op: Optional[trace.Operation] = None) -> None:
+        """起動できなかったツールのプロセスを、**誰も止められないまま残さない。**
+
+        all-tools で、本体を組み立てられなかったツールの Python が待機画面で
+        残り、フォルダーを消せなかった。ランチャーも同じで、入口のあるツールは
+        「起こしたものは片付けない」、入口の無いツールは起動ファイルが動いて
+        いるときだけ片付けていた。Start.vbs のようにすぐ終わる起動ファイルだと、
+        本体の Python は**記録が無いまま**残り、［ツール停止］も stop.bat も
+        届かなかった。
+
+        * ツールが「準備中」と答えている (入口が 2・/api/health がそのツールと
+          して答える)、または窓を出している → 起動に時間がかかっているだけ
+          かもしれない。**止めずに記録を残す** (見回りが続き、使えるように
+          なれば動作中になる。［ツール停止］で止められる)
+        * 答えないのにプロセスが残っている → 片付ける。入口があれば、まず
+          入口に止めてもらう。それでも残るものだけ止める
+        """
+        name = tool.display_name
+        if entries.has_check:
+            running = _running_by_entries(tool, launch_pid=proc.pid, confirmed=False)
+            last = seen.get("check")
+            answering = bool(last is not None and last.alive)
+        else:
+            payload = seen.get("payload")
+            running = _running_from_health(tool, payload or {}, launch_pid=proc.pid)
+            answering = health.is_tool(payload, tool.app_id)
+        running.confirmed = False
+        try:
+            left = process_manager.tool_processes(running)
+            if proc.poll() is None:
+                left.add(proc.pid)
+        except Exception:                     # noqa: BLE001 - 分からなければ残す
+            log.warning("起動できなかった %s のプロセスを確かめられませんでした",
+                        tool.app_id, exc_info=True)
+            left = set()
+        if not left:
+            with self._lock:
+                self._processes.pop(tool.app_id, None)
+            return
+        names = process_manager.describe_pids(left)
+        if answering or desktop.has_window(left):
+            self._keep_failed(running, op=op, cause="ツールはまだ準備中と答えている")
+            self._amend_detail(running, f"{name}のプロセスはまだ動いています ({names})。\n"
+                                        "使えるようになれば、そのまま使えます。"
+                                        "止めるときは［ツール停止］を押してください。")
+            return
+        log.info("起動できなかった %s のプロセスが残っているので片付けます: %s",
+                 tool.app_id, names)
+        if entries.stop:
+            outcome = process_manager.stop(running, timeout=10)
+            if outcome.busy and not outcome.leftover:
+                # ツールが止めるのを断った。止めるかは利用者が決める
+                self._keep_failed(running, op=op, cause=outcome.message)
+                self._amend_detail(running, f"{name}のプロセスが残っています ({names})。\n"
+                                            f"{outcome.message}\n"
+                                            "止めるときは［ツール停止］を押してください。")
+                return
+        if proc.poll() is None:
+            self._kill_started(tool, proc)
+        remaining = process_manager.stop_leftovers(running)
+        with self._lock:
+            self._processes.pop(tool.app_id, None)
+        trace.event("起動しかけを片付け", trace.WARNING if remaining else trace.INFO,
+                    tool=tool, op=op, cause="起動できなかったツールのプロセスが残っていた",
+                    detail=names)
+        if remaining:
+            self._keep_failed(running, op=op, cause="止められなかった")
+            self._amend_detail(running, f"{name}のプロセスを止められませんでした "
+                                        f"({process_manager.describe_pids(remaining)})。\n"
+                                        "［ツール停止］から「強制終了」を選んでください。")
+        else:
+            self._amend_detail(running, f"残っていた{name}のプロセスを止めました ({names})。")
+
+    def _keep_failed(self, running: RunningTool, *, op: Optional[trace.Operation] = None,
+                     cause: str = "") -> None:
+        """起動できなかったが動いているツールを、記録に残す (［ツール停止］で止められる)。"""
+        with self._lock:
+            self._running[running.app_id] = running
+            self._failures[running.app_id] = 0
+        runtime_state.put(running)
+        trace.event("起動しかけを残す", trace.WARNING, tool=running, op=op, cause=cause)
+
+    def _amend_detail(self, who, note: str) -> None:
+        """いま出している知らせ (起動できなかった理由など) の後ろに足す。"""
+        status = self._status
+        detail = f"{status.detail}\n{note}" if status.detail else note
+        self._set(status.state, status.message, who, detail=detail,
+                  incident=status.incident)
+
     def _kill_started(self, tool: Tool, proc: subprocess.Popen) -> None:
         """起動しかけて応答しないまま動いているものを片付ける (起こしたものだけ)。"""
         # 受け皿 (start.bat) が、ちょうど本体を起こしているところかもしれない。
@@ -1497,10 +1588,16 @@ class ToolManager:
         """
         entries = tool_entries.for_tool(tool)
         if entries.has_check:
+            running = _running_by_entries(tool, launch_pid=proc.pid)
             if tool_entries.check(entries).alive:
-                running = _running_by_entries(tool, launch_pid=proc.pid)
                 log.info("打ち切ったツールを止めます: %s", running.summary())
                 process_manager.stop(running, force=True, timeout=10)
+            # 入口が「動いていない」と言っても、ツールのフォルダーに Python が
+            # 残っていることがある (本体を組み立てられずに待機画面で残った、など)
+            left = process_manager.stop_leftovers(running)
+            if left:
+                log.warning("打ち切った %s のプロセスが止まりません: %s", tool.app_id,
+                            process_manager.describe_pids(left))
             payload = None
         else:
             payload = health.probe(tool.health_url)
