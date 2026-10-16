@@ -779,10 +779,11 @@ class _ToolRow:
         if chosen:
             self.path_var.set(chosen)
             note = ""
+            found = tool_registry.probe_tool_folder(chosen)
+            if self.ui_var.get() == "自動" and found.get("ui_mode"):
+                # exe・自分の窓を出す Python のツール (start.bat) は「アプリの窓」
+                self.ui_var.set(UI_LABELS[found["ui_mode"]])
             if chosen.lower().endswith(".exe"):
-                found = tool_registry.probe_tool_folder(chosen)
-                if self.ui_var.get() == "自動" and found.get("ui_mode"):
-                    self.ui_var.set(UI_LABELS[found["ui_mode"]])
                 # ブラウザー版のポートが残っていれば空にする (exe は待ち受けない)
                 if found.get("browser_port") and \
                         self.port_var.get().strip() == str(found["browser_port"]):

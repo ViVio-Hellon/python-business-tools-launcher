@@ -1107,13 +1107,26 @@ class AppWindowTests(ManagerTestCase):
             app_manager._DETACHED.remove(proc)
             proc.wait(timeout=5)
 
-    def test_Webサーバーを持たないアプリにbatは使えない(self) -> None:
+    def test_Webサーバーを持たないアプリもbatで起動して止められる(self) -> None:
+        """1.7.8 から。窓のプロセスは、ツールのフォルダーから起動したもので見る
+        (photo-cleaner: start.bat が pyw で tkinter の窓を起こす)。以前は断っていた。"""
         tool = self.register("fake.batapp", "日報")
         tool_registry.save(replace(tool, port=0, ui_mode="app"))
-        self.start(tool_registry.get("fake.batapp"))
-        self.assertEqual(self.manager.status.state, State.ERROR)
-        self.assertIn("exe を直接指定", self.manager.status.detail)
-        self.assertEqual(self.spawned, [])
+        tool = tool_registry.get("fake.batapp")
+        self.assertEqual(tool.ui_problem(), "")
+        self.start(tool)
+        self.assertEqual(self.manager.status.state, State.RUNNING, self.manager.status.detail)
+        # 起動ファイル (sh) と、その子の本体。本体のコマンドラインにはフォルダーの
+        # 中の道が無い (フォルダーでは見分けられない子)
+        pids = process_manager.app_pids(self.manager.running[tool.app_id])
+        self.assertGreaterEqual(len(pids), 2, pids)
+        self.assertTrue(self.manager._stop_blocking(tool.app_id))
+        deadline = time.monotonic() + 5
+        while any(process_manager.is_pid_alive(p) for p in pids) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([p for p in pids if process_manager.is_pid_alive(p)], [],
+                         "起動ファイルだけ止めて、子の本体を残しました")
 
 
 @unittest.skipIf(os.name == "nt", "偽の exe (名前だけ .exe のスクリプト) は Windows 以外で動かす")

@@ -176,6 +176,22 @@ def app_folder(running: RunningTool) -> str:
     return ""
 
 
+def script_app_folder(running: RunningTool) -> str:
+    """**起動ファイルが exe でない**アプリ (start.bat が `pyw main.py` を起こして
+    すぐ終わる tkinter の窓のツールなど) のフォルダー。
+
+    その窓のプロセスは、ツールのフォルダーから起動したものでしか見分けられない。
+    ほかの登録済みツールとフォルダーを分け合っていれば空 (取り違えない)。
+    """
+    if not running.is_app or app_exe(running):
+        return ""
+    folder = app_folder(running)
+    if not folder or not desktop.folder_is_specific(folder) \
+            or _shared(folder, running.app_id):
+        return ""
+    return folder
+
+
 def app_pids(running: RunningTool) -> set[int]:
     """アプリのプロセス一式。
 
@@ -183,21 +199,49 @@ def app_pids(running: RunningTool) -> set[int]:
     があるので、記録したPIDだけでは足りない。ツールのフォルダーから起動した
     プロセスと、その子・孫をまとめて見る (`desktop.related_pids`)。記録した
     PIDは、**いまもその exe を実行しているときだけ**使う (PIDは使い回される)。
+
+    起動ファイルが start.bat などのアプリ (`script_app_folder`) は、ツールの
+    フォルダーから起動したプロセスで見る。
     """
-    exe = app_exe(running)
-    if not running.is_app or not exe:
+    if not running.is_app:
         return set()
+    exe = app_exe(running)
+    if not exe:
+        folder = script_app_folder(running)
+        # 起動ファイル (start.bat) がまだ動いていれば、その子・孫も見る。本体の
+        # コマンドラインにフォルダーの中の道が無くても (`python main.py` を
+        # 作業フォルダーで起こすなど)、起動ファイルからたどれる
+        return desktop.related_pids(folder, _recorded_roots(running)) if folder else set()
     roots = {running.window_pid} if (running.window_pid and
                                      desktop.runs_exe(running.window_pid, exe)) else set()
     return desktop.related_pids(app_folder(running), roots)
 
 
+def _recorded_roots(running: RunningTool) -> set[int]:
+    """記録した PID (本体・起動ファイル) のうち、**いまもそのツールのもの**。
+
+    PID は使い回されるので、コマンドラインにツールの置き場所が入っている
+    ものだけ。`verify_process` は `app_pids` を使うので、ここでは使わない。
+    """
+    roots = set()
+    for pid in {running.pid, running.launch_pid}:
+        if not pid or not _is_alive(pid):
+            continue
+        command = _normalize_path(process_command_line(pid))
+        for marker in (running.start_command, running.app_root, running.work_dir):
+            needle = _normalize_path(marker)
+            if _is_specific_enough(needle) and needle in command:
+                roots.add(pid)
+                break
+    return roots
+
+
 def app_alive(running: RunningTool) -> Optional[bool]:
     """アプリが動いているか (プロセス一式のどれかが生きているか)。
 
-    アプリの窓のツールでない・exe でないときは `None` (分からない)。
+    アプリの窓のツールでない・プロセスを見分けられないときは `None` (分からない)。
     """
-    if not running.is_app or not app_exe(running):
+    if not running.is_app or not (app_exe(running) or script_app_folder(running)):
         return None
     return bool(app_pids(running))
 
@@ -220,9 +264,12 @@ def stop(running: RunningTool, *, force: bool = False,
     残ると、フォルダーを消せないまま「正常に終了しました」と出ていた
     (all-tools の報告: 本体を組み立てられず待機画面で残った Python)。
     """
+    # 止める前に、ツールのプロセスを覚えておく。止め方によっては親 (start.bat)
+    # だけが先に終わり、残った子はもう親からたどれない (ほかの手がかりも無い)
+    before = _snapshot(running)
     outcome = _stop_chain(running, force=force, timeout=timeout,
                           on_backend=on_backend)
-    return _confirm_gone(running, outcome, force=force)
+    return _confirm_gone(running, outcome, force=force, before=before)
 
 
 def _stop_chain(running: RunningTool, *, force: bool, timeout: float,
@@ -369,8 +416,41 @@ def describe_pids(pids) -> str:
     return "、".join(parts)
 
 
+def _snapshot(running: RunningTool) -> dict[int, Optional[float]]:
+    """止める前の、ツールのプロセスと起動した時刻 (PID の使い回しを見分ける)。
+
+    アプリの窓のツールは子・孫も入れるが、**Python・cmd などスクリプトを動かす
+    ものと、ツールのフォルダーの中の実行ファイルだけ**。ツールが起こした利用者の
+    ブラウザーなどは入れない (止めてはいけない)。
+    """
+    try:
+        pids = tool_processes(running)
+        if running.is_app:
+            folder = _normalize_path(app_folder(running))
+            for pid in app_pids(running):
+                image = desktop.process_image(pid)
+                if desktop._is_script_host(image) or (
+                        folder and _normalize_path(image).startswith(folder + "/")):
+                    pids.add(pid)
+        pids -= desktop.protected_pids()
+        return {pid: desktop.process_started_at(pid) for pid in pids}
+    except Exception:                         # noqa: BLE001 - 覚えられなくても止める
+        log.warning("止める前のプロセスを確かめられませんでした", exc_info=True)
+        return {}
+
+
+def _still_running(before: dict[int, Optional[float]]) -> set[int]:
+    """覚えておいたプロセスのうち、**同じプロセスのまま**残っているもの。"""
+    left = set()
+    for pid, started in before.items():
+        if _is_alive(pid) and desktop.process_started_at(pid) == started:
+            left.add(pid)
+    return left
+
+
 def _confirm_gone(running: RunningTool, outcome: StopResult, *,
-                  force: bool) -> StopResult:
+                  force: bool,
+                  before: Optional[dict[int, Optional[float]]] = None) -> StopResult:
     """「止まった」と言う前に、ツールのプロセスが残っていないか確かめる。
 
     残っていれば少し待つ (終わりかけ)。それでも残っていれば:
@@ -383,7 +463,7 @@ def _confirm_gone(running: RunningTool, outcome: StopResult, *,
     if not outcome.stopped:
         return outcome
     try:
-        left = tool_processes(running)
+        left = tool_processes(running) | _still_running(before or {})
     except Exception:                         # noqa: BLE001 - 確かめられなければ答えを信じる
         log.warning("止まったかをプロセスで確かめられませんでした", exc_info=True)
         return outcome
@@ -616,8 +696,11 @@ def _stop_by_closing(running: RunningTool, *,
 
     asked = desktop.close_windows(pids)
     if asked is None:
-        # 窓の無い環境 (Windows 以外)。終了の要求で代える
-        if not any(_terminate(pid, force=False) for pid in sorted(pids)):
+        # 窓の無い環境 (Windows 以外)。終了の要求で代える。**全部に**出す ──
+        # 以前は最初の1つ (起動ファイルの sh) だけに出し、子の Python が残った
+        requested = [_terminate(pid, force=False, tree=False)
+                     for pid in sorted(pids, reverse=True)]
+        if not any(requested):
             return None
     elif asked == 0:
         log.info("%s は窓を出していないので、ほかの手で止めます",
@@ -757,8 +840,8 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
 
-    if running.is_app and app_exe(running):
-        # 起動した exe が終わっていても、ツールのフォルダーのプロセスを止める
+    if running.is_app and (app_exe(running) or script_app_folder(running)):
+        # 起動した exe (start.bat) が終わっていても、ツールのフォルダーのプロセスを止める
         targets = sorted(app_pids(running))
     else:
         targets = [pid for pid in (running.pid, running.launch_pid)
@@ -831,7 +914,7 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
     if running.is_app and exe and desktop.runs_exe(pid, exe):
         # 実行ファイルのフルパスで確かめられる (外部コマンドを使わない)
         return Verdict(True, f"実行ファイルが {exe} です")
-    if running.is_app and exe and pid in app_pids(running):
+    if running.is_app and pid in app_pids(running):
         return Verdict(True, "ツールのフォルダーから起動したプロセスです")
 
     command = process_command_line(pid)

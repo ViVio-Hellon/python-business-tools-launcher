@@ -2326,11 +2326,14 @@ def _find_app_pid(tool: Tool) -> int:
     """そのアプリのプロセス。exe そのものが動いていればそれ、無ければ
     ツールのフォルダーから起動したもの。無ければ 0。"""
     exe = tool.start_command.strip().strip('"')
-    if not exe.lower().endswith(".exe"):
+    if exe.lower().endswith(".exe"):
+        pids = desktop.find_by_exe(exe)
+        if pids:
+            return pids[0]
+    elif not tool.is_app:
         return 0
-    pids = desktop.find_by_exe(exe)
-    if pids:
-        return pids[0]
+    # 起動ファイルが start.bat などのアプリ (tkinter の窓など) は、ツールの
+    # フォルダーから起動したプロセスで見る
     folder = _own_folder(tool)
     pids = desktop.processes_in_folder(folder) if folder else []
     return min(pids) if pids else 0

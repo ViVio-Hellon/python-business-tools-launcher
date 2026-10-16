@@ -275,15 +275,28 @@ class Tool:
             return ""
         if self.is_app:
             if not self.health_url and self.entry_kind != "exe":
-                return ("Web サーバーを持たないアプリは、起動ファイルに exe を"
-                        "直接指定してください (起動と終了をプロセスで見るため)")
+                # start.bat が `pyw main.py` を起こしてすぐ終わる、tkinter の窓の
+                # ツールなど。窓のプロセスは**ツールのフォルダーから起動したもの**
+                # でしか見分けられない (1.7.8)
+                from . import desktop
+
+                folder = self.resolved_work_dir
+                if not desktop.folder_is_specific(folder):
+                    return ("Web サーバーを持たないアプリは、ツールだけのフォルダーに"
+                            "置いてください (起動と終了を、そのフォルダーから起動した"
+                            "プロセスで見るため)")
+                if shared_folder(folder, self.app_id):
+                    return ("Web サーバーを持たないアプリは、ほかのツールとフォルダーを"
+                            "分けてください (起動と終了を、そのフォルダーから起動した"
+                            "プロセスで見るため)")
             return ""
         if not self.health_url:
             if self.entry_kind == "exe":
                 return ("ポートが空です。自分で窓を出すアプリなら「画面」を"
                         "「アプリの窓」に、Web サーバーの exe ならポートを"
                         "入れてください")
-            return "ブラウザーで開くツールはポートが要ります"
+            return ("ブラウザーで開くツールはポートが要ります。自分で窓を出すアプリ"
+                    "なら「画面」を「アプリの窓」にしてください")
         return ""
 
 
@@ -921,6 +934,14 @@ def probe_tool_folder(start_command: str) -> dict:
             found["ui_mode"] = raw["ui_mode"]
 
     if entry.suffix.lower() != ".exe":
+        if "port" not in found and "ui_mode" not in found \
+                and looks_like_desktop_app(entry):
+            # Web サーバーを持たず、自分の窓を出す Python のツール (tkinter)。
+            # config/app.json が無くても名前を決める (photo-cleaner)
+            found["ui_mode"] = UI_APP
+            found["kind"] = "desktop"
+            found.setdefault("display_name", _readme_title(entry.parent) or entry.parent.name)
+            found.setdefault("app_id", script_app_id(entry))
         return found
 
     from . import desktop
@@ -944,6 +965,57 @@ def probe_tool_folder(start_command: str) -> dict:
     if "app_id" not in found:
         found["app_id"] = exe_app_id(entry)
     return found
+
+
+def looks_like_desktop_app(entry: Path) -> bool:
+    """起動ファイル (bat / vbs) が、**自分の窓を出す Python のツール**を起こすか。
+
+    次がそろうとき: ツールの入口 (`launcher_check.bat` など) が無い・ツールの
+    直下の .py が tkinter を使い、`--no-browser` (ランチャーの画面で開く Web の
+    ツールの印) を知らない。pythonw で起こすことだけでは決めない ── Web の
+    ツールの Start.vbs も pythonw で起こす (ふつうは config/app.json のポートで、
+    呼ぶ前に外れている)。
+    """
+    from . import tool_entries
+
+    if not fileprobe.is_file(entry) or tool_entries.for_start(str(entry)).any:
+        return False
+    try:
+        scripts = sorted(entry.parent.glob("*.py"))[:20]
+    except OSError:
+        return False
+    texts = [_read_text_head(script) for script in scripts]
+    if any(NO_BROWSER_ARG in text for text in texts):
+        return False                          # ランチャーの画面を知っている = Web のツール
+    return any("tkinter" in text for text in texts)
+
+
+def _read_text_head(path: Path, limit: int = 200_000) -> str:
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(limit)
+    except OSError:
+        return ""
+    for encoding in ("utf-8", "cp932"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _readme_title(folder: Path) -> str:
+    """README.md の最初の見出し (`# Photo Cleaner`)。無ければ空。"""
+    for line in _read_text_head(folder / "README.md", 4000).splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return ""
+
+
+def script_app_id(entry: Path) -> str:
+    """config/app.json の無い、窓のツールのアプリID。フォルダー名から作る (`app.<名前>`)。"""
+    stem = re.sub(r"[^0-9A-Za-z._-]+", "-", entry.parent.name).strip("-").lower()
+    return f"app.{stem or 'tool'}"
 
 
 def exe_app_id(entry: Path) -> str:
@@ -1014,6 +1086,9 @@ def recommend_start_args(start_command: str) -> tuple[str, str]:
     kind = path.suffix.lower()
     if kind == ".exe":
         return _recommend_exe_args(path)
+    if probe_tool_folder(str(path)).get("ui_mode") == UI_APP:
+        return "", ("自分で窓を出すアプリなので、起動引数は要りません。"
+                    "ランチャーはブラウザーを開かず、アプリの窓を前に出します")
     if kind == ".vbs":
         # Start.vbs はブラウザー版。画面は**ふだんのブラウザーのタブ**に開く
         # (利用者が決めた)。引数を渡す Start.vbs でも --no-browser は入れない ──
@@ -1461,7 +1536,15 @@ def setting_hints(tool: Tool, probed: Optional[dict] = None) -> list[str]:
             elif tool.stop_method == "stop_bat":
                 hints.append("停止方法は「自動」を勧めます (stop.bat はブラウザー版用のことが"
                              "多く、exe 版の窓を止められないことがあります)")
+    elif tool.is_app:
+        # 自分の窓を出す Python のツール (start.bat が pyw で起こす。photo-cleaner)
+        if tool.stop_method == "auto" and not entries.stop:
+            hints.append("停止方法は「自動」のままで大丈夫です (［ツール停止］で、窓の × を"
+                         "押したのと同じように閉じます)")
     else:
+        if not tool.health_url and not entries.any and looks_like_desktop_app(entry):
+            hints.append("自分で窓を出すアプリのようです。画面を「アプリの窓」にして"
+                         "ください (ポートは空のままで大丈夫です)")
         if kind == "bat" and entry.name.lower() == "start.bat" \
                 and fileprobe.is_file(entry.with_name("Start.vbs")):
             hints.append("起動ファイルは、同じフォルダーの Start.vbs を選んでください "

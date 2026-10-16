@@ -51,7 +51,8 @@ class UiModeTests(unittest.TestCase):
         self.assertFalse(tool.watches_window, "Web サーバーがあれば応答で確かめる")
 
     def test_噛み合わない組み合わせは先に言う(self) -> None:
-        self.assertIn("exe を直接指定",
+        # Web サーバーを持たないアプリの start.bat は、ツールだけのフォルダーなら使える (1.7.8)
+        self.assertIn("ツールだけのフォルダー",
                       self.tool("C:/t/start.bat", ui_mode="app").ui_problem())
         self.assertIn("ポートが要ります", self.tool("C:/t/start.bat").ui_problem())
         self.assertIn("アプリの窓",
