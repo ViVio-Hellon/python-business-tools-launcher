@@ -103,6 +103,51 @@ class NestedFolderTests(ManagerTestCase):
         self.assertTrue(app_manager._own_folder(tool_registry.get("nlm.資材2")))
 
 
+class NestedFolderStopTests(ManagerTestCase):
+    """(1.7.9) 統合ツールの exe と、その中の日報を別々に登録しているとき、統合ツールを
+    止めても**日報のプロセスに触らない**。以前は exe のアプリのプロセスを数えるとき
+    だけ、フォルダーを分け合っているかを見ておらず、日報の Python を「残っています」
+    と出して、強制終了で止めていた。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import subprocess
+
+        self.outer = self.work_root / "all-tools"
+        inner = self.outer / "tools" / "nippou"
+        inner.mkdir(parents=True)
+        (self.outer / "統合ツール.exe").write_bytes(b"MZ")
+        (inner / "Start.vbs").write_text("' vbs\n", encoding="utf-8")
+        (inner / "main.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+        tool_registry.save(tool_registry.Tool(
+            app_id="nlm.nippou", display_name="日報", port=free_port(),
+            start_command=str(inner / "Start.vbs")))
+        tool_registry.save(tool_registry.Tool(
+            app_id="nlm.all-tools", display_name="統合ツール",
+            start_command=str(self.outer / "統合ツール.exe"), ui_mode="app"))
+        self.nippou = subprocess.Popen([sys.executable, str(inner / "main.py")],
+                                       stdin=subprocess.DEVNULL)
+        self.addCleanup(lambda: (self.nippou.kill(), self.nippou.wait(5)))
+        time.sleep(0.3)
+
+    def running(self):
+        return app_manager._running_for_app(tool_registry.get("nlm.all-tools"), 0)
+
+    def test_exeのアプリのプロセスに内側のツールを数えない(self) -> None:
+        import process_manager
+
+        running = self.running()
+        self.assertNotIn(self.nippou.pid, process_manager.app_pids(running))
+        self.assertNotIn(self.nippou.pid, process_manager.tool_processes(running))
+
+    def test_外側を強制終了しても内側のツールは止めない(self) -> None:
+        import process_manager
+
+        result = process_manager.stop(self.running(), force=True, timeout=2)
+        self.assertTrue(result.stopped, result.message)
+        self.assertIsNone(self.nippou.poll(), "別に登録した日報を止めました")
+
+
 def _have_tkinter() -> bool:
     try:
         import tkinter  # noqa: F401

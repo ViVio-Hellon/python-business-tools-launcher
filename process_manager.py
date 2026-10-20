@@ -214,7 +214,14 @@ def app_pids(running: RunningTool) -> set[int]:
         return desktop.related_pids(folder, _recorded_roots(running)) if folder else set()
     roots = {running.window_pid} if (running.window_pid and
                                      desktop.runs_exe(running.window_pid, exe)) else set()
-    return desktop.related_pids(app_folder(running), roots)
+    folder = app_folder(running)
+    if folder and _shared(folder, running.app_id):
+        # ほかの登録済みツールとフォルダーを分け合っている (統合ツールの exe の中に、
+        # 別に登録した日報がある、など)。**フォルダーでは見分けない** ── 見分けると、
+        # 日報のプロセスを統合ツールのものとして閉じたり止めたりする (1.7.9)。
+        # exe そのものを実行しているプロセスだけを見る
+        return desktop.process_tree(roots | set(desktop.find_by_exe(exe)))
+    return desktop.related_pids(folder, roots)
 
 
 def _recorded_roots(running: RunningTool) -> set[int]:
