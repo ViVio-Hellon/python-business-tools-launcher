@@ -1423,8 +1423,8 @@ class StarterAndPortTests(ManagerTestCase):
         a = self.register_app("fake.role1", "現場", detach=True)
         tool_registry.save(tool_registry.Tool(
             app_id="fake.role2", display_name="資材", start_command=a.start_command))
-        self.assertEqual(app_manager._own_folder(a), "")
-        self.assertEqual(app_manager._own_folder(tool_registry.get("fake.role2")), "")
+        self.assertEqual(process_manager.own_folder(a), "")
+        self.assertEqual(process_manager.own_folder(tool_registry.get("fake.role2")), "")
 
 
 if __name__ == "__main__":

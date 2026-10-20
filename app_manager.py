@@ -393,7 +393,7 @@ class ToolManager:
                 running = _running_from_health(tool, payload, launch_pid=0)
                 if tool.is_app:
                     # 窓を持つ exe を探しておく (前に出す・閉じるのに要る)
-                    found = _find_app_pid(tool)
+                    found = process_manager.find_app_pid(tool)
                     running.launch_pid = found
                 else:
                     # **この画面はランチャーが開いたものではない。** 閉じる
@@ -495,9 +495,7 @@ class ToolManager:
         """
         with self._lock:
             proc = self._processes.get(tool.app_id)
-        folder = _own_folder(tool)
-        roots = {proc.pid} if proc is not None else set()
-        pids = desktop.related_pids(folder, roots) if (folder or roots) else set()
+        pids = process_manager.tool_pids(tool, launched=proc.pid if proc else 0)
         brought = (desktop.bring_to_front(pids) if pids else False) \
             or _front_by_title(tool)
         log.info("%s は起動の最中です (窓を前へ=%s)", tool.display_name, brought)
@@ -611,12 +609,11 @@ class ToolManager:
             if health.is_tool(payload, tool.app_id):
                 running = _running_from_health(tool, payload, launch_pid=0)
                 if tool.is_app:
-                    running.launch_pid = _find_app_pid(tool)
+                    running.launch_pid = process_manager.find_app_pid(tool)
                 return running
         if not tool.start_command.strip():
             return None
-        folder = _own_folder(tool)
-        pids = desktop.processes_in_folder(folder) if folder else []
+        pids = process_manager.folder_processes(tool)
         if tool.entry_kind == "exe":
             pids = sorted(set(pids) | set(desktop.find_by_exe(tool.start_command)))
         if not pids:
@@ -625,10 +622,10 @@ class ToolManager:
             if tool.health_url else None
         if payload is not None:
             running = _running_from_health(tool, payload, launch_pid=0)
-            running.launch_pid = _find_app_pid(tool) if tool.is_app else 0
+            running.launch_pid = process_manager.find_app_pid(tool) if tool.is_app else 0
             return running
         if tool.is_app:
-            return _running_for_app(tool, _find_app_pid(tool) or pids[0])
+            return _running_for_app(tool, process_manager.find_app_pid(tool) or pids[0])
         # 応答はしないが、ツールのプロセスは動いている
         running = _running_from_health(tool, {}, launch_pid=0)
         running.pid = pids[0]
@@ -676,14 +673,8 @@ class ToolManager:
         ランチャーが起こしたもの、その子・孫)。"""
         with self._lock:
             proc = self._processes.get(running.app_id)
-        folder = _own_folder(running)
-        if proc is not None:
-            # 起こしたプロセスのハンドルを持っているあいだは、その番号は
-            # ほかに使い回されない。終わっていても、子をたどる起点にしてよい
-            return desktop.related_pids(folder, {proc.pid})
-        if running.is_app:
-            return process_manager.app_pids(running) if folder else set()
-        return desktop.related_pids(folder) if folder else set()
+        # 規則は process_manager の「ツールのプロセス」だけにある
+        return process_manager.tool_pids(running, launched=proc.pid if proc else 0)
 
     def _tool_alive(self, running: RunningTool) -> bool:
         """そのツールのプロセスが、どれか動いているか。"""
@@ -1076,7 +1067,6 @@ class ToolManager:
             own_window: dict[str, set] = {}
             next_look = [time.monotonic() + DISCOVER_EVERY_SEC]
             next_window = [time.monotonic() + WINDOW_LOOK_SEC]
-            folder = _own_folder(tool)
 
             def look_elsewhere(elapsed: float, payload: Optional[dict]) -> None:
                 on_progress(elapsed, payload)
@@ -1085,7 +1075,7 @@ class ToolManager:
                 now = time.monotonic()
                 if now < next_look[0] and now < next_window[0]:
                     return
-                pids = desktop.related_pids(folder, {proc.pid})
+                pids = process_manager.tool_pids(tool, launched=proc.pid)
                 if now >= next_look[0]:
                     next_look[0] = now + DISCOVER_EVERY_SEC
                     found = self._discover(tool, pids)
@@ -1114,7 +1104,7 @@ class ToolManager:
                 op.step("ツールが自分の窓を出した (起動確認の応答はまだ)")
                 how, payload = "window", {}
             if payload is None and tool.app_id not in self._cancelled:
-                payload = self._discover(tool, desktop.related_pids(folder, {proc.pid}))
+                payload = self._discover(tool, process_manager.tool_pids(tool, launched=proc.pid))
             if payload and int(payload.get("port") or 0) not in (0, tool.port):
                 window_note = _port_note(tool, int(payload["port"]))
 
@@ -1328,7 +1318,6 @@ class ToolManager:
         プロセスと、その子・孫を見る。窓が出たら、それ以上待たせない
         (起動中の窓が、出てきたツールの画面の上に居座らないように)。
         """
-        folder = _own_folder(tool)
         limit = timeout if tool.health_url else min(timeout, APP_WINDOW_WAIT_SEC)
         began = time.monotonic()
         next_look = began + DISCOVER_EVERY_SEC
@@ -1341,7 +1330,7 @@ class ToolManager:
             if code is not None:
                 early_exit["code"] = code
                 exited_at = exited_at or time.monotonic()
-            pids = desktop.related_pids(folder, {proc.pid})
+            pids = process_manager.tool_pids(tool, launched=proc.pid)
             if not pids:
                 if code is not None and (
                         code != 0 or time.monotonic() - exited_at >= STUB_GRACE_SEC):
@@ -1879,7 +1868,7 @@ class ToolManager:
             if by_entry:
                 answer = tool_entries.check(tool_entries.for_record(running))
                 return answer.state == tool_entries.STOPPED
-            if running.port <= 0 or not _own_folder(running):
+            if running.port <= 0 or not process_manager.own_folder(running):
                 return False                  # 確かめる手がかりが無い
             if health.is_port_accepting(running.port):
                 return False
@@ -2288,7 +2277,7 @@ def _running_by_entries(tool: Tool, *, launch_pid: int = 0,
     **その URL を開く**。ツールは設定のポートが空いていなければ次の番号を使う。
     """
     if tool.is_app:
-        return _running_for_app(tool, launch_pid or _find_app_pid(tool),
+        return _running_for_app(tool, launch_pid or process_manager.find_app_pid(tool),
                                 confirmed=confirmed)
     running = _running_from_health(tool, {}, launch_pid=launch_pid)
     running.confirmed = confirmed
@@ -2322,44 +2311,10 @@ def _running_for_app(tool: Tool, pid: int, *,
     )
 
 
-def _find_app_pid(tool: Tool) -> int:
-    """そのアプリのプロセス。exe そのものが動いていればそれ、無ければ
-    ツールのフォルダーから起動したもの。無ければ 0。"""
-    exe = tool.start_command.strip().strip('"')
-    if exe.lower().endswith(".exe"):
-        pids = desktop.find_by_exe(exe)
-        if pids:
-            return pids[0]
-    elif not tool.is_app:
-        return 0
-    # 起動ファイルが start.bat などのアプリ (tkinter の窓など) は、ツールの
-    # フォルダーから起動したプロセスで見る
-    folder = _own_folder(tool)
-    pids = desktop.processes_in_folder(folder) if folder else []
-    return min(pids) if pids else 0
-
-
 def _find_running_app(tool: Tool) -> Optional[RunningTool]:
     """ランチャーの外で動いている、そのアプリ。無ければ None。"""
-    pid = _find_app_pid(tool)
+    pid = process_manager.find_app_pid(tool)
     return _running_for_app(tool, pid) if pid else None
-
-
-def _own_folder(item) -> str:
-    """そのツールのフォルダー。**ほかのツールと共有していれば空**
-    (フォルダーでツールを見分けられない)。`Tool` でも `RunningTool` でもよい。"""
-    if isinstance(item, RunningTool):
-        folder = process_manager.app_folder(item)
-    else:
-        folder = item.resolved_work_dir
-    if not folder:
-        return ""
-    try:
-        if tool_registry.shared_folder(folder, item.app_id):
-            return ""
-    except Exception:                         # noqa: BLE001 - 分からなければ使わない
-        return ""
-    return folder
 
 
 def _title_windows(tool: Tool) -> list[int]:

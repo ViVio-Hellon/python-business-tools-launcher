@@ -27,6 +27,7 @@ from _fake_tool_support import free_port, make_tool_dir  # noqa: E402
 from test_app_manager import ManagerTestCase  # noqa: E402
 
 import app_manager  # noqa: E402
+import process_manager  # noqa: E402
 from app_manager import State  # noqa: E402
 from launcher import tool_registry  # noqa: E402
 
@@ -89,7 +90,7 @@ class NestedFolderTests(ManagerTestCase):
             start_command=str(inner / "梱包資材総合ツール.exe")))
         for app_id in ("nlm.packaging-tool", "exe.packaging"):
             with self.subTest(app_id=app_id):
-                self.assertEqual(app_manager._own_folder(tool_registry.get(app_id)), "")
+                self.assertEqual(process_manager.own_folder(tool_registry.get(app_id)), "")
 
     def test_となりのフォルダーどうしは見分ける(self) -> None:
         for name in ("資材", "資材2"):            # 名前の頭が同じでも中ではない
@@ -99,8 +100,8 @@ class NestedFolderTests(ManagerTestCase):
             tool_registry.save(tool_registry.Tool(
                 app_id=f"nlm.{name}", display_name=name, port=free_port(),
                 start_command=str(folder / "start.bat")))
-        self.assertTrue(app_manager._own_folder(tool_registry.get("nlm.資材")))
-        self.assertTrue(app_manager._own_folder(tool_registry.get("nlm.資材2")))
+        self.assertTrue(process_manager.own_folder(tool_registry.get("nlm.資材")))
+        self.assertTrue(process_manager.own_folder(tool_registry.get("nlm.資材2")))
 
 
 class NestedFolderStopTests(ManagerTestCase):

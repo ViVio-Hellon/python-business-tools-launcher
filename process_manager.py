@@ -160,6 +160,23 @@ def is_running(running: RunningTool) -> bool:
     return health.is_tool(health.probe(running.health_url), running.app_id)
 
 
+# ------------------------------------------------------------------
+# ツールのプロセス (**どのプロセスがそのツールのものか、はここだけで決める**)
+# ------------------------------------------------------------------
+#
+# 以前はこの規則が 7 か所にあり (app_manager と desktop にも)、少しずつ違って
+# いた。「止めたのに残る」「ほかのツールを巻き込む」不具合は、その食い違いから
+# 起きた (1.6.2・1.7.3・1.7.7・1.7.8・1.7.9)。規則:
+#
+#   フォルダー    own_folder: ツールのフォルダー。**ほかの登録済みツールと分け
+#                 合っている (同じ・中・外) なら使わない** (取り違えて止めない)
+#   照合          記録した PID は、コマンドラインにツールの置き場所が入っている
+#                 ときだけ使う (PID は使い回される)
+#   子・孫        見る (tool_pids・app_pids): 起動用の exe・start.bat が本体を
+#                 別に起こす作りがある。
+#                 止める・残りを数える (tool_processes): **たどらない**。ツールが
+#                 起こした利用者のブラウザーを巻き込まない (§8.3.3)
+#   ランチャー    自分とその祖先は数えない (desktop.protected_pids)
 def app_exe(running: RunningTool) -> str:
     """アプリの窓のツールの exe。exe で起動していなければ空。"""
     path = (running.start_command or "").strip().strip('"')
@@ -167,7 +184,7 @@ def app_exe(running: RunningTool) -> str:
 
 
 def app_folder(running: RunningTool) -> str:
-    """そのツールの置き場所 (ふつうは起動ファイルのフォルダー)。"""
+    """そのツールの置き場所 (ふつうは起動ファイルのフォルダー)。分け合いは見ない。"""
     exe = app_exe(running)
     for text in (running.work_dir, running.app_root,
                  str(Path(exe).parent) if exe else ""):
@@ -176,52 +193,45 @@ def app_folder(running: RunningTool) -> str:
     return ""
 
 
+def own_folder(item) -> str:
+    """そのツール**だけ**のフォルダー。`Tool` でも `RunningTool` でもよい。
+
+    ほかの登録済みツールとフォルダーを分け合っていれば (同じ・中・外)、空。
+    分け合いを確かめられなかったときも空 (分からなければ使わない)。
+    """
+    if isinstance(item, RunningTool):
+        folder = app_folder(item)
+    else:
+        folder = item.resolved_work_dir
+    if not folder or _shared(folder, item.app_id):
+        return ""
+    return folder
+
+
+def _shared(folder: str, app_id: str) -> bool:
+    try:
+        from launcher import tool_registry
+
+        return tool_registry.shared_folder(folder, app_id)
+    except Exception:                         # noqa: BLE001 - 分からなければ使わない
+        log.warning("フォルダーをほかのツールと分け合っているか確かめられませんでした",
+                    exc_info=True)
+        return True
+
+
 def script_app_folder(running: RunningTool) -> str:
     """**起動ファイルが exe でない**アプリ (start.bat が `pyw main.py` を起こして
     すぐ終わる tkinter の窓のツールなど) のフォルダー。
 
     その窓のプロセスは、ツールのフォルダーから起動したものでしか見分けられない。
-    ほかの登録済みツールとフォルダーを分け合っていれば空 (取り違えない)。
+    ツールだけのフォルダーで、広すぎない (`desktop.folder_is_specific`) ときだけ。
     """
     if not running.is_app or app_exe(running):
         return ""
-    folder = app_folder(running)
-    if not folder or not desktop.folder_is_specific(folder) \
-            or _shared(folder, running.app_id):
+    folder = own_folder(running)
+    if not folder or not desktop.folder_is_specific(folder):
         return ""
     return folder
-
-
-def app_pids(running: RunningTool) -> set[int]:
-    """アプリのプロセス一式。
-
-    **起動した exe がすぐ終わる作り** (本体を別に起こして戻り値 0 で終わる)
-    があるので、記録したPIDだけでは足りない。ツールのフォルダーから起動した
-    プロセスと、その子・孫をまとめて見る (`desktop.related_pids`)。記録した
-    PIDは、**いまもその exe を実行しているときだけ**使う (PIDは使い回される)。
-
-    起動ファイルが start.bat などのアプリ (`script_app_folder`) は、ツールの
-    フォルダーから起動したプロセスで見る。
-    """
-    if not running.is_app:
-        return set()
-    exe = app_exe(running)
-    if not exe:
-        folder = script_app_folder(running)
-        # 起動ファイル (start.bat) がまだ動いていれば、その子・孫も見る。本体の
-        # コマンドラインにフォルダーの中の道が無くても (`python main.py` を
-        # 作業フォルダーで起こすなど)、起動ファイルからたどれる
-        return desktop.related_pids(folder, _recorded_roots(running)) if folder else set()
-    roots = {running.window_pid} if (running.window_pid and
-                                     desktop.runs_exe(running.window_pid, exe)) else set()
-    folder = app_folder(running)
-    if folder and _shared(folder, running.app_id):
-        # ほかの登録済みツールとフォルダーを分け合っている (統合ツールの exe の中に、
-        # 別に登録した日報がある、など)。**フォルダーでは見分けない** ── 見分けると、
-        # 日報のプロセスを統合ツールのものとして閉じたり止めたりする (1.7.9)。
-        # exe そのものを実行しているプロセスだけを見る
-        return desktop.process_tree(roots | set(desktop.find_by_exe(exe)))
-    return desktop.related_pids(folder, roots)
 
 
 def _recorded_roots(running: RunningTool) -> set[int]:
@@ -243,6 +253,38 @@ def _recorded_roots(running: RunningTool) -> set[int]:
     return roots
 
 
+def app_pids(running: RunningTool) -> set[int]:
+    """アプリのプロセス一式 (子・孫を含む)。
+
+    **起動した exe がすぐ終わる作り** (本体を別に起こして戻り値 0 で終わる)
+    があるので、記録したPIDだけでは足りない。ツールのフォルダーから起動した
+    プロセスと、その子・孫をまとめて見る (`desktop.related_pids`)。記録した
+    PIDは、**いまもその exe を実行しているときだけ**使う (PIDは使い回される)。
+
+    起動ファイルが start.bat などのアプリ (`script_app_folder`) は、ツールの
+    フォルダーから起動したプロセスで見る。
+    """
+    if not running.is_app:
+        return set()
+    exe = app_exe(running)
+    if not exe:
+        folder = script_app_folder(running)
+        # 起動ファイル (start.bat) がまだ動いていれば、その子・孫も見る。本体の
+        # コマンドラインにフォルダーの中の道が無くても (`python main.py` を
+        # 作業フォルダーで起こすなど)、起動ファイルからたどれる
+        return desktop.related_pids(folder, _recorded_roots(running)) if folder else set()
+    roots = {running.window_pid} if (running.window_pid and
+                                     desktop.runs_exe(running.window_pid, exe)) else set()
+    folder = own_folder(running)
+    if not folder and app_folder(running):
+        # ほかの登録済みツールとフォルダーを分け合っている (統合ツールの exe の中に、
+        # 別に登録した日報がある、など)。**フォルダーでは見分けない** ── 見分けると、
+        # 日報のプロセスを統合ツールのものとして閉じたり止めたりする (1.7.9)。
+        # exe そのものを実行しているプロセスだけを見る
+        return desktop.process_tree(roots | set(desktop.find_by_exe(exe)))
+    return desktop.related_pids(folder, roots)
+
+
 def app_alive(running: RunningTool) -> Optional[bool]:
     """アプリが動いているか (プロセス一式のどれかが生きているか)。
 
@@ -251,6 +293,64 @@ def app_alive(running: RunningTool) -> Optional[bool]:
     if not running.is_app or not (app_exe(running) or script_app_folder(running)):
         return None
     return bool(app_pids(running))
+
+
+def tool_pids(running, *, launched: int = 0) -> set[int]:
+    """そのツールのプロセス一式 (子・孫を含む)。見回り・前に出す・待ち受けを探すとき。
+
+    `running` は `RunningTool`。起動を待っているあいだ (まだ記録が無い) は `Tool`
+    でもよい。`launched` は**ランチャーがいま手に持っている**起動ファイルの
+    プロセス。ハンドルを持っているあいだは番号が使い回されないので、照合せずに
+    子をたどる起点にしてよい (終わっていても)。
+    """
+    folder = own_folder(running)
+    if launched or not isinstance(running, RunningTool):
+        return desktop.related_pids(folder, {launched} if launched else set())
+    if running.is_app:
+        return app_pids(running) if folder else set()
+    return desktop.related_pids(folder) if folder else set()
+
+
+def tool_processes(running: RunningTool) -> set[int]:
+    """そのツールのプロセスのうち、いま動いているもの。止める・残りを数えるとき。
+
+    * ツールのフォルダーから起動したプロセス (`desktop.processes_in_folder`。
+      `tools\\nippou` のような中のフォルダーも含む)。ほかの登録済みツールと
+      フォルダーを分け合っていれば、フォルダーでは見分けない
+    * 記録した PID (本体・起動ファイル・窓) で、照合できたもの
+
+    **子・孫はたどらない。** ツールが既定のブラウザーを起こすと、そのブラウザーは
+    ツールの子になる。たどると利用者のブラウザーまで止めてしまう (§8.3.3)。
+    """
+    found: set[int] = set(folder_processes(running))
+    for pid in {running.pid, running.launch_pid, running.window_pid}:
+        if pid and pid not in found and _is_alive(pid) \
+                and verify_process(pid, running).ok:
+            found.add(pid)
+    return found - desktop.protected_pids()
+
+
+def folder_processes(item) -> list[int]:
+    """ツールだけのフォルダーから起動したプロセス (子・孫はたどらない)。
+    `Tool` でも `RunningTool` でもよい。フォルダーを分け合っていれば空。"""
+    folder = own_folder(item)
+    return desktop.processes_in_folder(folder) if folder else []
+
+
+def find_app_pid(tool) -> int:
+    """そのアプリのプロセス。exe そのものが動いていればそれ、無ければ
+    ツールのフォルダーから起動したもの。無ければ 0。`Tool` を渡す。"""
+    exe = tool.start_command.strip().strip('"')
+    if exe.lower().endswith(".exe"):
+        pids = desktop.find_by_exe(exe)
+        if pids:
+            return pids[0]
+    elif not tool.is_app:
+        return 0
+    # 起動ファイルが start.bat などのアプリ (tkinter の窓など) は、ツールの
+    # フォルダーから起動したプロセスで見る
+    pids = folder_processes(tool)
+    return min(pids) if pids else 0
 
 
 # ------------------------------------------------------------------
@@ -371,39 +471,6 @@ def _stop_chain(running: RunningTool, *, force: bool, timeout: float,
 
 
 # --- 止まったことを、プロセスで確かめる ----------------------------
-def tool_processes(running: RunningTool) -> set[int]:
-    """そのツールのプロセスのうち、いま動いているもの。
-
-    * ツールのフォルダーから起動したプロセス (`desktop.processes_in_folder`。
-      `tools\\nippou` のような中のフォルダーも含む)。ほかの登録済みツールと
-      フォルダーを分け合っていれば、フォルダーでは見分けない
-    * 記録した PID (本体・起動ファイル・窓) で、照合できたもの
-
-    **子・孫はたどらない。** ツールが既定のブラウザーを起こすと、そのブラウザーは
-    ツールの子になる。たどると利用者のブラウザーまで止めてしまう (§8.3.3)。
-    """
-    found: set[int] = set()
-    folder = app_folder(running)
-    if folder and not _shared(folder, running.app_id):
-        found |= set(desktop.processes_in_folder(folder))
-    for pid in {running.pid, running.launch_pid, running.window_pid}:
-        if pid and pid not in found and _is_alive(pid) \
-                and verify_process(pid, running).ok:
-            found.add(pid)
-    return found - desktop.protected_pids()
-
-
-def _shared(folder: str, app_id: str) -> bool:
-    try:
-        from launcher import tool_registry
-
-        return tool_registry.shared_folder(folder, app_id)
-    except Exception:                         # noqa: BLE001 - 分からなければ使わない
-        log.warning("フォルダーをほかのツールと分け合っているか確かめられませんでした",
-                    exc_info=True)
-        return True
-
-
 def _alive_among(pids: set[int], timeout: float) -> set[int]:
     """`timeout` 秒待っても残っているもの。"""
     deadline = time.monotonic() + timeout
