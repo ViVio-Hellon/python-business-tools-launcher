@@ -158,7 +158,7 @@ class CheckTests(EntryTestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(proc.wait, 5)
         # start.bat の下の本体ごと止める (start.bat だけ止めると本体が残る)
-        self.addCleanup(lambda: [process_manager._terminate(p, force=True)
+        self.addCleanup(lambda: [process_manager.terminate(p, force=True)
                                  for p in desktop.process_tree({proc.pid})])
         self.assertTrue(tool_entries.wait_until(entries, want_alive=True, timeout=10))
         deadline = time.monotonic() + 10

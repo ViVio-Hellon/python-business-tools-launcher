@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import LocalAreaTestCase, release_tk  # noqa: E402
+from _isolation import LocalAreaTestCase, have_tk, release_tk  # noqa: E402
 from test_app_manager import ManagerTestCase  # noqa: E402
 
 from launcher import distribution, tool_registry  # noqa: E402
@@ -27,18 +27,7 @@ from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
 
 
-def _have_tk() -> bool:
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.destroy()
-        return True
-    except Exception:                         # noqa: BLE001
-        return False
-
-
-HAVE_TK = _have_tk()
+HAVE_TK = have_tk()
 
 
 def make_web_tool(base: Path, name: str, *, app_id: str, port: int,

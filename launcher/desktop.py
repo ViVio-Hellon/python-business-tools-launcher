@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Union
 
 from .logging_utils import get_logger
+from .paths import normalize as _normalize
 
 log = get_logger("desktop")
 
@@ -186,10 +187,6 @@ def file_description(path: str | Path) -> str:
 # ------------------------------------------------------------------
 # プロセス
 # ------------------------------------------------------------------
-def _normalize(path: str) -> str:
-    return (path or "").strip().strip('"').replace("\\", "/").rstrip("/").lower()
-
-
 def _processes() -> list[tuple[int, int, str]]:
     """いま動いているプロセスの (PID, 親のPID, 実行ファイル名) の一覧。"""
     if IS_WINDOWS:
@@ -578,7 +575,7 @@ _SCRIPT_HOSTS = ("python", "pythonw", "py", "pyw", "cmd", "wscript", "cscript",
                  "node", "java", "javaw")
 
 
-def _is_script_host(image: str) -> bool:
+def is_script_host(image: str) -> bool:
     # 区切りは「\」も「/」も見る (どちらの書き方で渡されても名前を取る)
     name = image.replace("\\", "/").rsplit("/", 1)[-1].lower()
     stem = name[:-4] if name.endswith(".exe") else name
@@ -607,7 +604,7 @@ def processes_in_folder(folder: str) -> list[int]:
         if IS_WINDOWS and _normalize(image).startswith(wanted):
             found.append(pid)
             continue
-        if image and not _is_script_host(image):
+        if image and not is_script_host(image):
             continue
         if wanted in _normalize(command_line(pid)) + "/":
             if not IS_WINDOWS and _is_zombie(pid):

@@ -20,6 +20,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _isolation import have_tk  # noqa: E402
+
 from _fake_tool_support import free_port, make_app_dir  # noqa: E402
 from test_app_manager import ManagerTestCase  # noqa: E402
 from test_tool_entries import _script, make_entry_tool  # noqa: E402
@@ -142,18 +144,7 @@ class EntryForceTests(ManagerTestCase):
         self.assertEqual((self.root / "args.txt").read_text().split(), ["--force"])
 
 
-def _have_tk() -> bool:
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.destroy()
-        return True
-    except Exception:                         # noqa: BLE001
-        return False
-
-
-HAVE_TK = _have_tk()
+HAVE_TK = have_tk()
 
 
 @unittest.skipUnless(HAVE_TK, "tkinter と画面が要る")

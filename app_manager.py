@@ -47,7 +47,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
@@ -1480,7 +1480,7 @@ class ToolManager:
                 log.info("起動できなかった %s のプロセスを片付けます: %s",
                          tool.app_id, sorted(tree))
             for pid in sorted(tree, reverse=True):
-                process_manager._terminate(pid, force=True)
+                process_manager.terminate(pid, force=True)
             if round_no == 0:
                 time.sleep(0.3)
         try:

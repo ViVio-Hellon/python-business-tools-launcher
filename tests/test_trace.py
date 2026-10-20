@@ -80,7 +80,7 @@ class EventTests(LocalAreaTestCase):
     def test_Excelで開いたままでも記録を失わない(self) -> None:
         """共有フォルダーの CSV を誰かが開いていると書けない。端末の中へ逃がす。"""
         shared = self.work_root / "shared"
-        tool_registry.set_pc_setting(trace.LOG_DIR_KEY, str(shared))
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
         trace.destination(refresh=True)
         # 書けない状態を作る (Excel のロックの代わりに、同じ名前のフォルダー)
         trace.events_path().mkdir(parents=True)
@@ -112,7 +112,7 @@ class DestinationTests(LocalAreaTestCase):
 
     def test_指定すると端末名のフォルダーに分けて書く(self) -> None:
         shared = self.work_root / "shared"
-        tool_registry.set_pc_setting(trace.LOG_DIR_KEY, str(shared))
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
 
         dest = trace.destination(refresh=True)
         self.assertEqual(dest.path, shared / "PC-01")
@@ -134,13 +134,13 @@ class DestinationTests(LocalAreaTestCase):
         tool_registry.initialize()
         distribution.export_tools([], log_dir=str(self.work_root / "dist"))
         mine = self.work_root / "mine"
-        tool_registry.set_pc_setting(trace.LOG_DIR_KEY, str(mine))
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(mine))
 
         self.assertEqual(trace.destination(refresh=True).path, mine / "PC-01")
 
     def test_配布先フォルダを作ると出力先も入る(self) -> None:
         tool_registry.initialize()
-        tool_registry.set_pc_setting(trace.LOG_DIR_KEY, r"\\server\logs")
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, r"\\server\logs")
         tool_registry.export_distribution()
         self.assertEqual(distribution.log_dir(), r"\\server\logs")
 
@@ -148,7 +148,7 @@ class DestinationTests(LocalAreaTestCase):
         """**記録のためにランチャーを止めない。** 退いた理由は残す。"""
         blocker = self.work_root / "not-a-folder"
         blocker.write_text("file", encoding="utf-8")
-        tool_registry.set_pc_setting(trace.LOG_DIR_KEY, str(blocker))
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(blocker))
 
         dest = trace.destination(refresh=True)
         self.assertEqual(dest.path, app_config.local_dir("logs"))
@@ -167,7 +167,7 @@ class DestinationTests(LocalAreaTestCase):
         """出力先は起動のいちばん最初に要る。設定DBの用意より前。"""
         db = app_config.settings_db_path()
         self.assertFalse(db.exists())
-        self.assertEqual(tool_registry.peek_pc_setting(trace.LOG_DIR_KEY), "")
+        self.assertEqual(tool_registry.peek_pc_setting(tool_registry.LOG_DIR_KEY), "")
         self.assertFalse(db.exists(), "読むだけで設定DBを作っています")
 
     def test_出力先を変えるとその場で書き先が移る(self) -> None:
@@ -182,7 +182,7 @@ class DestinationTests(LocalAreaTestCase):
                 logging_utils.get_logger("test").warning("移したあとの1行")
                 self.assertEqual(dest.path, shared / "PC-01")
                 self.assertEqual(
-                    tool_registry.get_pc_setting(trace.LOG_DIR_KEY), str(shared))
+                    tool_registry.get_pc_setting(tool_registry.LOG_DIR_KEY), str(shared))
                 text = logging_utils.log_file_path().read_text(encoding="utf-8")
                 self.assertIn("移したあとの1行", text)
             finally:
@@ -202,7 +202,7 @@ class DestinationTests(LocalAreaTestCase):
         trace.set_log_dir(str(self.work_root / "shared"))
         dest = trace.set_log_dir("")
         self.assertEqual(dest.path, app_config.local_dir("logs"))
-        self.assertEqual(tool_registry.get_pc_setting(trace.LOG_DIR_KEY), "")
+        self.assertEqual(tool_registry.get_pc_setting(tool_registry.LOG_DIR_KEY), "")
 
 
 class IncidentTests(LocalAreaTestCase):
@@ -272,7 +272,7 @@ class IncidentTests(LocalAreaTestCase):
 
     def test_出力先に書けなければ端末の中に書く(self) -> None:
         shared = self.work_root / "shared"
-        tool_registry.set_pc_setting(trace.LOG_DIR_KEY, str(shared))
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
         dest = trace.destination(refresh=True)
         (dest.path / "incidents").write_text("ふさぐ", encoding="utf-8")
 
@@ -294,7 +294,7 @@ class IncidentTests(LocalAreaTestCase):
     def test_古い記録は自分の端末のフォルダーだけ片付ける(self) -> None:
         with mock.patch.dict(os.environ, {"COMPUTERNAME": "PC-01"}):
             shared = self.work_root / "shared"
-            tool_registry.set_pc_setting(trace.LOG_DIR_KEY, str(shared))
+            tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
             mine = trace.destination(refresh=True).path / "incidents"
             theirs = shared / "PC-02" / "incidents"
             for folder in (mine, theirs):

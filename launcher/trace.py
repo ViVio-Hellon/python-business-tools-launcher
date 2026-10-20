@@ -49,9 +49,6 @@ from .logging_utils import get_logger
 
 log = get_logger("trace")
 
-# ［設定］の「ログの出力先」 (端末ごとの設定DBの鍵)
-LOG_DIR_KEY = "log_dir"
-
 EVENT_FIELDS = ("日時", "端末", "利用者", "ランチャー版", "操作ID", "種類",
                 "結果", "ツール", "アプリID", "ツール版", "ポート", "PID",
                 "経過秒", "原因", "詳細", "障害記録")
@@ -123,7 +120,7 @@ def configured_dir() -> tuple[str, str]:
     """
     from . import distribution, tool_registry
 
-    value = tool_registry.peek_pc_setting(LOG_DIR_KEY).strip()
+    value = tool_registry.peek_pc_setting(tool_registry.LOG_DIR_KEY).strip()
     if value:
         return value, "この端末の設定"
     value = distribution.log_dir().strip()
@@ -197,9 +194,9 @@ def set_log_dir(text: str) -> Destination:
     event("ログの出力先を変更", INFO,
           detail=f"{before.path} → {folder_for(text) if text else local_dir()}")
     if text:
-        tool_registry.set_pc_setting(LOG_DIR_KEY, text)
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, text)
     else:
-        tool_registry.clear_pc_setting(LOG_DIR_KEY)
+        tool_registry.clear_pc_setting(tool_registry.LOG_DIR_KEY)
     after = destination(refresh=True)
     logging_utils.reconfigure()
     event("ログの出力先を変更", WARNING if after.problem else OK,

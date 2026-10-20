@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import os
 import sys
@@ -79,6 +80,32 @@ class LocalAreaTestCase(unittest.TestCase):
             os.environ[app_config.LOCAL_DIR_ENV] = self._orig
         self._tmp.cleanup()
         super().tearDown()
+
+
+@functools.lru_cache(maxsize=None)
+def have_tk() -> bool:
+    """tkinter があり、窓を出せるか (画面の無い環境では偽)。画面の試験の印に使う。
+
+    以前は同じ関数が試験のファイルごとに 8 つあった。1度だけ確かめる。
+    """
+    try:
+        import tkinter
+
+        root = tkinter.Tk()
+        root.destroy()
+        return True
+    except Exception:                         # noqa: BLE001 - tkinter が無い・画面が無い
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def have_tkinter() -> bool:
+    """tkinter を読み込めるか (窓は出さない。部品を読み込むだけの試験の印)。"""
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def release_tk(case: unittest.TestCase) -> None:

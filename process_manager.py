@@ -48,9 +48,10 @@ APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from launcher import (app_config, desktop, fileprobe, health,  # noqa: E402
+from launcher import (desktop, fileprobe, health,  # noqa: E402
                       runtime_state, tool_entries)
 from launcher.logging_utils import get_logger  # noqa: E402
+from launcher.paths import normalize as _normalize_path  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 
 log = get_logger("process_manager")
@@ -503,7 +504,7 @@ def _snapshot(running: RunningTool) -> dict[int, Optional[float]]:
             folder = _normalize_path(app_folder(running))
             for pid in app_pids(running):
                 image = desktop.process_image(pid)
-                if desktop._is_script_host(image) or (
+                if desktop.is_script_host(image) or (
                         folder and _normalize_path(image).startswith(folder + "/")):
                     pids.add(pid)
         pids -= desktop.protected_pids()
@@ -578,7 +579,7 @@ def stop_leftovers(running: RunningTool,
     if not targets:
         return set()
     for pid in sorted(targets, reverse=True):
-        _terminate(pid, force=True, tree=False)
+        terminate(pid, force=True, tree=False)
     return _alive_among(targets, TERMINATE_WAIT_SEC)
 
 
@@ -772,7 +773,7 @@ def _stop_by_closing(running: RunningTool, *,
     if asked is None:
         # 窓の無い環境 (Windows 以外)。終了の要求で代える。**全部に**出す ──
         # 以前は最初の1つ (起動ファイルの sh) だけに出し、子の Python が残った
-        requested = [_terminate(pid, force=False, tree=False)
+        requested = [terminate(pid, force=False, tree=False)
                      for pid in sorted(pids, reverse=True)]
         if not any(requested):
             return None
@@ -939,7 +940,7 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
             continue
 
         log.info("PID %s を停止します (%s)", pid, verdict.reason)
-        if _terminate(pid, force=False) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
+        if terminate(pid, force=False) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
             stopped_any = True
             continue
         if not force:
@@ -947,7 +948,7 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
                               "中断してでも止めるには --force を付けてください")
             refused = True
             continue
-        if _terminate(pid, force=True) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
+        if terminate(pid, force=True) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
             stopped_any = True
             result.method = "kill"
         else:
@@ -1023,18 +1024,6 @@ def _is_specific_enough(needle: str) -> bool:
     return len(needle) >= MIN_MARKER_LENGTH and "/" in needle.strip("/")
 
 
-def _normalize_path(text: str) -> str:
-    """パスの比較用に均す。
-
-    Windowsは大文字小文字を区別せず、`\\` と `/` が混ざる。
-    `start.bat` のパスはそのままだと末尾のファイル名まで含むので、
-    ここでは単純な文字列として突き合わせる。
-    """
-    if not text:
-        return ""
-    return text.strip().strip('"').replace("\\", "/").rstrip("/").lower()
-
-
 # ------------------------------------------------------------------
 # ブラウザー画面 (要件定義書 §8.3)
 # ------------------------------------------------------------------
@@ -1088,9 +1077,9 @@ def _close_window(pid: int) -> bool:
     log.info("画面を閉じます: pid=%s", pid)
     # まず穏やかに頼む。Windowsの `taskkill /T` は WM_CLOSE を送るので、
     # ブラウザーは後始末をしてから終われる
-    if _terminate(pid, force=False) and _wait_pid_gone(pid, BROWSER_WAIT_SEC):
+    if terminate(pid, force=False) and _wait_pid_gone(pid, BROWSER_WAIT_SEC):
         return True
-    if _terminate(pid, force=True) and _wait_pid_gone(pid, BROWSER_WAIT_SEC):
+    if terminate(pid, force=True) and _wait_pid_gone(pid, BROWSER_WAIT_SEC):
         log.info("画面を強制的に閉じました: pid=%s", pid)
         return True
     log.warning("画面を閉じられませんでした: pid=%s", pid)
@@ -1298,7 +1287,7 @@ def _command_line_windows(pid: int) -> str:
         return ""
 
 
-def _terminate(pid: int, *, force: bool, tree: bool = True) -> bool:
+def terminate(pid: int, *, force: bool, tree: bool = True) -> bool:
     """1つのプロセス (と、その子・孫) を止める。要求を出せたかを返す。
 
     子まで止めるのは、`start.bat` から起こした `cmd.exe` の下にPythonが

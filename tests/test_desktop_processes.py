@@ -63,11 +63,11 @@ class FolderRuleTests(unittest.TestCase):
                       "cmd.exe", "wscript.exe", "node.exe", "javaw.exe",
                       r"C:\Python39\python.exe"):
             with self.subTest(image=image):
-                self.assertTrue(desktop._is_script_host(image))
+                self.assertTrue(desktop.is_script_host(image))
         for image in ("notepad.exe", "梱包資材総合ツール.exe", "EXCEL.EXE",
                       "explorer.exe", "msedge.exe", "tail", "pythonista.exe"):
             with self.subTest(image=image):
-                self.assertFalse(desktop._is_script_host(image))
+                self.assertFalse(desktop.is_script_host(image))
 
 
 @unittest.skipIf(desktop.IS_WINDOWS, "Windows 以外で /proc から確かめる")

@@ -24,17 +24,9 @@ SCREEN_MARGIN = 40
 ANCHORS = ("center", "bottom_left", "bottom_center", "bottom_right",
            "top_left", "top_center", "top_right")
 
-# ［設定］で選べる置き場所 (と画面の呼び名)。**ランチャーを起動したとき**と
-# **ツールを使っているとき**の2つを、どちらもこの7通りから選ぶ
-POSITION_NAMES = {
-    "center": "画面中央",
-    "top_left": "左上", "top_center": "中央上", "top_right": "右上",
-    "bottom_left": "左下", "bottom_center": "中央下", "bottom_right": "右下",
-}
-# 以前の名前 (ツールを使っているときの置き場所)。中身は同じ7通り
-ACTIVE_ANCHORS = POSITION_NAMES
-DEFAULT_IDLE_ANCHOR = "center"
-DEFAULT_ACTIVE_ANCHOR = "bottom_left"
+# ［設定］で選べる置き場所の名前は、設定と画面の両方が使うので `bar_positions` に置く
+from ..bar_positions import (ACTIVE_ANCHORS, DEFAULT_ACTIVE_ANCHOR,  # noqa: E402,F401
+                             DEFAULT_IDLE_ANCHOR, POSITION_NAMES)
 
 # 以前、手で動かした位置を覚えていた鍵 (PC別設定の入れ物を借りる)。
 # 1.7.4 から覚えない (覚えると以後ずっと動かず、「設定どおりに動かない」に

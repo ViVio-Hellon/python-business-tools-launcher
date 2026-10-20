@@ -77,7 +77,7 @@ class ManagerTestCase(LocalAreaTestCase):
         # 動かしたままランチャーだけ閉じたときは、画面も残るのが正しい
         # (要件定義書 §11)。片付けるのは試験の都合
         for pid in browser.managed_pids():
-            process_manager._terminate(pid, force=True)
+            process_manager.terminate(pid, force=True)
             browser.forget(pid)
 
     def register(self, app_id: str, display_name: str, **kwargs) -> object:
@@ -280,7 +280,7 @@ class ConcurrentTests(ManagerTestCase):
         a_running = self.manager.running["fake.e1"]
 
         # 利用者が日報の画面を閉じ、日報は「誰も見ていない」ので終わった
-        process_manager._terminate(a_running.browser_pid, force=True)
+        process_manager.terminate(a_running.browser_pid, force=True)
         process_manager._wait_pid_gone(a_running.browser_pid, 5)
         self.manager.poll_health()
         process_manager._stop_by_api(a_running, force=True, timeout=10)
@@ -475,7 +475,7 @@ class BrowserTests(ManagerTestCase):
         self.manager.poll_health()              # 画面が出ていることを見ておく
 
         # 利用者が画面だけ手で閉じた
-        process_manager._terminate(running.browser_pid, force=True)
+        process_manager.terminate(running.browser_pid, force=True)
         process_manager._wait_pid_gone(running.browser_pid, 5)
 
         # バックエンドは動いている。ランチャーはその状態を把握する
@@ -493,7 +493,7 @@ class BrowserTests(ManagerTestCase):
         first = runtime_state.read_all()[tool.app_id]
         first_window = first.browser_pid
 
-        process_manager._terminate(first.browser_pid, force=True)
+        process_manager.terminate(first.browser_pid, force=True)
         process_manager._wait_pid_gone(first.browser_pid, 5)
         self.manager.poll_health()
 
@@ -787,7 +787,7 @@ class RecordTests(ManagerTestCase):
         root = make_tool_dir(self.work_root, app_id="outside.app", port=port)
         outside = subprocess.Popen([str(root / "start.bat"), "--no-browser"])
         self.addCleanup(outside.wait, 5)
-        self.addCleanup(lambda: [process_manager._terminate(p, force=True)
+        self.addCleanup(lambda: [process_manager.terminate(p, force=True)
                                  for p in desktop.process_tree({outside.pid})])
         self.assertIsNotNone(health.wait_ready(f"http://127.0.0.1:{port}/api/health",
                                                "outside.app", timeout=10))
@@ -1164,7 +1164,7 @@ class StarterAndPortTests(ManagerTestCase):
         """起動用 exe が起こした本体は、ランチャーの子ではない。試験の後始末"""
         for folder in self.folders:
             for pid in desktop.processes_in_folder(str(folder)):
-                process_manager._terminate(pid, force=True)
+                process_manager.terminate(pid, force=True)
         for proc in self.spawned:
             if proc.poll() is None:
                 proc.kill()
@@ -1400,7 +1400,7 @@ class StarterAndPortTests(ManagerTestCase):
         tool = self.register("fake.outsidebat", "日報")
         outside = subprocess.Popen([tool.start_command, "--no-browser"])
         self.addCleanup(outside.wait, 5)
-        self.addCleanup(lambda: [process_manager._terminate(p, force=True)
+        self.addCleanup(lambda: [process_manager.terminate(p, force=True)
                                  for p in desktop.process_tree({outside.pid})])
         self.assertIsNotNone(health.wait_ready(tool.health_url, tool.app_id,
                                                timeout=10))

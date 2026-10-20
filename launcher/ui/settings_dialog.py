@@ -274,7 +274,7 @@ class SettingsDialog:
         フォルダーに分けて書く)。**書けない場所でもランチャーは止めない**
         ── 書けるようになるまで端末の中に書く。
         """
-        self._log_dir_before = tool_registry.get_pc_setting(trace.LOG_DIR_KEY)
+        self._log_dir_before = tool_registry.get_pc_setting(tool_registry.LOG_DIR_KEY)
         self.log_dir_var = tk.StringVar(value=self._log_dir_before)
 
         frame = tk.Frame(self.area, bg=theme.BG)

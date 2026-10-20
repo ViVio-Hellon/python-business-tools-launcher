@@ -28,21 +28,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import ROOT  # noqa: E402
+from _isolation import ROOT, have_tk, have_tkinter  # noqa: E402
 
 
-def _can_show_windows() -> bool:
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.destroy()
-        return True
-    except Exception:                         # noqa: BLE001 - tkinter が無い・画面が無い
-        return False
-
-
-HAVE_TK = _can_show_windows()
+HAVE_TK = have_tk()
 
 
 def _run(script: str) -> subprocess.CompletedProcess:
@@ -69,17 +58,9 @@ class SplashTests(unittest.TestCase):
         self.assertIn("生きている", result.stdout)
 
 
-def _have_tkinter() -> bool:
-    try:
-        import tkinter  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 class BarGcTests(unittest.TestCase):
 
-    @unittest.skipUnless(_have_tkinter(), "tkinter が要る")
+    @unittest.skipUnless(have_tkinter(), "tkinter が要る")
     def test_バーが動いているあいだ自動のごみ集めを止める(self) -> None:
         from launcher.ui import bar as bar_module
 

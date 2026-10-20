@@ -246,7 +246,7 @@ class ScreenTests(LocalAreaTestCase):
             for app_id in list(manager._processes):
                 manager._reap_process(app_id)
         for pid in browser.managed_pids():
-            process_manager._terminate(pid, force=True)
+            process_manager.terminate(pid, force=True)
             browser.forget(pid)
 
     @property
@@ -335,7 +335,7 @@ class ScreenTests(LocalAreaTestCase):
         self.wait_opened(1)
 
         window = manager.current.browser_pid
-        process_manager._terminate(window, force=True)
+        process_manager.terminate(window, force=True)
         process_manager._wait_pid_gone(window, 5)
         manager.poll_health()
 

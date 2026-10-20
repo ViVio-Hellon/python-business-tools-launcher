@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import LocalAreaTestCase, release_tk  # noqa: E402
+from _isolation import LocalAreaTestCase, have_tk, release_tk  # noqa: E402
 from test_app_manager import ManagerTestCase  # noqa: E402
 from test_tool_entries import _script, make_entry_tool  # noqa: E402
 
@@ -205,18 +205,7 @@ class EntryUrlTests(ManagerTestCase):
             time.sleep(0.05)
 
 
-def _have_tk() -> bool:
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.destroy()
-        return True
-    except Exception:                         # noqa: BLE001
-        return False
-
-
-@unittest.skipUnless(_have_tk(), "tkinter と画面が要る")
+@unittest.skipUnless(have_tk(), "tkinter と画面が要る")
 class SettingsRowTests(HintTestCase):
     """［設定］の行にヒントが出て、値を変えると出し直す。"""
 

@@ -23,6 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _isolation import have_tkinter  # noqa: E402
+
 from _fake_tool_support import free_port, make_tool_dir  # noqa: E402
 from test_app_manager import ManagerTestCase  # noqa: E402
 
@@ -149,15 +151,7 @@ class NestedFolderStopTests(ManagerTestCase):
         self.assertIsNone(self.nippou.poll(), "別に登録した日報を止めました")
 
 
-def _have_tkinter() -> bool:
-    try:
-        import tkinter  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-@unittest.skipUnless(_have_tkinter(), "設定画面の部品が tkinter を読み込む")
+@unittest.skipUnless(have_tkinter(), "設定画面の部品が tkinter を読み込む")
 class SettingsWarningTests(unittest.TestCase):
 
     def test_同じポートのツールを保存するとき知らせる(self) -> None:

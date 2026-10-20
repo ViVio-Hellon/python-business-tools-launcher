@@ -25,24 +25,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import ROOT, LocalAreaTestCase, release_tk  # noqa: E402
+from _isolation import LocalAreaTestCase, ROOT, have_tk, release_tk  # noqa: E402
 
 import app_manager  # noqa: E402
 from launcher import trace  # noqa: E402
 
 
-def _can_show_windows() -> bool:
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.destroy()
-        return True
-    except Exception:                         # noqa: BLE001 - tkinter が無い・画面が無い
-        return False
-
-
-HAVE_TK = _can_show_windows()
+HAVE_TK = have_tk()
 
 
 class RedirectedTestCase(LocalAreaTestCase):

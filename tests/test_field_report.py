@@ -21,6 +21,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _isolation import have_tk  # noqa: E402
+
 from test_app_manager import ManagerTestCase  # noqa: E402
 from test_tool_entries import _script, make_entry_tool  # noqa: E402
 
@@ -94,18 +96,7 @@ class PositionSettingTests(ManagerTestCase):
             tool_registry.set_idle_bar_position("まんなか")
 
 
-def _have_tk() -> bool:
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.destroy()
-        return True
-    except Exception:                         # noqa: BLE001
-        return False
-
-
-@unittest.skipUnless(_have_tk(), "tkinter と画面が要る")
+@unittest.skipUnless(have_tk(), "tkinter と画面が要る")
 class BarPositionTests(ManagerTestCase):
 
     def setUp(self) -> None:
@@ -192,7 +183,7 @@ class BarPositionTests(ManagerTestCase):
         self.assertEqual(self.xy(bar), self.expected(bar, "center"))
 
 
-@unittest.skipUnless(_have_tk(), "tkinter と画面が要る")
+@unittest.skipUnless(have_tk(), "tkinter と画面が要る")
 class SettingsDialogFitTests(ManagerTestCase):
     """ヒントの多い4行を入れても、［保存］が画面の中に見えている。"""
 

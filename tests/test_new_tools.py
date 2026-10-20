@@ -136,7 +136,7 @@ class DesktopToolLifecycleTests(ManagerTestCase):
 
     def _kill_left(self) -> None:
         for pid in desktop.processes_in_folder(str(self.root)):
-            process_manager._terminate(pid, force=True, tree=False)
+            process_manager.terminate(pid, force=True, tree=False)
 
     def tool_pids(self) -> list[int]:
         return sorted(desktop.processes_in_folder(str(self.root)))
@@ -165,7 +165,7 @@ class DesktopToolLifecycleTests(ManagerTestCase):
     def test_利用者が窓を閉じたら外す(self) -> None:
         self.start(self.tool)
         for pid in self.tool_pids():
-            process_manager._terminate(pid, force=False, tree=False)
+            process_manager.terminate(pid, force=False, tree=False)
         deadline = time.monotonic() + 5
         while self.tool_pids() and time.monotonic() < deadline:
             time.sleep(0.05)

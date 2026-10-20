@@ -130,10 +130,10 @@ class TerminateTests(unittest.TestCase):
         # 守りが外れても試験そのものを落とさないよう、止める手は偽物にする
         with mock.patch.object(process_manager.os, "kill") as kill, \
                 mock.patch.object(process_manager.subprocess, "run") as run:
-            self.assertFalse(process_manager._terminate(ME, force=True))
-            self.assertFalse(process_manager._terminate(os.getppid(), force=True))
+            self.assertFalse(process_manager.terminate(ME, force=True))
+            self.assertFalse(process_manager.terminate(os.getppid(), force=True))
             with REUSED, mock.patch.object(process_manager.os, "name", "nt"):
-                self.assertFalse(process_manager._terminate(ME, force=True))
+                self.assertFalse(process_manager.terminate(ME, force=True))
         kill.assert_not_called()
         run.assert_not_called()
 
@@ -141,7 +141,7 @@ class TerminateTests(unittest.TestCase):
         """`taskkill /T` は残った親の番号で子をたどる (ランチャーまで落ちる)。"""
         with REUSED, mock.patch.object(process_manager.os, "name", "nt"), \
                 mock.patch.object(process_manager.subprocess, "run") as run:
-            self.assertTrue(process_manager._terminate(700, force=True))
+            self.assertTrue(process_manager.terminate(700, force=True))
         command = run.call_args.args[0]
         self.assertNotIn("/T", command)
         pids = [int(command[i + 1]) for i, part in enumerate(command) if part == "/PID"]

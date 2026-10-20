@@ -21,8 +21,6 @@ from __future__ import annotations
 import sys
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 from . import app_config, health, tool_registry
 from .logging_utils import get_logger

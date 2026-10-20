@@ -40,6 +40,7 @@ if str(APP_ROOT) not in sys.path:
 
 from launcher import app_config, desktop  # noqa: E402
 from launcher.logging_utils import get_logger  # noqa: E402
+from launcher.paths import normalize as normalize_path  # noqa: E402
 
 log = get_logger("launch_guard")
 
@@ -243,7 +244,7 @@ def judge_owner(info: LockInfo) -> GuardResult:
     """
     import process_manager
 
-    if not process_manager._is_alive(info.pid):
+    if not process_manager.is_pid_alive(info.pid):
         return GuardResult(True, f"残っていたロックを片付けました (pid={info.pid})")
 
     started = desktop.process_started_at(info.pid)
@@ -323,8 +324,6 @@ def check_existing() -> GuardResult:
 
 def _looks_like_launcher(command: str, info: LockInfo) -> bool:
     """そのコマンドラインがこのランチャーのものか。"""
-    import process_manager
-
-    haystack = process_manager._normalize_path(command)
-    needle = process_manager._normalize_path(info.app_root or str(APP_ROOT))
+    haystack = normalize_path(command)
+    needle = normalize_path(info.app_root or str(APP_ROOT))
     return bool(needle) and needle in haystack

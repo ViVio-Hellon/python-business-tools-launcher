@@ -147,7 +147,7 @@ class AdoptedToolTests(LocalAreaTestCase):
         if self.proc is not None:
             # start.bat の下の本体ごと止める (start.bat だけ止めると本体が残る)
             for pid in desktop.process_tree({self.proc.pid}):
-                process_manager._terminate(pid, force=True)
+                process_manager.terminate(pid, force=True)
             if self.proc.poll() is None:
                 self.proc.kill()
             self.proc.wait(timeout=5)
