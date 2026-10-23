@@ -575,6 +575,13 @@ class ToolManager:
         other = str((payload or {}).get("app_id") or "")
         if not other or other == tool.app_id:
             return ""                         # 答えない・名乗らないものは決めつけない
+        if tool_registry.port_retry(tool) > 0:
+            # ツールが自分で次の空きポートへ移る (Display-file-list と
+            # excel-format-converter はどちらも 8753 から)。**断らずに起こす**。
+            # 移った先は、起動を待つあいだにツールのプロセスの待ち受けから見つける
+            log.info("ポート %s は %s が使っています。%s は次の空きへ移るので起動します",
+                     tool.port, other, tool.app_id)
+            return ""
         owner = tool_registry.get(other)
         if owner is not None:
             name = owner.display_name or other
@@ -1190,8 +1197,12 @@ class ToolManager:
                     elapsed=time.monotonic() - started)
 
         if window_note and "ポート" in window_note:
-            trace.event("ポートちがい", trace.WARNING, tool=running, op=op,
-                        cause=f"設定のポート {tool.port} ではなく {running.port} で応答")
+            if _moved_aside(tool, running.port):
+                trace.event("ポートを移った", trace.INFO, tool=running, op=op,
+                            cause=f"設定のポート {tool.port} が塞がっていて {running.port} へ")
+            else:
+                trace.event("ポートちがい", trace.WARNING, tool=running, op=op,
+                            cause=f"設定のポート {tool.port} ではなく {running.port} で応答")
         if tool.is_app or how == "window":
             # **ブラウザーは開かない。** アプリ (ツール自身) の窓が画面
             runtime_state.put(running)
@@ -2335,8 +2346,21 @@ def _front_by_title(tool: Tool) -> bool:
     return bool(windows) and desktop.activate(windows[0])
 
 
+def _moved_aside(tool: Tool, port: int) -> bool:
+    """設定のポートが塞がっていて、ツールが自分で次の空きへ移ったか。
+
+    ツールの作りどおりの動き (同じポートから始まるツールを同時に使っている)
+    なので、設定の直しを勧めない。
+    """
+    return bool(tool.port) and tool.port < port <= tool.port + tool_registry.port_retry(tool)
+
+
 def _port_note(tool: Tool, port: int) -> str:
     """設定と違うポートで動いていたときの案内。"""
+    if _moved_aside(tool, port):
+        return (f"ポート {tool.port} はほかのアプリが使っていたので、"
+                f"{tool.display_name}は {port} で開きました (ツールが自分で空いている"
+                "ポートへ移りました。設定は直さなくて大丈夫です)。")
     return (f"{tool.display_name}は、設定のポート {tool.port or '(空)'} ではなく "
             f"{port} で動いています。\n［設定］でポートを {port} にすると、"
             "起動の確認が早くなります。")

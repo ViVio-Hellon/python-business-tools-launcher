@@ -879,14 +879,19 @@ def _shared_port_warnings(tools: list[Tool]) -> list[str]:
     同じツールの Python 版 (Start.vbs) と exe 版 (Tauri) を両方登録すると
     起きやすい。**同時には動かせない** (あとから押したほうは、先に動いて
     いるほうに断られる)。保存は止めない ── 片方ずつ使うなら困らない。
+
+    **どれも自分で次の空きポートへ移るツールなら知らせない** (1.7.10)。
+    Display-file-list と excel-format-converter (8753) のように、別のツールが
+    たまたま同じ番号から始まるだけで、同時に使える。
     """
-    by_port: dict[int, list[str]] = {}
+    by_port: dict[int, list[Tool]] = {}
     for tool in tools:
         if tool.enabled and tool.port > 0:
-            by_port.setdefault(tool.port, []).append(tool.display_name or tool.app_id)
-    return [f"{'、'.join(names)} が同じポート {port} を使います。"
-            "同時には動かせません (あとから押したほうは起動できません)。"
-            for port, names in sorted(by_port.items()) if len(names) > 1]
+            by_port.setdefault(tool.port, []).append(tool)
+    return [f"{'、'.join(t.display_name or t.app_id for t in group)} が同じポート {port} "
+            "を使います。同時には動かせません (あとから押したほうは起動できません)。"
+            for port, group in sorted(by_port.items())
+            if len(group) > 1 and not all(tool_registry.port_retry(t) > 0 for t in group)]
 
 
 def _delivery_warning(tool: Tool) -> str:

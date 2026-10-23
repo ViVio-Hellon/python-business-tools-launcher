@@ -86,12 +86,27 @@ def main(argv=None) -> int:
     parser.add_argument("--app-root", default=os.getcwd())
     parser.add_argument("--ready-after", type=float, default=0.0)
     parser.add_argument("--busy", action="store_true")
+    # 本物と同じく、ポートが塞がっていれば次の空きへ移る (この数まで)。
+    # 移った先は app_root/bound_port.txt に書く (本物はロックファイルに書く)
+    parser.add_argument("--port-retry", type=int, default=0)
     # 本物が受け付ける引数。受け取って無視する
     parser.add_argument("--no-browser", action="store_true")
     options = parser.parse_args(argv)
 
     Handler.options = options
-    server = ThreadingHTTPServer(("127.0.0.1", options.port), Handler)
+    server = None
+    for port in range(options.port, options.port + options.port_retry + 1):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        except OSError:
+            continue
+        options.port = port
+        break
+    if server is None:
+        return 1
+    if options.port_retry:
+        with open(os.path.join(options.app_root, "bound_port.txt"), "w") as handle:
+            handle.write(str(options.port))
     server.serve_forever()
     return 0
 

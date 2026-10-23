@@ -970,7 +970,8 @@ def looks_like_desktop_app(entry: Path) -> bool:
     直下の .py が tkinter を使い、`--no-browser` (ランチャーの画面で開く Web の
     ツールの印) を知らない。pythonw で起こすことだけでは決めない ── Web の
     ツールの Start.vbs も pythonw で起こす (ふつうは config/app.json のポートで、
-    呼ぶ前に外れている)。
+    呼ぶ前に外れている)。素性のファイルが**ポートを持たない**と言っていれば、
+    `--no-browser` があっても窓のツール (Web から作り直した Ainputcollect。1.7.10)。
     """
     from . import tool_entries
 
@@ -981,9 +982,15 @@ def looks_like_desktop_app(entry: Path) -> bool:
     except OSError:
         return False
     texts = [_read_text_head(script) for script in scripts]
-    if any(NO_BROWSER_ARG in text for text in texts):
-        return False                          # ランチャーの画面を知っている = Web のツール
-    return any("tkinter" in text for text in texts)
+    if not any("tkinter" in text for text in texts):
+        return False
+    declared = _read_app_json(entry)
+    if declared.get("app_id") and not _first_port(declared.get("server")):
+        # 素性のファイルが**ポートを持たない**と言っている。Web から窓に作り直した
+        # ツール (Ainputcollect VER2) は、昔の `--no-browser` を受けて捨てるだけ
+        return True
+    # ランチャーの画面を知っている = Web のツール
+    return not any(NO_BROWSER_ARG in text for text in texts)
 
 
 def _read_text_head(path: Path, limit: int = 200_000) -> str:
@@ -1020,25 +1027,71 @@ def exe_app_id(entry: Path) -> str:
     return f"exe.{stem or 'app'}"
 
 
+# `config/app.json` のほかに、ツールの素性を置いているファイル (1.7.10)。
+# **app_id があるときだけ**使う (settings.json はどのツールにもありそうな名前)
+#   app_config.json … Coil_Packaging-Specifications (app_name・port・port_fallback_count)
+#   settings.json   … RNEConverter (app_id・display_name・server)
+_OTHER_CONFIG_NAMES = ("app_config.json", "settings.json")
+
+
 def _read_app_json(entry: Path) -> dict:
-    """起動ファイルの近くの `config/app.json`。無ければ空。
+    """起動ファイルの近くの、ツールの素性 (`config/app.json` など)。無ければ空。
 
     `.bat` は `<ツール>/start.bat` の隣に `config/` がある。exe は置き方が
     いろいろなので、exe の隣・その `config/`・一つ上の `config/` を見る。
+    名前の違うファイルも、`app.json` と同じ形 (`display_name`・`server`) に
+    そろえて返す。
     """
     folder = entry.parent
-    candidates = [folder / "config" / "app.json"]
+    candidates = [(folder / "config" / "app.json", False)]
     if entry.suffix.lower() == ".exe":
-        candidates += [folder / "app.json", folder.parent / "config" / "app.json"]
-    for candidate in candidates:
+        candidates += [(folder / "app.json", False),
+                       (folder.parent / "config" / "app.json", False)]
+    candidates += [(folder / "config" / name, True) for name in _OTHER_CONFIG_NAMES]
+    for candidate, needs_id in candidates:
         try:
-            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             log.debug("相手の設定を読めませんでした (%s): %s", candidate, exc)
             continue
-        if isinstance(raw, dict):
-            return raw
+        if not isinstance(raw, dict):
+            continue
+        if needs_id and not str(raw.get("app_id") or "").strip():
+            continue
+        return _same_shape(raw)
     return {}
+
+
+def _same_shape(raw: dict) -> dict:
+    """名前の違う素性のファイルを、`app.json` の形にそろえる。"""
+    shaped = dict(raw)
+    if not str(shaped.get("display_name") or "").strip() and shaped.get("app_name"):
+        shaped["display_name"] = shaped["app_name"]
+    port = shaped.get("port")
+    if not isinstance(shaped.get("server"), dict) and isinstance(port, int) and port > 0:
+        shaped["server"] = {"port": port,
+                            "port_retry": shaped.get("port_retry",
+                                                     shaped.get("port_fallback_count", 0))}
+    return shaped
+
+
+def port_retry(tool: Tool) -> int:
+    """ポートが塞がっていたとき、ツールが自分で次へずらす数 (`server.port_retry`)。
+
+    現場のツールはどれも、設定のポートを別のアプリが使っていれば次の空きへ
+    移る (Display-file-list と excel-format-converter はどちらも 8753 から)。
+    読めなければ 0 (ずれないものとして扱う)。
+    """
+    path = (tool.start_command or "").strip().strip('"')
+    raw = _read_app_json(Path(path)) if path else {}
+    server = raw.get("server") if raw else None
+    if not isinstance(server, dict):
+        return 0
+    values = [server.get("port_retry")]
+    roles = server.get("roles")
+    if isinstance(roles, dict):
+        values += [role.get("port_retry") for role in roles.values() if isinstance(role, dict)]
+    return max((v for v in values if isinstance(v, int) and v > 0), default=0)
 
 
 # ------------------------------------------------------------------

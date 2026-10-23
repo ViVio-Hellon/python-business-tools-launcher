@@ -13,6 +13,14 @@ import urllib.request
 
 def main(argv: list[str]) -> int:
     port = int(argv[0])
+    if "--port-file" in argv:
+        # ポートを移るツール。本物と同じく**自分が使っている**ポートへ頼む
+        try:
+            with open(argv[argv.index("--port-file") + 1]) as handle:
+                port = int(handle.read().strip())
+        except (OSError, ValueError, IndexError):
+            print("動いていませんでした")
+            return 0
     force = "--force" in argv[1:]
     url = f"http://127.0.0.1:{port}/api/shutdown"
     body = json.dumps({"force": force}).encode("utf-8")

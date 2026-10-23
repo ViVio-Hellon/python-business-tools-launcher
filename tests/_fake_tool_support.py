@@ -28,7 +28,8 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
                   exit_code: int | None = None,
                   with_stop_bat: bool = True,
                   version: str = "1.0.0",
-                  installed_version: str | None = None) -> Path:
+                  installed_version: str | None = None,
+                  port_retry: int = 0) -> Path:
     """1つの業務ツールらしいフォルダを作る。
 
     `exit_code` を渡すと、**起動せずにその戻り値で終わる** BATになる。
@@ -53,6 +54,8 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
                 "--ready-after", str(ready_after)]
         if busy:
             args.append("--busy")
+        if port_retry:
+            args += ["--port-retry", str(port_retry)]
         start.write_text(
             "#!/bin/sh\n" + " ".join(_quote(a) for a in args) + ' "$@"\n',
             encoding="utf-8")
@@ -63,7 +66,8 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
         stop.write_text(
             "#!/bin/sh\n"
             + " ".join(_quote(a) for a in [
-                sys.executable, str(TESTS_DIR / "_stop_tool.py"), str(port)])
+                sys.executable, str(TESTS_DIR / "_stop_tool.py"), str(port)]
+                + (["--port-file", str(root / "bound_port.txt")] if port_retry else []))
             + ' "$@"\n',
             encoding="utf-8")
         os.chmod(stop, 0o755)
@@ -74,7 +78,7 @@ def make_tool_dir(base: Path, *, app_id: str, port: int,
         f'{{"app_id": "{app_id}", "display_name": "{display_name}",'
         f' "version": "{installed_version or version}",'
         f' "local_dir_name": "Fake_{app_id}",'
-        f' "server": {{"port": {port}}}}}',
+        f' "server": {{"port": {port}, "port_retry": {port_retry}}}}}',
         encoding="utf-8")
     return root
 
