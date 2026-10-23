@@ -293,9 +293,10 @@ class SettingsDialog:
         blank = (f"配布先フォルダの指定 ({shared})" if shared
                  else f"この端末の中 ({trace.local_dir()})")
         for text in (f"空欄のとき: {blank}",
-                     "共有フォルダーを指定すると、端末名のフォルダー "
-                     f"({trace.computer_name()}) に分けて書きます"
-                     " (全端末の記録が1か所に集まります)"):
+                     f"指定した場所に「{trace.LOG_NAME}」のフォルダーを作り、"
+                     f"{trace.LOG_NAME}_ログ_{trace.pc_tag()}_日付.log のように、"
+                     "ツールの名前と端末名の入った名前で書きます"
+                     " (共有フォルダーなら全端末の記録が1か所に集まります)"):
             tk.Label(self.area, text=text, bg=theme.BG, fg=theme.MUTED,
                      font=theme.FONT_SMALL, anchor="w", justify="left",
                      wraplength=640).pack(fill="x", padx=6, pady=(4, 0))

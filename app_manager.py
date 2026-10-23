@@ -2429,7 +2429,7 @@ def tool_log_path(app_id: str) -> Path:
     に置くとネットワークが切れたときにツールの書き込みが失敗しかねない。
     障害記録には末尾を写す (`trace`)。
     """
-    return app_config.local_dir("logs") / f"tool_{_safe_name(app_id)}.out.log"
+    return trace.tool_output_path(app_id)
 
 
 def _records_note(incident: str) -> str:
@@ -2451,8 +2451,3 @@ def _describe_payload(payload: Optional[dict]) -> str:
     keys = ("app_id", "ready", "stage", "version", "pid", "port")
     parts = [f"{k}={payload[k]}" for k in keys if k in payload]
     return ", ".join(parts) or "(中身なし)"
-
-
-def _safe_name(app_id: str) -> str:
-    """アプリIDをファイル名に使える形へ。"""
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in app_id)

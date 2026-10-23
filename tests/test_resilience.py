@@ -209,8 +209,16 @@ class LogRotationTests(LocalAreaTestCase):
 
     def test_古いツールログも片付け対象(self) -> None:
         """日付で分かれないので、日数での片付けからも漏らさない。"""
-        self.assertIn("tool_*.out.log", logging_utils.LOG_PATTERNS)
-        self.assertIn("launcher_*.log", logging_utils.LOG_PATTERNS)
+        import fnmatch
+
+        from launcher import trace
+
+        patterns = logging_utils.log_patterns()
+        for path in (trace.tool_output_path("nlm.fake"), trace.text_log_path()):
+            self.assertTrue(any(fnmatch.fnmatch(path.name, p) for p in patterns), path.name)
+        # 1.7.10 までの名前も片付ける
+        self.assertIn("tool_*.out.log", logging_utils.LEGACY_LOG_PATTERNS)
+        self.assertIn("launcher_*.log", logging_utils.LEGACY_LOG_PATTERNS)
 
     def test_無い場所でも失敗しない(self) -> None:
         logging_utils.rotate_if_large(self.work_root / "ない.log",

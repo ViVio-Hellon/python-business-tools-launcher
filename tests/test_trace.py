@@ -35,7 +35,7 @@ class _Tool:
 
 
 class EventTests(LocalAreaTestCase):
-    """出来事の一覧 (events_YYYYMM.csv)。"""
+    """出来事の一覧 (業務ツール統合ランチャー_出来事_<端末名>_YYYYMM.csv)。"""
 
     def test_Excelで開けるようBOM付きで書く(self) -> None:
         trace.event("起動開始", tool=_Tool())
@@ -110,15 +110,20 @@ class DestinationTests(LocalAreaTestCase):
         self.assertEqual(dest.configured, "")
         self.assertIn("既定", dest.describe())
 
-    def test_指定すると端末名のフォルダーに分けて書く(self) -> None:
+    def test_指定するとツール名のフォルダーに書く(self) -> None:
+        """(1.7.11) 共有の出力先にはいろいろなツールが書く。フォルダーも名前も
+        ツールの名前で始め、名前に端末名を入れる。"""
         shared = self.work_root / "shared"
         tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
 
         dest = trace.destination(refresh=True)
-        self.assertEqual(dest.path, shared / "PC-01")
+        self.assertEqual(dest.path, shared / "業務ツール統合ランチャー")
         self.assertEqual(dest.source, "この端末の設定")
         trace.event("起動開始")
-        self.assertTrue((shared / "PC-01" / trace.events_path().name).exists())
+        written = shared / "業務ツール統合ランチャー" / \
+            f"業務ツール統合ランチャー_出来事_PC-01_{time.strftime('%Y%m')}.csv"
+        self.assertTrue(written.exists())
+        self.assertFalse((shared / "PC-01").exists(), "端末名のフォルダーを作っています")
 
     def test_配布先フォルダの指定を使う(self) -> None:
         shared = self.work_root / "from-distribution"
@@ -127,7 +132,7 @@ class DestinationTests(LocalAreaTestCase):
         self.assertEqual(distribution.log_dir(), str(shared))
 
         dest = trace.destination(refresh=True)
-        self.assertEqual(dest.path, shared / "PC-01")
+        self.assertEqual(dest.path, shared / trace.LOG_NAME)
         self.assertEqual(dest.source, "配布先フォルダ")
 
     def test_端末の設定が配布先フォルダより優先(self) -> None:
@@ -136,7 +141,7 @@ class DestinationTests(LocalAreaTestCase):
         mine = self.work_root / "mine"
         tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(mine))
 
-        self.assertEqual(trace.destination(refresh=True).path, mine / "PC-01")
+        self.assertEqual(trace.destination(refresh=True).path, mine / trace.LOG_NAME)
 
     def test_配布先フォルダを作ると出力先も入る(self) -> None:
         tool_registry.initialize()
@@ -180,7 +185,7 @@ class DestinationTests(LocalAreaTestCase):
             try:
                 # 試験では logging を設定していないので、既定で出る WARNING で
                 logging_utils.get_logger("test").warning("移したあとの1行")
-                self.assertEqual(dest.path, shared / "PC-01")
+                self.assertEqual(dest.path, shared / trace.LOG_NAME)
                 self.assertEqual(
                     tool_registry.get_pc_setting(tool_registry.LOG_DIR_KEY), str(shared))
                 text = logging_utils.log_file_path().read_text(encoding="utf-8")
@@ -193,7 +198,7 @@ class DestinationTests(LocalAreaTestCase):
 
         # 変えたことは**移す前と後の両方**に残る
         old_rows = trace.read_events(trace.events_path(trace.local_dir()))
-        new_rows = trace.read_events(trace.events_path(shared / "PC-01"))
+        new_rows = trace.read_events(trace.events_path(shared / trace.LOG_NAME))
         self.assertEqual([r["種類"] for r in old_rows], ["ログの出力先を変更"])
         self.assertEqual(new_rows[0]["種類"], "ログの出力先を変更")
         self.assertEqual(new_rows[0]["結果"], "成功")
@@ -274,10 +279,12 @@ class IncidentTests(LocalAreaTestCase):
         shared = self.work_root / "shared"
         tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
         dest = trace.destination(refresh=True)
-        (dest.path / "incidents").write_text("ふさぐ", encoding="utf-8")
+        dest.path.rmdir()
+        dest.path.write_text("ふさぐ", encoding="utf-8")   # フォルダーの代わりにファイル
 
         path = Path(trace.incident("試し"))
-        self.assertEqual(path.parent, trace.local_dir() / "incidents")
+        self.assertEqual(path.parent, trace.local_dir())
+        self.assertTrue(path.name.startswith("業務ツール統合ランチャー_障害記録_"), path.name)
 
     def test_ツールの出力の末尾とエラー行(self) -> None:
         out = self.work_root / "cp932.log"
@@ -291,23 +298,96 @@ class IncidentTests(LocalAreaTestCase):
         self.assertEqual(trace.tail_lines(self.work_root / "無い.log"), [])
         self.assertEqual(trace.error_line(["準備中", "起動しました"]), "")
 
-    def test_古い記録は自分の端末のフォルダーだけ片付ける(self) -> None:
+    def test_古い記録は自分の端末のものだけ片付ける(self) -> None:
+        """フォルダーはほかの端末と分け合う (1.7.11)。名前の端末名で見分ける。"""
         with mock.patch.dict(os.environ, {"COMPUTERNAME": "PC-01"}):
             shared = self.work_root / "shared"
             tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(shared))
-            mine = trace.destination(refresh=True).path / "incidents"
-            theirs = shared / "PC-02" / "incidents"
-            for folder in (mine, theirs):
-                folder.mkdir(parents=True)
-                old = folder / "古い.txt"
-                old.write_text("x", encoding="utf-8")
-                past = time.time() - (trace.INCIDENT_KEEP_DAYS + 1) * 86400
-                os.utime(old, (past, past))
+            folder = trace.destination(refresh=True).path
+            folder.mkdir(parents=True, exist_ok=True)
+            prefix = "業務ツール統合ランチャー_障害記録_"
+            mine = folder / f"{prefix}PC-01_20260101_000000_日報_古い.txt"
+            theirs = folder / f"{prefix}PC-02_20260101_000000_日報_古い.txt"
+            # 1.7.10 までの置き場所
+            legacy_mine = shared / "PC-01" / "incidents" / "古い.txt"
+            legacy_theirs = shared / "PC-02" / "incidents" / "古い.txt"
+            past = time.time() - (trace.INCIDENT_KEEP_DAYS + 1) * 86400
+            for path in (mine, theirs, legacy_mine, legacy_theirs):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+                os.utime(path, (past, past))
 
             trace.purge_old()
-            self.assertFalse((mine / "古い.txt").exists())
-            self.assertTrue((theirs / "古い.txt").exists(),
-                            "ほかの端末の記録を消しています")
+            self.assertFalse(mine.exists())
+            self.assertFalse(legacy_mine.exists())
+            self.assertTrue(theirs.exists(), "ほかの端末の記録を消しています")
+            self.assertTrue(legacy_theirs.exists(), "ほかの端末の記録を消しています")
+
+
+class LogNameTests(LocalAreaTestCase):
+    """(1.7.11) どのファイルも「業務ツール統合ランチャー_<種類>_」で始まり、端末名が入る。
+
+    共有の出力先にはいろいろなツールが書く (dbviewer_…・rneconverter_…・出来事_…)。
+    取り出したあとでも、開かずにどのツールの・どの端末の記録か分かるように。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, {"COMPUTERNAME": "PC-01"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.shared = self.work_root / "shared"
+        tool_registry.set_pc_setting(tool_registry.LOG_DIR_KEY, str(self.shared))
+        self.folder = trace.destination(refresh=True).path
+
+    def test_書くファイルの名前(self) -> None:
+        day = time.strftime("%Y%m%d")
+        self.assertEqual(trace.text_log_path(),
+                         self.folder / f"業務ツール統合ランチャー_ログ_PC-01_{day}.log")
+        self.assertEqual(logging_utils.log_file_path(), trace.text_log_path())
+        self.assertEqual(trace.events_path().name,
+                         f"業務ツール統合ランチャー_出来事_PC-01_{day[:6]}.csv")
+        self.assertEqual(trace.tool_output_path("nlm.packaging-tool"),
+                         trace.local_dir() / "業務ツール統合ランチャー_ツール出力_nlm.packaging-tool.log")
+        self.assertEqual(trace.crash_log_path(),
+                         trace.local_dir() / "業務ツール統合ランチャー_落ちたとき_PC-01.log")
+
+    def test_障害記録も同じフォルダーに名前で分かるように(self) -> None:
+        path = Path(trace.incident("起動できなかった", tool=tool_registry.Tool(
+            app_id="nlm.nippou", display_name="日報")))
+        self.assertEqual(path.parent, self.folder)
+        self.assertRegex(path.name, r"^業務ツール統合ランチャー_障害記録_PC-01_"
+                                    r"\d{8}_\d{6}_日報_起動できなかった\.txt$")
+        self.assertEqual(trace.recent_incidents(), [path])
+        # 「_」で区切ると、頭がツールの名前・次が種類 (ファイル名の一覧で並べたとき)
+        self.assertEqual(path.name.split("_")[:3],
+                         ["業務ツール統合ランチャー", "障害記録", "PC-01"])
+
+    def test_以前の置き場所の最近の障害記録も読む(self) -> None:
+        """入れ替えた直後でも、［詳細］から最近の記録が消えない。"""
+        old = self.shared / "PC-01" / "incidents" / "20261022_101010_日報_古い.txt"
+        old.parent.mkdir(parents=True)
+        old.write_text("x", encoding="utf-8")
+        local_old = trace.local_dir() / "incidents" / "20261022_101011_看板_古い.txt"
+        local_old.parent.mkdir(parents=True, exist_ok=True)
+        local_old.write_text("x", encoding="utf-8")
+        self.assertEqual(set(trace.recent_incidents()), {old, local_old})
+
+    def test_端末名に区切りの文字があってもほかの端末の記録を消さない(self) -> None:
+        past = time.time() - (trace.INCIDENT_KEEP_DAYS + 1) * 86400
+        with mock.patch.dict(os.environ, {"COMPUTERNAME": "LINE"}):
+            other = self.folder / "業務ツール統合ランチャー_障害記録_LINE-B_20260101_000000_x_y.txt"
+            other.parent.mkdir(parents=True, exist_ok=True)
+            other.write_text("x", encoding="utf-8")
+            os.utime(other, (past, past))
+            trace.purge_old()
+            self.assertTrue(other.exists(), "ほかの端末の記録を消しています")
+        with mock.patch.dict(os.environ, {"COMPUTERNAME": "LINE_B"}):
+            self.assertEqual(trace.pc_tag(), "LINE-B")
+
+    def test_設定の窓の説明もツールの名前のフォルダー(self) -> None:
+        self.assertEqual(trace.folder_for(str(self.shared)),
+                         self.shared / "業務ツール統合ランチャー")
 
 
 class AdminLockRecordTests(LocalAreaTestCase):

@@ -180,8 +180,7 @@ def _report_unclean_end(info, manager) -> str:
         hints = ["外から止められた可能性: タスクマネージャー・taskkill、"
                  "またはツールが起動・終了のときに python / pythonw を止めていないか",
                  "ランチャーのログの最後の行で、何をしていたときかを確かめる"]
-    log_path = (trace.destination().path
-                / f"launcher_{time.strftime('%Y%m%d', time.localtime(info.started_at))}.log")
+    log_path = trace.text_log_path(info.started_at)
     path = trace.incident(
         "ランチャーが終了の手順を通らずに終わっていた", whys=whys, hints=hints,
         observed=[("前回のランチャー", f"pid={info.pid} / {when} 起動 / {info.python}")],
