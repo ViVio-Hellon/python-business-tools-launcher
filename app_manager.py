@@ -1532,6 +1532,7 @@ class ToolManager:
             # 業務ツールはこのプロセスが生きているあいだ動き続けるので、
             # 誰も読まないパイプはやがて詰まり、ツールごと固まる。
             # ファイルなら詰まらず、しかも調査の材料になる (§16)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             out = open(out_path, "a", encoding="utf-8", errors="replace")
         except OSError as exc:
             log.warning("出力ログを開けませんでした (%s): %s", out_path, exc)

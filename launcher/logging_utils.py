@@ -28,21 +28,19 @@ ROOT_NAME = "launcher"
 # 「先週から切り替わらない」の類は数日さかのぼれないと追えない
 KEEP_DAYS = 30
 
-# 1.7.10 までの名前 (端末の中・端末名のフォルダーに残っている分を片付ける)
-LEGACY_LOG_PATTERNS = ("launcher_*.log", "tool_*.out.log", "tool_*.out.log.*")
-
-
 def log_patterns() -> tuple[str, ...]:
     """片付けの対象。**この端末が書いたものだけ** (出力先はほかの端末と分け合う)。
 
     **業務ツールの出力も含める** ── こちらは日付で分かれておらず追記され
     続けるので、放っておくと無制限に増える (端末の中だけにある)。
     """
-    from .trace import KIND_LOG, KIND_TOOL_OUTPUT, LOG_NAME, own_pattern
+    import glob
 
-    return (own_pattern(KIND_LOG, ".log"),
-            f"{LOG_NAME}_{KIND_TOOL_OUTPUT}_*.log",
-            f"{LOG_NAME}_{KIND_TOOL_OUTPUT}_*.log.*")
+    from .trace import KIND_LOG, KIND_TOOL_OUTPUT, TOOL_ID, own_pattern, pc_tag
+
+    # ツールの出力は `launcher_ツール出力_<アプリID>_<端末名>.log` (端末名が最後)
+    tool_output = f"{TOOL_ID}_{KIND_TOOL_OUTPUT}_*_{glob.escape(pc_tag())}.log"
+    return (own_pattern(KIND_LOG, ".log"), tool_output, tool_output + ".*")
 
 
 def configure_logging(*, console: bool | None = None) -> None:
@@ -131,17 +129,18 @@ def _purge_old_logs() -> None:
     """古いログを片付ける。失敗しても起動は続ける。"""
     import time
 
-    from .trace import destination, legacy_folders, purge_old
+    from . import trace
+    from .trace import destination, purge_old
 
     limit = time.time() - KEEP_DAYS * 86400
     # **この端末が書いたものだけ**片付ける (共有の出力先のフォルダーは
     # ほかの端末と分け合うので、名前の端末名で見分ける)
     places = [(folder, pattern)
-              for folder in {app_config.local_dir("logs"), destination().path}
+              for folder in {trace.local_dir(), destination().path}
               for pattern in log_patterns()]
-    # 1.7.10 までの置き場所 (端末の中・指定先の端末名のフォルダー)
-    places += [(folder, pattern) for folder in legacy_folders()
-               for pattern in LEGACY_LOG_PATTERNS]
+    # 前の場所の、この端末のログ (移さない・もう書かない。残す期間を過ぎたら片付ける)
+    places += trace.legacy_places(trace.LEGACY_LOG)
+    places += trace.legacy_places(trace.LEGACY_TOOL_OUTPUT)
     for folder, pattern in places:
         try:
             for path in folder.glob(pattern):
@@ -158,7 +157,7 @@ def _purge_old_logs() -> None:
 def rotate_if_large(path, *, max_bytes: int, keep: int = 2) -> None:
     """大きくなったファイルを退避する。
 
-    業務ツールの出力 (`業務ツール統合ランチャー_ツール出力_<アプリID>.log`) は日付で分かれず、
+    業務ツールの出力 (`launcher_ツール出力_<アプリID>_<端末名>.log`) は日付で分かれず、
     動いているあいだ追記され続ける。**日数で消すだけでは、開いたまま
     長く使う端末を守れない** ── 1つのファイルが際限なく育つ。
 

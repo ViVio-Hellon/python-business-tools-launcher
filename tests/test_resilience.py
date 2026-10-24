@@ -216,9 +216,11 @@ class LogRotationTests(LocalAreaTestCase):
         patterns = logging_utils.log_patterns()
         for path in (trace.tool_output_path("nlm.fake"), trace.text_log_path()):
             self.assertTrue(any(fnmatch.fnmatch(path.name, p) for p in patterns), path.name)
-        # 1.7.10 までの名前も片付ける
-        self.assertIn("tool_*.out.log", logging_utils.LEGACY_LOG_PATTERNS)
-        self.assertIn("launcher_*.log", logging_utils.LEGACY_LOG_PATTERNS)
+        # 前の名前も片付ける (1.7.10 まで)
+        old = [pattern for _folder, pattern in trace.legacy_places(trace.LEGACY_TOOL_OUTPUT)
+               + trace.legacy_places(trace.LEGACY_LOG)]
+        self.assertIn("tool_*.out.log", old)
+        self.assertIn("launcher_*.log", old)
 
     def test_無い場所でも失敗しない(self) -> None:
         logging_utils.rotate_if_large(self.work_root / "ない.log",

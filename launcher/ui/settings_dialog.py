@@ -293,9 +293,9 @@ class SettingsDialog:
         blank = (f"配布先フォルダの指定 ({shared})" if shared
                  else f"この端末の中 ({trace.local_dir()})")
         for text in (f"空欄のとき: {blank}",
-                     f"指定した場所に「{trace.LOG_NAME}」のフォルダーを作り、"
-                     f"{trace.LOG_NAME}_ログ_{trace.pc_tag()}_日付.log のように、"
-                     "ツールの名前と端末名の入った名前で書きます"
+                     f"指定した場所に「{trace.TOOL_ID}」のフォルダーを作り、"
+                     f"{trace.TOOL_ID}_{trace.pc_tag()}_日付.log のように、"
+                     f"{trace.TOOL_ID}_ で始まり端末名の入った名前で書きます"
                      " (共有フォルダーなら全端末の記録が1か所に集まります)"):
             tk.Label(self.area, text=text, bg=theme.BG, fg=theme.MUTED,
                      font=theme.FONT_SMALL, anchor="w", justify="left",

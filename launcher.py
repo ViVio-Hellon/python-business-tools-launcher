@@ -537,9 +537,9 @@ def _describe_records() -> str:
              f"  ランチャーのログ : {real(logging_utils.log_file_path())}",
              f"  出来事の一覧     : {real(trace.events_path())}",
              f"  障害記録         : {real(dest.path)}"
-             f" ({trace.LOG_NAME}_障害記録_{trace.pc_tag()}_….txt)",
+             f" ({trace.TOOL_ID}_障害記録_{trace.pc_tag()}_….txt)",
              f"  ツールの出力     : {real(trace.local_dir())}"
-             f" ({trace.LOG_NAME}_ツール出力_<アプリID>.log。いつも端末の中)"]
+             f" ({trace.TOOL_ID}_ツール出力_<アプリID>_{trace.pc_tag()}.log。いつも端末の中)"]
     if dest.problem:
         lines.append(f"  [注意] 指定された出力先に書けません: {dest.problem}")
     if trace.is_store_python() or trace.moved_by_python(trace.local_dir()):

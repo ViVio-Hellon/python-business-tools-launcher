@@ -1,40 +1,40 @@
 """後追いの記録 (なぜなぜ分析のため)
 
 「起動しなかった」「急に止まった」を、**あとから順を追って調べられる**
-ようにする。ふつうのログ (`業務ツール統合ランチャー_ログ_*.log`) は文章で、何が起きたかを
+ようにする。ふつうのログ (`launcher_<端末名>_YYYYMMDD.log`) は文章で、何が起きたかを
 探すのに読み込みが要る。そこで次の2つを別に残す。
 
-    出来事の一覧  業務ツール統合ランチャー_出来事_<端末名>_YYYYMM.csv
+    出来事の一覧  launcher_出来事_<端末名>_YYYYMM.csv
         1行1件。Excel で開いて、日時・ツール・種類・結果で絞り込める。
         **操作ID**で、1回の操作 (ボタンを押した〜起動できなかった) の
         行をまとめて追える。
 
-    障害記録      業務ツール統合ランチャー_障害記録_<端末名>_YYYYMMDD_HHMMSS_<ツール>_<現象>.txt
+    障害記録      launcher_障害記録_<端末名>_YYYYMMDD_HHMMSS_<ツール>_<現象>.txt
         失敗・思わぬ停止・想定外の例外が起きたときに1件。なぜなぜ分析の
         書式で、**ランチャーが確かめられたところまで「なぜ」を埋めて**
         おく。その先は人が書き足す。直前の操作の流れ、ランチャーが見た
         こと (戻り値・ポート・応答)、ツールの出力の最後の行も付ける。
 
-【置き場所と名前】(1.7.11)
-［設定］の「ログの出力先」→ 配布先フォルダ → 既定 (`%LOCALAPPDATA%\\...\\logs`)
-の順に決める。指定した場所には **「業務ツール統合ランチャー」のフォルダー**を
-作り、その中に書く。ファイル名も**いつも「業務ツール統合ランチャー_」で始め**、
-種類と端末名を入れる。共有の出力先にはいろいろなツールが書くので、フォルダーから
-取り出したあとでも、開かずにどのツールの・どの端末の記録か分かるように
-(1.7.10 までは端末名のフォルダーに `events_YYYYMM.csv` などと書いていて、
-ツールの名前がどこにも無かった)。共有フォルダーを指定すれば、全端末の記録が
-1か所に集まる。
+【置き場所と名前】現場のログの決まり (日報複合ツールに合わせる。1.7.12)
+1. ［設定］の「ログの出力先」→ 配布先フォルダ の順に決めた出力先に
+   **`<出力先>\\launcher\\`** を作り、その中に書く。出力先の直下には置かない。
+   `launcher` はランチャーのツールID (半角英小文字)。
+2. ファイル名は必ず `launcher_` で始め、種類 (ふだんのログには付けない)・
+   日付・**端末名**を入れる (共有フォルダーで何台もが同じファイルに書かない)。
+3. 出力先を決めていない・届かないときは、ローカルの `logs\\launcher\\` に同じ形で
+   書く。**記録のためにランチャーを止めない。** 退いたこと自体も記録する。
+4. 前の場所・前の名前の記録は、移さない・消さない・もう書かない。［詳細］・
+   診断・古いものの片付けは、前の場所の**この端末の**記録も見る (`legacy_places`)。
+5. ほかのツールのフォルダー・ファイル (nippou\\・kanban\\・dbviewer\\ など) は
+   読まない・消さない。片付けるのは、ランチャーの、この端末のものだけ。
 
-    <出力先>\\業務ツール統合ランチャー\\
-        業務ツール統合ランチャー_ログ_<端末名>_YYYYMMDD.log
-        業務ツール統合ランチャー_出来事_<端末名>_YYYYMM.csv
-        業務ツール統合ランチャー_障害記録_<端末名>_YYYYMMDD_HHMMSS_<ツール>_<現象>.txt
+    <出力先>\\launcher\\
+        launcher_<端末名>_YYYYMMDD.log
+        launcher_出来事_<端末名>_YYYYMM.csv
+        launcher_障害記録_<端末名>_YYYYMMDD_HHMMSS_<ツール>_<現象>.txt
 
-**書けなければ既定の場所へ退く。** 記録のためにランチャーが止まるほうが
-困る。退いたこと自体も記録する。
-
-ツールの出力 (`業務ツール統合ランチャー_ツール出力_<アプリID>.log`) と、落ちたときの
-記録 (`業務ツール統合ランチャー_落ちたとき_<端末名>.log`) は、いつも端末の中に置く。
+ツールの出力 (`launcher_ツール出力_<アプリID>_<端末名>.log`) と、落ちたときの記録
+(`launcher_落ちたとき_<端末名>.log`) は、いつも端末の中 (`logs\\launcher\\`) に置く。
 ツールが書き続けるファイルなので、共有フォルダーにするとネットワークが
 切れたときにツールの書き込みが失敗し、ツールごと止まりかねない。
 障害記録にはその末尾を写しておく。
@@ -109,26 +109,35 @@ class Destination:
         return f"{shown} ({self.source}で指定)"
 
 
-def local_dir() -> Path:
-    return app_config.local_dir("logs")
+# ツールID。**半角英小文字。** 置き場所のフォルダー名と、ファイル名の頭に使う
+# (現場のログの決まり: <出力先>\\<ツールID>\\<ツールID>_…。日報複合ツールに合わせる)。
+# **設定ファイルでは変えない** ── 変わると、古い記録の片付けや［詳細］から探せなくなる
+TOOL_ID = "launcher"
 
-
-# 出力先のフォルダー名と、ファイル名の頭。**設定ファイルでは変えない** ──
-# 変わると、古い記録の片付けや［詳細］から探せなくなる
-LOG_NAME = "業務ツール統合ランチャー"
-
-# ファイル名の2つ目 (種類)
-KIND_LOG = "ログ"
+# ファイル名の2つ目 (種類)。ふだんのログには付けない (dbviewer_<PC>_<日付>.log と同じ形)
+KIND_LOG = ""
 KIND_EVENTS = "出来事"
 KIND_INCIDENT = "障害記録"
 KIND_TOOL_OUTPUT = "ツール出力"
 KIND_CRASH = "落ちたとき"
 
+# 1.7.11 の名前 (日本語の表示名をフォルダーとファイル名の頭にしていた)。読むだけ
+OLD_NAME_1711 = "業務ツール統合ランチャー"
+
+
+def logs_root() -> Path:
+    """この端末のローカルの logs (ランチャーの領域の中)。"""
+    return app_config.local_dir("logs")
+
+
+def local_dir() -> Path:
+    """出力先を決めていない・届かないときに書く場所 (`logs\\launcher`)。"""
+    return logs_root() / TOOL_ID
+
 
 def file_name(kind: str, *parts: str, suffix: str) -> str:
-    """`業務ツール統合ランチャー_<種類>_<…>.<拡張子>`。一覧で「_」で区切ると、
-    頭がツールの名前、次が種類になる。"""
-    return "_".join([LOG_NAME, kind, *(p for p in parts if p)]) + suffix
+    """`launcher_[<種類>_]<…>.<拡張子>`。一覧で「_」で区切ると、頭がツールID。"""
+    return "_".join([TOOL_ID, *(p for p in (kind, *parts) if p)]) + suffix
 
 
 def pc_tag() -> str:
@@ -137,9 +146,10 @@ def pc_tag() -> str:
     return computer_name().replace("_", "-")
 
 
-def own_pattern(kind: str, suffix: str) -> str:
-    """この端末が書いた、その種類のファイル (片付けるのはこれだけ)。"""
-    return f"{LOG_NAME}_{kind}_{glob.escape(pc_tag())}_*{suffix}"
+def own_pattern(kind: str, suffix: str, *, prefix: str = TOOL_ID) -> str:
+    """この端末が書いた、その種類のファイル (片付け・［詳細］で読むのはこれだけ)。"""
+    head = f"{prefix}_{kind}_" if kind else f"{prefix}_"
+    return f"{head}{glob.escape(pc_tag())}_*{suffix}"
 
 
 def text_log_path(day: Optional[float] = None, dest: Optional[Path] = None) -> Path:
@@ -151,7 +161,7 @@ def text_log_path(day: Optional[float] = None, dest: Optional[Path] = None) -> P
 
 def tool_output_path(app_id: str) -> Path:
     """ツールの出力の写し。いつも端末の中。"""
-    return local_dir() / file_name(KIND_TOOL_OUTPUT, _safe(app_id) or "tool",
+    return local_dir() / file_name(KIND_TOOL_OUTPUT, _safe(app_id) or "tool", pc_tag(),
                                    suffix=".log")
 
 
@@ -193,20 +203,58 @@ def expand_dir(text: str) -> Path:
 
 
 def folder_for(text: str) -> Path:
-    """指定された出力先に、実際に書く場所 (「業務ツール統合ランチャー」のフォルダー)。"""
-    return expand_dir(text) / LOG_NAME
+    """指定された出力先に、実際に書く場所 (`<出力先>\\launcher`)。"""
+    return expand_dir(text) / TOOL_ID
 
 
-def legacy_folders() -> list[Path]:
-    """1.7.10 までの置き場所 (指定先の端末名のフォルダー・端末の中)。読むだけ。"""
-    folders = [local_dir()]
+# ------------------------------------------------------------------
+# 前の場所・前の名前 (移さない・消さない・もう書かない。読む・期限で片付けるだけ)
+# ------------------------------------------------------------------
+# 種類: 障害記録 / 出来事 / ログ / ツール出力
+LEGACY_INCIDENT = "incident"
+LEGACY_EVENTS = "events"
+LEGACY_LOG = "log"
+LEGACY_TOOL_OUTPUT = "tool_output"
+
+
+def legacy_places(kind: str) -> list[tuple[Path, str]]:
+    """前の場所にある、**この端末のランチャーが書いた**その種類のファイル。
+
+    1.7.10 まで: 指定先の `<端末名>\\`・ローカルの `logs\\` 直下 (`events_YYYYMM.csv`・
+    `incidents\\*.txt`・`launcher_YYYYMMDD.log`・`tool_<アプリID>.out.log`)。
+    1.7.11: 指定先の `業務ツール統合ランチャー\\`・ローカルの `logs\\` 直下
+    (`業務ツール統合ランチャー_<種類>_<端末名>_…`)。
+    **ほかのツールのフォルダー・ファイルは見ない** (出力先の直下を探さない)。
+    """
+    root = logs_root()
     try:
         text, _source = configured_dir()
     except Exception:                         # noqa: BLE001 - 読めなくても続ける
         text = ""
+    pc_folders = [root]
+    old_folders = [root]
     if text:
-        folders.append(expand_dir(text) / computer_name())
-    return folders
+        base = expand_dir(text)
+        pc_folders.append(base / computer_name())      # 端末名のフォルダー = この端末だけ
+        old_folders.append(base / OLD_NAME_1711)
+    old = OLD_NAME_1711
+    if kind == LEGACY_INCIDENT:
+        return ([(folder / "incidents", "*.txt") for folder in pc_folders]
+                + [(folder, own_pattern("障害記録", ".txt", prefix=old))
+                   for folder in old_folders])
+    if kind == LEGACY_EVENTS:
+        return ([(folder, "events_*.csv") for folder in pc_folders]
+                + [(folder, own_pattern("出来事", ".csv", prefix=old))
+                   for folder in old_folders])
+    if kind == LEGACY_LOG:
+        return ([(folder, "launcher_*.log") for folder in pc_folders]
+                + [(folder, own_pattern("ログ", ".log", prefix=old))
+                   for folder in old_folders])
+    if kind == LEGACY_TOOL_OUTPUT:
+        # 端末の中だけにあった
+        return [(root, "tool_*.out.log"), (root, "tool_*.out.log.*"),
+                (root, f"{old}_ツール出力_*.log"), (root, f"{old}_ツール出力_*.log.*")]
+    raise ValueError(kind)
 
 
 def check_writable(folder: Path) -> str:
@@ -623,11 +671,16 @@ def enable_crash_log() -> None:
 
 def crash_lines_since(started_at: float) -> list[str]:
     """`started_at` のあとに起動したランチャーが、落ちたときに書いたもの。"""
-    path = crash_log_path()
-    try:
-        if path.stat().st_mtime < started_at:
-            return []
-    except OSError:
+    # 入れ替えた直後は、前の版が前の場所に書いている
+    old = [logs_root() / "launcher_crash.log",
+           logs_root() / f"{OLD_NAME_1711}_落ちたとき_{pc_tag()}.log"]
+    for path in (crash_log_path(), *old):
+        try:
+            if path.stat().st_mtime >= started_at:
+                break
+        except OSError:
+            continue
+    else:
         return []
     lines = tail_lines(path, 200)
     # 最後の「ランチャー起動」の見出しより後ろ (= 前回の分)
@@ -740,11 +793,11 @@ def recent_incidents(days: int = 7) -> list[Path]:
     """最近の障害記録 (新しい順)。"""
     limit = time.time() - days * 86400
     found: list[Path] = []
-    places = {(destination().path, f"{LOG_NAME}_{KIND_INCIDENT}_*.txt"),
-              (local_dir(), f"{LOG_NAME}_{KIND_INCIDENT}_*.txt")}
-    # 1.7.10 までの置き場所 (incidents フォルダー) も読む。入れ替えた直後でも
-    # 最近の記録が［詳細］から消えないように
-    places |= {(folder / "incidents", "*.txt") for folder in legacy_folders()}
+    # **この端末の**記録だけ (出力先のフォルダーはほかの端末と分け合う)
+    places = {(destination().path, own_pattern(KIND_INCIDENT, ".txt")),
+              (local_dir(), own_pattern(KIND_INCIDENT, ".txt"))}
+    # 前の場所の記録も読む。入れ替えた直後でも最近の記録が［詳細］から消えないように
+    places |= set(legacy_places(LEGACY_INCIDENT))
     for folder, pattern in places:
         try:
             found.extend(p for p in folder.glob(pattern)
@@ -804,10 +857,11 @@ def purge_old() -> None:
     for folder in {destination().path, local_dir()}:
         places += [(folder, own_pattern(KIND_INCIDENT, ".txt"), INCIDENT_KEEP_DAYS),
                    (folder, own_pattern(KIND_EVENTS, ".csv"), EVENT_KEEP_DAYS)]
-    # 1.7.10 までの置き場所 (どれもこの端末だけのもの)
-    for folder in legacy_folders():
-        places += [(folder / "incidents", "*.txt", INCIDENT_KEEP_DAYS),
-                   (folder, "events_*.csv", EVENT_KEEP_DAYS)]
+    # 前の場所の、この端末の記録 (移さない・もう書かない。残す期間を過ぎたら片付ける)
+    places += [(folder, pattern, INCIDENT_KEEP_DAYS)
+               for folder, pattern in legacy_places(LEGACY_INCIDENT)]
+    places += [(folder, pattern, EVENT_KEEP_DAYS)
+               for folder, pattern in legacy_places(LEGACY_EVENTS)]
     for folder, pattern, days in places:
         try:
             for path in folder.glob(pattern):
