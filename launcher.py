@@ -62,7 +62,7 @@ ESSENTIAL_FILES = (
     "launcher/bar_positions.py", "launcher/browser.py", "launcher/desktop.py",
     "launcher/distribution.py", "launcher/fileprobe.py", "launcher/health.py",
     "launcher/logging_utils.py", "launcher/paths.py",
-    "launcher/runtime_state.py", "launcher/startup_progress.py",
+    "launcher/runtime_state.py", "launcher/startup_progress.py", "launcher/stopwatch.py",
     "launcher/tool_entries.py", "launcher/tool_registry.py", "launcher/trace.py",
     "launcher/version_info.py",
     "launcher/ui/__init__.py", "launcher/ui/bar.py", "launcher/ui/geometry.py",

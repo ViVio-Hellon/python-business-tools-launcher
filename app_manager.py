@@ -62,6 +62,7 @@ from launcher import (app_config, browser, desktop, fileprobe,  # noqa: E402
                       trace, tool_entries)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
+from launcher.stopwatch import SLEEP_GAP_SEC, Stopwatch  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
 
 log = get_logger("app_manager")
@@ -100,6 +101,8 @@ APP_SETTLE_SEC = 0.8
 STUB_GRACE_SEC = 5.0
 # 設定のポートで答えないとき、ツールが本当に待ち受けているポートを探す間隔 (秒)
 DISCOVER_EVERY_SEC = 2.0
+# スリープ明けの猶予 (秒)。復帰してすぐは、ツールも答えが遅れることがある
+WAKE_GRACE_SEC = 30.0
 # ブラウザーで使うツールが**自分の窓**を出していないか見る間隔 (秒)
 WINDOW_LOOK_SEC = 1.0
 # ツールの起動確認の入口に聞く間隔 (秒)
@@ -219,6 +222,10 @@ class ToolManager:
         # 窓は出ているのに、中の Web サーバーが答えないアプリ。
         # 障害記録を1回だけ書くための印
         self._unhealthy: set[str] = set()
+        # 見回りの時刻 (前回)。間が大きく空いたら PC のスリープ明け (1.7.13)
+        self._last_poll: Optional[float] = None
+        # スリープ明けの猶予の終わり。それまでは応答が無くても数えない
+        self._wake_until = 0.0
 
     # --------------------------------------------------------------
     # 状態
@@ -1019,7 +1026,9 @@ class ToolManager:
         with self._lock:
             self._processes[tool.app_id] = proc
 
-        started = time.monotonic()
+        # 待った時間。**PC のスリープ中は数えない** (復帰した瞬間に時間切れに
+        # しない。1.7.13)
+        watch = Stopwatch()
         # BATが先に落ちたことを、時間切れと区別するための入れ物。
         # 「90秒待った末に時間切れ」より「start.bat が3秒で終了した
         # (戻り値 1)」のほうが、次に何を見ればよいか分かる
@@ -1057,11 +1066,12 @@ class ToolManager:
             # **ツールの起動確認の入口に任せる** (ランチャー連携 §10)。
             # ランチャーの推測 (ポート探し・窓の検出) は使わない
             how = self._wait_by_entries(tool, proc, entries, timeout,
-                                        early_exit, seen, op)
+                                        early_exit, seen, op, watch=watch)
             payload = {} if how == "entry" else None
         elif tool.is_app:
             how, payload, window_note = self._wait_app(tool, proc, timeout,
-                                                       early_exit, seen, op)
+                                                       early_exit, seen, op,
+                                                       watch=watch)
             if how in ("window", "alive"):
                 payload = {}                  # 応答は無いが、起動はしている
             elif how != "health":
@@ -1098,7 +1108,8 @@ class ToolManager:
                 tool.health_url, tool.app_id, timeout=timeout,
                 on_progress=look_elsewhere,
                 should_stop=lambda: (should_stop() or "payload" in discovered
-                                     or "pids" in own_window))
+                                     or "pids" in own_window),
+                stopwatch=watch)
             if payload is None and "payload" in discovered:
                 payload = discovered["payload"]
             if payload is None and "pids" in own_window \
@@ -1124,7 +1135,7 @@ class ToolManager:
             self._abandon(tool, proc)
             trace.event("起動中止", trace.CANCELLED, tool=tool, op=op,
                         cause="利用者がやめた",
-                        elapsed=time.monotonic() - started)
+                        elapsed=watch.elapsed())
             self._set(self._settled_state(), f"{tool.display_name}の起動をやめました",
                       tool)
             return
@@ -1133,9 +1144,9 @@ class ToolManager:
             # 起動確認の入口が「使える」と言わなかった。残ったプロセスは
             # 置き去りにしない (`_settle_failed_start`)
             self._report_entry_failure(tool, proc, entries, early_exit, seen,
-                                       time.monotonic() - started, op=op,
+                                       watch.elapsed(), op=op,
                                        timeout=timeout)
-            self._settle_failed_start(tool, proc, entries, seen, op=op)
+            self._settle_failed_start(tool, proc, entries, seen, op=op, watch=watch)
             return
 
         if payload is None:
@@ -1154,14 +1165,14 @@ class ToolManager:
                     self._show(tool, found, op)
                     return
             self._report_start_failure(tool, proc, early_exit,
-                                       time.monotonic() - started, op=op,
+                                       watch.elapsed(), op=op,
                                        last_payload=seen.get("payload"),
                                        timeout=timeout)
             if tool.is_app:
                 with self._lock:
                     self._processes.pop(tool.app_id, None)
             else:
-                self._settle_failed_start(tool, proc, entries, seen, op=op)
+                self._settle_failed_start(tool, proc, entries, seen, op=op, watch=watch)
             return
 
         if how == "entry":
@@ -1194,7 +1205,7 @@ class ToolManager:
                  payload.get("version") or "不明")
         trace.event("起動完了", trace.OK, tool=running, op=op,
                     version=str(payload.get("version") or ""),
-                    elapsed=time.monotonic() - started)
+                    elapsed=watch.elapsed())
 
         if window_note and "ポート" in window_note:
             if _moved_aside(tool, running.port):
@@ -1210,7 +1221,7 @@ class ToolManager:
             if pids:
                 desktop.bring_to_front(pids)
             self._set(State.RUNNING, self.summary(), tool, detail=window_note,
-                      elapsed=time.monotonic() - started, responding=True)
+                      elapsed=watch.elapsed(), responding=True)
             return
 
         # **ここで初めて画面を開く** (要件定義書 §7.1 / §20)。
@@ -1220,7 +1231,7 @@ class ToolManager:
         # **同じツールの画面が2枚**になり、作業状態を奪い合う
         if tool.suppresses_browser:
             self._set(State.STARTING, f"{tool.display_name}の画面を開いています...",
-                      tool, elapsed=time.monotonic() - started,
+                      tool, elapsed=watch.elapsed(),
                       phase=PHASE_OPEN_BROWSER, timeout=timeout)
             self._open_browser(running, running.url or tool.home_url, op)
         else:
@@ -1238,22 +1249,24 @@ class ToolManager:
                       "止めるときに自動では閉じないので、"
                       "不要になったタブは手で閉じてください。")
         self._set(State.RUNNING, self.summary(), tool, detail=detail,
-                  elapsed=time.monotonic() - started, responding=True)
+                  elapsed=watch.elapsed(), responding=True)
 
     def _wait_by_entries(self, tool: Tool, proc: subprocess.Popen,
                          entries: "tool_entries.Entries", timeout: float,
                          early_exit: dict, seen: dict,
-                         op: Optional[trace.Operation] = None) -> str:
+                         op: Optional[trace.Operation] = None, *,
+                         watch: Optional[Stopwatch] = None) -> str:
         """ツールの起動確認の入口が「使える」と言うまで待つ。
 
         戻り値: "entry" (使える) / "failed" / "cancelled"。起動ファイルが
         0 以外で終わり、少し待っても入口が「動いている」と言わなければ失敗。
+        PC のスリープ中の時間は数えない (`watch`)。
         """
-        began = time.monotonic()
+        watch = watch or Stopwatch()
         while True:
             if tool.app_id in self._cancelled:
                 return "cancelled"
-            elapsed = time.monotonic() - began
+            elapsed = watch.elapsed()
             code = proc.poll()
             if code is not None:
                 early_exit["code"] = code
@@ -1312,7 +1325,8 @@ class ToolManager:
 
     def _wait_app(self, tool: Tool, proc: subprocess.Popen, timeout: float,
                   early_exit: dict, seen: dict,
-                  op: Optional[trace.Operation] = None
+                  op: Optional[trace.Operation] = None, *,
+                  watch: Optional[Stopwatch] = None
                   ) -> tuple[str, Optional[dict], str]:
         """自分の窓を出すアプリの起動を待つ。`(どう起動したか, 応答, 案内)`。
 
@@ -1330,21 +1344,22 @@ class ToolManager:
         (起動中の窓が、出てきたツールの画面の上に居座らないように)。
         """
         limit = timeout if tool.health_url else min(timeout, APP_WINDOW_WAIT_SEC)
-        began = time.monotonic()
-        next_look = began + DISCOVER_EVERY_SEC
+        # 待った時間。PC のスリープ中は数えない (1.7.13)
+        watch = watch or Stopwatch()
+        next_look = time.monotonic() + DISCOVER_EVERY_SEC
         exited_at: Optional[float] = None
         while True:
             if tool.app_id in self._cancelled:
                 return "cancelled", None, ""
-            elapsed = time.monotonic() - began
+            elapsed = watch.elapsed()
             code = proc.poll()
             if code is not None:
                 early_exit["code"] = code
-                exited_at = exited_at or time.monotonic()
+                exited_at = elapsed if exited_at is None else exited_at
             pids = process_manager.tool_pids(tool, launched=proc.pid)
             if not pids:
                 if code is not None and (
-                        code != 0 or time.monotonic() - exited_at >= STUB_GRACE_SEC):
+                        code != 0 or elapsed - exited_at >= STUB_GRACE_SEC):
                     return "failed", None, ""
             elif code is not None:
                 early_exit.pop("code", None)  # 起動用の exe。本体は動いている
@@ -1391,7 +1406,8 @@ class ToolManager:
 
     def _settle_failed_start(self, tool: Tool, proc: subprocess.Popen,
                              entries: "tool_entries.Entries", seen: dict, *,
-                             op: Optional[trace.Operation] = None) -> None:
+                             op: Optional[trace.Operation] = None,
+                             watch: Optional[Stopwatch] = None) -> None:
         """起動できなかったツールのプロセスを、**誰も止められないまま残さない。**
 
         all-tools で、本体を組み立てられなかったツールの Python が待機画面で
@@ -1407,6 +1423,9 @@ class ToolManager:
           なれば動作中になる。［ツール停止］で止められる)
         * 答えないのにプロセスが残っている → 片付ける。入口があれば、まず
           入口に止めてもらう。それでも残るものだけ止める
+        * **待っているあいだに PC がスリープした** → 止めずに記録を残す (1.7.13)。
+          ツールも一緒に眠っていたので、復帰してから立ち上がりきるところかも
+          しれない。立ち上がりかけのツールを止めない
         """
         name = tool.display_name
         if entries.has_check:
@@ -1431,6 +1450,13 @@ class ToolManager:
                 self._processes.pop(tool.app_id, None)
             return
         names = process_manager.describe_pids(left)
+        if watch is not None and watch.crossed_sleep:
+            self._keep_failed(running, op=op, cause="待っているあいだに PC がスリープした")
+            self._amend_detail(running, f"{watch.note()}\n"
+                                        f"{name}のプロセスはまだ動いているので、止めていません"
+                                        f" ({names})。\n使えるようになれば、そのまま使えます。"
+                                        "止めるときは［ツール停止］を押してください。")
+            return
         if answering or desktop.has_window(left):
             self._keep_failed(running, op=op, cause="ツールはまだ準備中と答えている")
             self._amend_detail(running, f"{name}のプロセスはまだ動いています ({names})。\n"
@@ -1820,7 +1846,14 @@ class ToolManager:
         もう一度押せば起動し直せるようにする (要件定義書 §11)。
 
         何か1つでも動いていれば真。
+
+        **PC のスリープ明けは、しばらく応答が無くても数えない** (1.7.13)。
+        ツールも一緒に眠っていたので、復帰してすぐは答えが遅れることがある。
+        そこで「終了しました」と外すと、動いているツールが一覧から消える。
+        終わったのが確か (確認口が「動いていない」・ポートもプロセスも無い)
+        なら、猶予のあいだでもすぐ外す。
         """
+        waking = self._check_wake()
         with self._lock:
             targets = [(a, r) for a, r in self._running.items()
                        if a not in self._starting and a not in self._stopping]
@@ -1857,6 +1890,9 @@ class ToolManager:
                 continue
 
             # --- 応答が無い ---
+            if waking and not self._surely_ended(running, by_entry):
+                log.info("スリープ明けなので、応答が無くても待ちます: %s", app_id)
+                continue
             count = self._failures.get(app_id, 0) + 1
             self._failures[app_id] = count
             if count < limit and not self._surely_ended(running, by_entry):
@@ -1864,6 +1900,27 @@ class ToolManager:
                 continue                      # まだ判断しない
             self._lost(running, count)
         return bool(self._running)
+
+    def _check_wake(self) -> bool:
+        """見回りの間が大きく空いていたら (PC のスリープ明け)、猶予を始める。
+        猶予のあいだなら真。"""
+        interval = float(app_config.ui_setting("health_poll_seconds"))
+        limit = max(1, int(app_config.ui_setting("health_failures_before_dead")))
+        now = time.monotonic()
+        last, self._last_poll = self._last_poll, now
+        if last is not None and now - last > max(SLEEP_GAP_SEC, 3 * interval):
+            gap = now - last
+            self._wake_until = now + max(WAKE_GRACE_SEC, 2 * limit * interval)
+            with self._lock:
+                for app_id in self._failures:
+                    self._failures[app_id] = 0
+            log.info("PC がスリープから戻ったとみられます (見回りが %.0f 秒止まっていた)。"
+                     "しばらく応答が無くても外しません", gap)
+            if self._running:
+                trace.event("スリープ明け", trace.INFO,
+                            cause=f"見回りが {gap:.0f}秒止まっていた",
+                            detail="しばらく応答が無くても、動いているツールを外さない")
+        return now < self._wake_until
 
     def _surely_ended(self, running: RunningTool, by_entry: bool) -> bool:
         """応答が無いうえに、**終わったことが確か**か。確かなら回数を待たない。

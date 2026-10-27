@@ -198,6 +198,14 @@ def build_command(executable: str, url: str, profile: Path) -> list[str]:
         "--no-default-browser-check",
         # 前回落とし方が荒かったときの復元の案内を出さない
         "--disable-session-crashed-bubble",
+        # **裏に回っても・最小化しても、画面のタイマーを遅らせない** (1.7.13)。
+        # ブラウザーは見えていない画面のタイマーを間引く (長く隠れていると
+        # 1 分に 1 回)。業務ツールは画面からの心拍が途切れると「誰も見て
+        # いない」として自分で終わるので、最小化しただけで終わってしまう
+        # (他ツールの「タブ休止でサーバーが誤って終わる」と同じ形)
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
     ]
 
 

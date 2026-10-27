@@ -14,9 +14,12 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .logging_utils import get_logger
+
+if TYPE_CHECKING:
+    from .stopwatch import Stopwatch
 
 log = get_logger("health")
 
@@ -104,6 +107,7 @@ def wait_ready(url: str, app_id: str, *, timeout: float,
                interval: float = 0.5,
                on_progress: Optional[Callable[[float, Optional[dict]], None]] = None,
                should_stop: Optional[Callable[[], bool]] = None,
+               stopwatch: Optional["Stopwatch"] = None,
                ) -> Optional[dict[str, Any]]:
     """目的のツールが応答するまで待つ。時間切れなら `None`。
 
@@ -111,15 +115,20 @@ def wait_ready(url: str, app_id: str, *, timeout: float,
     のまま無反応に見えないようにするため (基盤仕様書 2.2)。
     `should_stop` が真を返したら、時間切れを待たずにあきらめる ──
     利用者が切替をやり直したときに、前の待機が居座らないようにする。
+
+    **PC のスリープ中の時間は数えない** (`stopwatch`。1.7.13)。復帰した瞬間に
+    時間切れにしない。
     """
-    started = time.monotonic()
+    from .stopwatch import Stopwatch
+
+    watch = stopwatch or Stopwatch()
     while True:
         if should_stop is not None and should_stop():
             log.info("起動待ちを中止しました: %s", url)
             return None
 
         health = probe(url)
-        elapsed = time.monotonic() - started
+        elapsed = watch.elapsed()
         if on_progress is not None:
             on_progress(elapsed, health)
 
