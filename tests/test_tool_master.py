@@ -326,6 +326,42 @@ class CatalogTests(MasterTestCase):
         self.assertIn(".bat", tool_master.check_start(r"C:\a\readme.txt"))
 
 
+class SharedFolderTests(MasterTestCase):
+    """共有フォルダーに置いたツール。朝つながる前に起動しても、その日消さない。"""
+
+    def test_置き場所に届かなければ前のまま出す(self) -> None:
+        start = self.tool_dir("nlm.nippou", "日報")
+        a = self.add_tool("日報", start)
+        b = self.add_tool("看板", self.tool_dir("nlm.kanban", "看板"))
+        self.add_pc([a, b])
+        tool_master.sync()
+        self.assertEqual(self.shown(), ["日報", "看板"])
+        real = fileprobe.probe
+
+        def offline(path, **kwargs):
+            if str(path) == start:
+                return fileprobe.Probe(fileprobe.UNKNOWN, "応答なし")
+            return real(path, **kwargs)
+
+        with mock.patch.object(fileprobe, "probe", side_effect=offline):
+            result = tool_master.sync()
+        self.assertEqual(self.shown(), ["日報", "看板"])
+        self.assertEqual(result.unreachable, ["日報"])
+        self.assertEqual(tool_registry.get("nlm.nippou").start_command, start)
+        self.assertIn("前のまま出している", result.describe())
+
+    def test_無いと確かめたら出さない(self) -> None:
+        start = self.tool_dir("nlm.nippou", "日報")
+        a = self.add_tool("日報", start)
+        self.add_pc([a])
+        tool_master.sync()
+        with mock.patch.object(fileprobe, "probe",
+                               return_value=fileprobe.Probe(fileprobe.MISSING)):
+            result = tool_master.sync()
+        self.assertEqual(self.shown(), [])
+        self.assertEqual(result.skipped, ["日報"])
+
+
 class DesktopTests(MasterTestCase):
     """1.8.1: デスクトップに置いたツール。ログインIDが違うとデスクトップの道が違う。"""
 

@@ -771,6 +771,7 @@ class SyncResult:
     skipped: list[str] = field(default_factory=list)    # 起動ファイルが無いので飛ばした
     hidden: list[str] = field(default_factory=list)     # マスタが隠したツール
     removed: list[str] = field(default_factory=list)    # マスタから消されたので消した
+    unreachable: list[str] = field(default_factory=list)  # 場所に届かないので前のまま出した
     created: bool = False
     changed: bool = False
     problem: str = ""
@@ -794,6 +795,8 @@ class SyncResult:
             text += f": {'、'.join(self.shown)}"
         if self.skipped:
             text += f" (この端末に起動ファイルが無いので出していないもの: {'、'.join(self.skipped)})"
+        if self.unreachable:
+            text += f" (置き場所に届かないので前のまま出しているもの: {'、'.join(self.unreachable)})"
         return text
 
 
@@ -862,6 +865,11 @@ def resolve_start(tool: MasterTool) -> tuple[Optional[str], str]:
     return None, " / ".join(reasons) or "起動ファイルが書かれていません"
 
 
+def _unreachable(tool: MasterTool) -> bool:
+    """起動ファイルの候補に、確かめられなかった (届かない・遅い) 場所があるか。"""
+    return any(fileprobe.probe(c).unknown for c in tool.candidates())
+
+
 def local_match(master_tool: MasterTool, tools: Iterable[Tool]) -> Optional[Tool]:
     """マスタのツールにあたる、この端末のツール (アプリID → 起動ファイルの順に探す)。"""
     tools = list(tools)
@@ -891,11 +899,20 @@ def _apply(master: Master, row: Optional[MasterPc]) -> SyncResult:
     for master_tool in wanted:
         start, why = resolve_start(master_tool)
         if start is None:
-            # **この端末に無ければ飛ばす** (知らせない)
-            log.info("起動ファイルがこの端末に無いので出しません: %s — %s",
+            # 共有フォルダーにつながらない (無いと確かめたのではない) なら、前に並べて
+            # いたツールは**前のまま出す** (朝つながる前に起動して、その日消えないように)
+            kept = (local_match(master_tool, before.values())
+                    if _unreachable(master_tool) else None)
+            if kept is None or not kept.start_command:
+                # **この端末に無ければ飛ばす** (知らせない)
+                log.info("起動ファイルがこの端末に無いので出しません: %s — %s",
+                         master_tool.label, why)
+                result.skipped.append(master_tool.label)
+                continue
+            log.info("起動ファイルの場所に届かないので、前のまま出します: %s — %s",
                      master_tool.label, why)
-            result.skipped.append(master_tool.label)
-            continue
+            result.unreachable.append(master_tool.label)
+            start = kept.start_command
         tool = _local_tool(master_tool, start, before)
         if tool.app_id in shown_ids:
             log.warning("同じツール (アプリID %s) が2つ選ばれています。2つ目は出しません: %s",
@@ -1048,7 +1065,7 @@ def _record(result: SyncResult) -> None:
     if result.state in (UNREACHABLE, ERROR):
         trace.event("ツール管理マスタ", trace.WARNING, cause=result.problem,
                     detail=str(result.path or ""))
-    elif result.changed or (result.state == APPLIED and result.skipped):
+    elif result.changed or result.unreachable or (result.state == APPLIED and result.skipped):
         trace.event("ツール管理マスタ", trace.OK,
                     cause=(f"管理番号 {result.pc.pc_no if result.pc else '?'} の行で並べた"
                            if result.state == APPLIED else "行が無いのでマスタのツールを全部"),
@@ -1058,4 +1075,7 @@ def _record(result: SyncResult) -> None:
                             + (f" / 隠す: {'、'.join(result.hidden)}"
                                if result.hidden else "")
                             + (f" / マスタから消された: {'、'.join(result.removed)}"
-                               if result.removed else "")))
+                               if result.removed else "")
+                            + (f" / 置き場所に届かないので前のまま: "
+                               f"{'、'.join(result.unreachable)}"
+                               if result.unreachable else "")))
