@@ -520,6 +520,8 @@ class SettingsDialog:
         reason = "\n".join(text for text in (reason, _port_note(found)) if text)
         row = self._add_row(tool, is_new=True)
         if self.shared:
+            # デスクトップの中なら %DESKTOP% で書く (ログインIDが違う PC でも見つかる)
+            row.path_var.set(tool_master.portable(chosen))
             # **足したツールは、この端末のバーに出す。** この端末の行があれば
             # そこにチェックを入れる (入れないと「足したのに出ない」になる)
             mine = self._this_pc_row()
@@ -1376,8 +1378,10 @@ class _ToolRow:
                   padx=12, pady=3, font=theme.FONT_SMALL,
                   cursor="hand2").pack(side="left", padx=(6, 0))
         self.path_help = tk.Label(
-            box, text="PC によって置き場所が違うときは、; で区切っていくつも書けます"
-                      " (その PC にある最初のものを使います)",
+            box, text="デスクトップの中は %DESKTOP%、ユーザーのフォルダーの中は %USERPROFILE% と"
+                      "書きます (［参照］で選ぶと自動でそう書きます)。ログインIDが違う PC でも、"
+                      "その PC のデスクトップを探します。置き場所がほかにも違うときは、; で区切って"
+                      "いくつも書けます (その PC にある最初のものを使います)",
             bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w",
             justify="left", wraplength=560)
         self.path_place = tk.Label(box, text="", bg=theme.BG, fg=theme.MUTED,
@@ -1482,7 +1486,8 @@ class _ToolRow:
             return "起動ファイルが決まっていません", theme.STATE_COLORS["starting"]
         if self.here():
             found = self.entry_path()
-            extra = f" ({found})" if len(candidates) > 1 else ""
+            extra = (f" ({found})" if len(candidates) > 1 or "%" in self.path_var.get()
+                     else "")
             return f"この端末にあります{extra}", theme.STATE_COLORS["running"]
         if self.shared:
             return ("この端末にはありません (ほかの PC 用ならこのままでかまいません。"
@@ -1598,7 +1603,8 @@ class _ToolRow:
             title=f"{self.tool.display_name} の起動ファイルを選んでください",
             initialdir=initial or None, filetypes=ENTRY_FILETYPES)
         if chosen:
-            self.path_var.set(chosen)
+            # マスタに書くときは、デスクトップの中なら %DESKTOP% で書く
+            self.path_var.set(tool_master.portable(chosen) if self.shared else chosen)
             note = ""
             found = tool_registry.probe_tool_folder(chosen)
             if self.ui_var.get() == "自動" and found.get("ui_mode"):

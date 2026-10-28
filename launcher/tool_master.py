@@ -151,7 +151,7 @@ class MasterTool:
         """起動ファイルの候補 (`;` か改行で区切って複数書ける)。環境変数は展開する。"""
         items = []
         for part in _SPLIT.split(self.start_command or ""):
-            text = os.path.expandvars(part.strip().strip('"'))
+            text = expand(part.strip().strip('"'))
             if text:
                 items.append(text)
         return items
@@ -209,6 +209,89 @@ class Master:
         if not rows:
             return None
         return sorted(rows, key=lambda p: (-p.rank(), p.pc_no))[0]
+
+
+# ------------------------------------------------------------------
+# PC ごとに違う場所 (デスクトップ・ユーザーのフォルダー)
+# ------------------------------------------------------------------
+# マスタには「この PC のデスクトップ」を `%DESKTOP%` と書く。ログインIDが違うと
+# デスクトップの道 (C:\Users\<ログインID>\Desktop、OneDrive に移したもの) が
+# 違うので、決め打ちの道では、ほかの PC で見つからない (1.8.1)
+DESKTOP_TOKEN = "%DESKTOP%"
+PROFILE_TOKEN = "%USERPROFILE%"
+_TOKEN = re.compile(r"%(DESKTOP|USERPROFILE)%", re.IGNORECASE)
+# Windows の「デスクトップ」の既知フォルダー (OneDrive に移していてもその場所を返す)
+_FOLDERID_DESKTOP = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
+
+
+def desktop_dir() -> str:
+    """この PC・このログインIDのデスクトップの道。"""
+    if os.name == "nt":
+        try:
+            import ctypes
+            import uuid
+            from ctypes import wintypes
+
+            class _Guid(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                            ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+            guid = _Guid.from_buffer_copy(uuid.UUID(_FOLDERID_DESKTOP).bytes_le)
+            found = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(
+                    ctypes.byref(guid), 0, None, ctypes.byref(found)) == 0:
+                value = found.value
+                ctypes.windll.ole32.CoTaskMemFree(found)
+                if value:
+                    return value
+        except Exception:                     # noqa: BLE001 - 取れなければ既定の場所
+            log.debug("デスクトップの場所を Windows に聞けませんでした", exc_info=True)
+    return str(Path(profile_dir()) / "Desktop")
+
+
+def profile_dir() -> str:
+    """この PC・このログインIDのユーザーのフォルダー (C:\\Users\\<ログインID>)。"""
+    return os.environ.get("USERPROFILE") or str(Path.home())
+
+
+def expand(text: str) -> str:
+    """`%DESKTOP%`・`%USERPROFILE%`・環境変数を、この PC の道にする。"""
+    def place(match: re.Match) -> str:
+        return desktop_dir() if match.group(1).upper() == "DESKTOP" else profile_dir()
+
+    # 置き換えを関数で返すと、道の「\」をそのまま使う (正規表現の書き方として読まない)
+    return os.path.expandvars(_TOKEN.sub(place, text or ""))
+
+
+def portable(text: str) -> str:
+    """マスタに書く形。デスクトップ・ユーザーのフォルダーの中なら `%DESKTOP%` などにする。
+
+    `;` 区切りの候補はそれぞれ直す。もう `%` を使っているもの・ほかの場所はそのまま。
+    """
+    parts = []
+    for part in _SPLIT.split(text or ""):
+        part = part.strip().strip('"')
+        if not part:
+            continue
+        if "%" not in part:
+            for token, base in ((DESKTOP_TOKEN, desktop_dir()), (PROFILE_TOKEN, profile_dir())):
+                rest = _inside(part, base)
+                if rest is not None:
+                    part = token + os.sep + rest.replace("/", os.sep).replace("\\", os.sep)
+                    break
+        parts.append(part)
+    return ";".join(parts)
+
+
+def _inside(path: str, base: str) -> Optional[str]:
+    """`path` が `base` の中なら、`base` から先の部分。違えば None。"""
+    if not base:
+        return None
+    full, root = normalize(path), normalize(base)
+    if root and full.startswith(root + "/"):
+        cleaned = path.strip().strip('"').replace("\\", "/")
+        return cleaned[len(root) + 1:]
+    return None
 
 
 def _fits(written: str, actual: str) -> bool:
@@ -552,7 +635,7 @@ def from_tool(tool: Tool, *, tool_no: int = 0, start_command: str = "",
               note: str = "") -> MasterTool:
     """ランチャーのツールから、マスタのツールを作る (細かい設定もいっしょに)。"""
     return MasterTool(tool_no=tool_no, name=tool.display_name,
-                      start_command=start_command or tool.start_command, note=note,
+                      start_command=portable(start_command or tool.start_command), note=note,
                       app_id=tool.app_id, start_args=tool.start_args,
                       port=tool.port, stop_method=tool.stop_method,
                       ui_mode=tool.ui_mode)

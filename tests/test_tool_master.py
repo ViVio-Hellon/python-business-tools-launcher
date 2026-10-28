@@ -326,6 +326,46 @@ class CatalogTests(MasterTestCase):
         self.assertIn(".bat", tool_master.check_start(r"C:\a\readme.txt"))
 
 
+class DesktopTests(MasterTestCase):
+    """1.8.1: デスクトップに置いたツール。ログインIDが違うとデスクトップの道が違う。"""
+
+    def desktops(self, who: str):
+        home = self.work_root / "Users" / who
+        return mock.patch.multiple(tool_master, desktop_dir=lambda: str(home / "Desktop"),
+                                   profile_dir=lambda: str(home))
+
+    def put(self, who: str) -> str:
+        root = make_tool_dir(self.work_root / "Users" / who / "Desktop", app_id="nlm.nippou",
+                             port=free_port(), display_name="日報")
+        return str(root / "start.bat")
+
+    def test_デスクトップの中は書き換えてマスタに入れる(self) -> None:
+        start = self.put("Aさん")
+        with self.desktops("Aさん"):
+            text = tool_master.portable(start)
+            self.assertTrue(text.startswith(tool_master.DESKTOP_TOKEN), text)
+            self.assertEqual(Path(tool_master.expand(text)), Path(start))
+            # ほかの場所・もう書き換えたものはそのまま
+            self.assertEqual(tool_master.portable(r"\\srv\a\start.bat"), r"\\srv\a\start.bat")
+            self.assertEqual(tool_master.portable(text), text)
+        with self.desktops("Aさん"):
+            profile = str(self.work_root / "Users" / "Aさん" / "tools" / "start.bat")
+            self.assertTrue(tool_master.portable(profile).startswith(tool_master.PROFILE_TOKEN))
+
+    def test_ログインIDが違うPCでもそのPCのデスクトップで見つける(self) -> None:
+        with self.desktops("Aさん"):
+            tool = tool_registry.Tool(app_id="nlm.nippou", display_name="日報",
+                                      start_command=self.put("Aさん"))
+            tool_master.save_tool(self.path, tool_master.from_tool(tool))
+        self.assertIn(tool_master.DESKTOP_TOKEN,
+                      tool_master.read(self.path).tools[0].start_command)
+        start_b = self.put("Bさん")
+        with self.desktops("Bさん"):
+            tool_master.sync()
+        self.assertEqual(self.shown(), ["日報"])
+        self.assertEqual(Path(tool_registry.get("nlm.nippou").start_command), Path(start_b))
+
+
 class BootTests(MasterTestCase):
     """起動したときに読む。届かなくても起動は止めず、［詳細］で知らせる。"""
 

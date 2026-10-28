@@ -246,6 +246,30 @@ class MasterTests(SettingsTestCase):
         self.run_settings(scenario)
         self.assertEqual(self.shown(), ["日報", "点検表"])
 
+    def test_デスクトップのツールはDESKTOPで書く(self) -> None:
+        self.use_master()
+        home = self.work_root / "Users" / "Aさん"
+        start = make_web_tool(home / "Desktop", "点検表", app_id="nlm.inspection", port=8736)
+        seen = {}
+
+        def scenario(dialog):
+            with self.pick(start):
+                dialog.add_tool()
+            row = dialog.rows[-1]
+            seen["path"] = row.path_var.get()
+            seen["place"] = row.path_place.cget("text")
+            dialog.save()
+
+        with mock.patch.multiple(tool_master, desktop_dir=lambda: str(home / "Desktop"),
+                                 profile_dir=lambda: str(home)):
+            dialog = self.run_settings(scenario)
+        self.assertTrue(dialog.saved, self.errors)
+        self.assertTrue(seen["path"].startswith("%DESKTOP%"), seen["path"])
+        self.assertIn("この端末にあります", seen["place"])
+        master = tool_master.read(self.path)
+        self.assertTrue(master.tools[-1].start_command.startswith("%DESKTOP%"))
+        self.assertEqual(Path(tool_registry.get("nlm.inspection").start_command), start)
+
     def test_表のチェックで出すツールを決める(self) -> None:
         self.use_master()
         tool_master.import_tools(self.path, tool_registry.all_tools(include_disabled=True))
