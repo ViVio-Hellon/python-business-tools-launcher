@@ -113,7 +113,7 @@ class FolderTests(_Base):
         self.assertEqual(names, ["README.txt", "password.json", "settings.json"])
         self.assertTrue(distribution.exists())
         self.assertIn("ツール 4件", distribution.describe())
-        self.assertIn("パスワード: あり", distribution.describe())
+        self.assertIn("パスワード: 変えてある", distribution.describe())
 
     def test_説明はメモ帳で読める形(self) -> None:
         """BOM 付き UTF-8・CRLF。古いメモ帳でも文字化けしない。"""
@@ -210,10 +210,17 @@ class PasswordTests(_Base):
         self.assertFalse(distribution.verify_password(""))
         self.assertFalse(distribution.verify_password("LINE-2024"))
 
-    def test_無ければ誰も通さない(self) -> None:
-        """「無い=誰でも」にしない。決める手順は `admin_lock` が持つ。"""
+    def test_無ければ既定のパスワードだけ通す(self) -> None:
+        """(1.7.14) はじめから既定のパスワード (nisk)。「無い=誰でも」にはしない。"""
+        self.assertFalse(distribution.has_password())
+        self.assertTrue(distribution.verify_password("nisk"))
         self.assertFalse(distribution.verify_password(""))
         self.assertFalse(distribution.verify_password("anything"))
+        self.assertFalse(distribution.verify_password("NISK"))
+
+    def test_変えたら既定のパスワードでは通らない(self) -> None:
+        distribution.set_password("line-2024")
+        self.assertFalse(distribution.verify_password("nisk"))
 
     def test_パスワードそのものは保存しない(self) -> None:
         distribution.set_password("himitsu-99")
@@ -313,28 +320,38 @@ class AdminLockTests(_Base):
     def unlock(self, script: _Script) -> bool:
         return admin_lock.unlock(script.ask, script.tell)
 
-    def test_はじめてならその場で決める(self) -> None:
-        script = _Script("line-01", "line-01")
+    def test_はじめては既定のパスワードを1回だけ尋ねる(self) -> None:
+        """(1.7.14) 以前ははじめて開くとき決めさせ、2回入力させていた。"""
+        script = _Script("nisk")
         self.assertTrue(self.unlock(script))
-        self.assertTrue(distribution.verify_password("line-01"))
-        # 配布先フォルダが無くても、そこに作る
-        self.assertTrue(distribution.password_path().exists())
+        self.assertEqual(len(script.asked), 1)
+        self.assertEqual(script.told, [], "決めてくださいの案内を出しています")
+        # 開いただけでは何も作らない
+        self.assertFalse(distribution.password_path().exists())
 
-    def test_決めずに閉じたら開かない(self) -> None:
+    def test_はじめてでも違えば開かない(self) -> None:
+        script = _Script("abcd", "efgh", "ijkl")
+        self.assertFalse(self.unlock(script))
+        self.assertFalse(distribution.exists())
+
+    def test_取り消せば開かない(self) -> None:
         self.assertFalse(self.unlock(_Script(None)))
         self.assertFalse(distribution.exists())
 
-    def test_確認が合わなければ決め直す(self) -> None:
-        script = _Script("line-01", "line-02", "line-03", "line-03")
-        self.assertTrue(self.unlock(script))
-        self.assertTrue(distribution.verify_password("line-03"))
-        self.assertFalse(distribution.verify_password("line-01"))
-        self.assertTrue(any("一致しません" in m for m in script.errors))
+    def test_変えるときも1回だけ尋ねる(self) -> None:
+        script = _Script("line-01")
+        self.assertTrue(admin_lock.choose(*_pair(script)))
+        self.assertEqual(len(script.asked), 1)
+        self.assertTrue(distribution.verify_password("line-01"))
+        self.assertFalse(distribution.verify_password("nisk"))
+        # 配布先フォルダが無くても、そこに作る
+        self.assertTrue(distribution.password_path().exists())
 
-    def test_短すぎれば決め直す(self) -> None:
-        script = _Script("ab", "abcd", "abcd")
-        self.assertTrue(self.unlock(script))
+    def test_短すぎれば尋ね直す(self) -> None:
+        script = _Script("ab", "abcd")
+        self.assertTrue(admin_lock.choose(*_pair(script)))
         self.assertTrue(any("4文字以上" in m for m in script.errors))
+        self.assertTrue(distribution.verify_password("abcd"))
 
     def test_合っていれば開く(self) -> None:
         distribution.set_password("abcd")
@@ -372,29 +389,28 @@ class AdminLockTests(_Base):
         distribution.settings_path().write_text("{broken", encoding="utf-8")
         self.assertTrue(self.unlock(_Script("abcd")))
 
-    def test_パスワードのファイルを消せば決め直せる(self) -> None:
+    def test_パスワードのファイルを消せば既定に戻る(self) -> None:
         """忘れたときの戻し方。ツールの設定は消えない。"""
         distribution.set_password("abcd")
         tool_registry.export_distribution()
         distribution.password_path().unlink()
 
-        self.assertTrue(self.unlock(_Script("efgh", "efgh")))
-        self.assertTrue(distribution.verify_password("efgh"))
+        self.assertTrue(self.unlock(_Script("nisk")))
         self.assertTrue(distribution.tools())
 
     def test_保存できなければ決めたことにしない(self) -> None:
         """「決めました」と言って保存されていないと、次に開くとき
         「パスワードがありません」に戻ってしまう。"""
-        script = _Script("abcd", "abcd")
+        script = _Script("abcd")
         with mock.patch.object(distribution, "_write",
                                side_effect=PermissionError("読み取り専用")):
-            self.assertFalse(self.unlock(script))
+            self.assertFalse(admin_lock.choose(*_pair(script)))
         self.assertFalse(distribution.has_password())
         self.assertIn("保存できません", script.errors[-1])
 
     def test_変えたら前のパスワードでは開かない(self) -> None:
         distribution.set_password("abcd")
-        self.assertTrue(admin_lock.choose(*_pair(_Script("efgh", "efgh"))))
+        self.assertTrue(admin_lock.choose(*_pair(_Script("efgh"))))
         self.assertFalse(distribution.verify_password("abcd"))
         self.assertTrue(distribution.verify_password("efgh"))
 
@@ -766,7 +782,9 @@ class RoundTripTests(_Base):
 
     def test_配った先で同じ設定とパスワードになる(self) -> None:
         # --- 配布元の端末: 一度起動して［設定］で整え、配布先フォルダを作る ---
-        self.assertTrue(admin_lock.unlock(*_pair(_Script("line-01", "line-01"))))
+        # はじめは既定のパスワードで開き、［設定］で変える (1.7.14)
+        self.assertTrue(admin_lock.unlock(*_pair(_Script("nisk"))))
+        self.assertTrue(admin_lock.choose(*_pair(_Script("line-01"))))
         tool_registry.initialize()
         tool_registry.set_start_command(NIPPOU, str(self.nippou_bat))
         tool_registry.set_start_command(CALENDAR, str(self.calendar_bat))
@@ -842,8 +860,9 @@ class InheritAndStartTests(ManagerTestCase):
         port = free_port()
         tool_dir = make_tool_dir(self.parent, app_id=NIPPOU, port=port,
                                  display_name="日報")
-        self.assertTrue(admin_lock.unlock(
-            *_pair(_Script("line-01", "line-01"))))
+        # はじめは既定のパスワードで開き、［設定］で変える (1.7.14)
+        self.assertTrue(admin_lock.unlock(*_pair(_Script("nisk"))))
+        self.assertTrue(admin_lock.choose(*_pair(_Script("line-01"))))
         tool_registry.save(tool_registry.Tool(
             app_id=NIPPOU, display_name="日報(2ライン)", port=port,
             start_command=str(tool_dir / "start.bat"),

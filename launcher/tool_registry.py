@@ -697,7 +697,11 @@ def export_distribution(*, relative: bool = True) -> Path:
                                      relative=relative,
                                      bar_position_idle=idle_bar_position(),
                                      bar_position_active=active_bar_position(),
-                                     log_dir=get_pc_setting(LOG_DIR_KEY))
+                                     log_dir=get_pc_setting(LOG_DIR_KEY),
+                                     # 配布先フォルダから受け取った場所も書き戻す
+                                     # (作り直すたびに、配った全端末がマスタを失わない)
+                                     tool_master=(get_pc_setting(TOOL_MASTER_KEY)
+                                                  or distribution.tool_master()))
 
 
 def reload_from_distribution() -> list[str]:
@@ -1390,6 +1394,10 @@ def clear_pc_setting(key: str) -> None:
 
 # ログの出力先 (［設定］で選ぶ。共有フォルダーにすれば全端末の記録が1か所に)
 LOG_DIR_KEY = "log_dir"
+
+# ツール管理マスタの場所 (［設定］で選ぶ。`tool_master`)。PC ごとに表示する
+# ツールを、前もってマスタに書いておける
+TOOL_MASTER_KEY = "tool_master"
 
 # バーの位置 (［設定］で選ぶ)。ランチャーを起動したとき・ツールを使っているとき
 BAR_POSITION_IDLE_KEY = "bar_position_idle"

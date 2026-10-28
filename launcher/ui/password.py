@@ -23,7 +23,8 @@ from . import theme
 class _Prompt:
     """伏せ字の1行入力。閉じるまで戻らない。"""
 
-    def __init__(self, parent: tk.Misc, title: str, message: str) -> None:
+    def __init__(self, parent: tk.Misc, title: str, message: str, *,
+                 masked: bool = True) -> None:
         self.value: Optional[str] = None
         # 呼び出し元がモーダルなら、閉じたあとで戻す
         previous = parent.grab_current()
@@ -41,8 +42,8 @@ class _Prompt:
                  wraplength=380).pack(fill="x", padx=16, pady=(14, 6))
         # 横から画面を見られても分からないよう、伏せ字にする
         self.var = tk.StringVar()
-        entry = tk.Entry(self.top, textvariable=self.var, show="*",
-                         width=30, font=theme.FONT)
+        entry = tk.Entry(self.top, textvariable=self.var,
+                         show="*" if masked else "", width=30, font=theme.FONT)
         entry.pack(fill="x", padx=16)
 
         buttons = tk.Frame(self.top, bg=theme.BG)
@@ -89,9 +90,9 @@ class _Prompt:
         self.top.destroy()
 
 
-def _asker(parent: tk.Misc):
+def _asker(parent: tk.Misc, *, masked: bool = True):
     def ask(title: str, message: str) -> Optional[str]:
-        return _Prompt(parent, title, message).value
+        return _Prompt(parent, title, message, masked=masked).value
     return ask
 
 
@@ -105,10 +106,13 @@ def _teller(parent: tk.Misc):
 
 
 def unlock(parent: tk.Misc) -> bool:
-    """［設定］を開いてよいか。パスワードがまだ無ければ決めてもらう。"""
+    """［設定］を開いてよいか (1回だけ尋ねる。変えるまでは既定のパスワード)。"""
     return admin_lock.unlock(_asker(parent), _teller(parent))
 
 
 def change(parent: tk.Misc) -> bool:
-    """パスワードを変える。［設定］を開けている人だけが呼べる。"""
-    return admin_lock.choose(_asker(parent), _teller(parent))
+    """パスワードを変える。［設定］を開けている人だけが呼べる。
+
+    1回だけ尋ねる代わりに、**入力欄を伏せ字にしない** (打ち間違いに気づける)。
+    """
+    return admin_lock.choose(_asker(parent, masked=False), _teller(parent))

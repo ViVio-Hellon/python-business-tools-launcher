@@ -8,6 +8,8 @@
     tell(種類, 題名, 文言)   種類は "info" か "error"
 
 パスワードそのものは配布先フォルダ (`distribution/password.json`) に置く。
+無ければ既定のパスワード (`distribution.DEFAULT_PASSWORD`)。**はじめて開くとき
+にも決めさせない・2回入力させない** (1.7.14)。変えるときも1回だけ尋ねる。
 """
 from __future__ import annotations
 
@@ -30,8 +32,7 @@ MAX_ATTEMPTS = 3
 def unlock(ask: Ask, tell: Tell) -> bool:
     """［設定］を開いてよいか。
 
-    * パスワードがまだ無い → **その場で決めてもらう** (決めなければ開かない)
-    * ある → 合っていれば開く
+    * 合っていれば開く (変えていなければ既定のパスワード)
     * パスワードのファイルが壊れている → 開かない (確かめようがない)
     """
     _, problem = distribution.load_password()
@@ -39,17 +40,9 @@ def unlock(ask: Ask, tell: Tell) -> bool:
         tell("error", TITLE,
              f"{problem}\n\n"
              "パスワードを確かめられないため、設定画面は開きません。\n"
-             f"{distribution.PASSWORD_FILE} を消すと、次に開くときに"
-             "決め直せます (ツールの設定は消えません)。")
+             f"{distribution.PASSWORD_FILE} を消すと、既定のパスワードに"
+             "戻ります (ツールの設定は消えません)。")
         return False
-
-    if not distribution.has_password():
-        tell("info", TITLE,
-             "設定を開くには管理者パスワードが必要です。\n"
-             "はじめに決めてください。\n\n"
-             "決めたパスワードは配布先フォルダに入り、フォルダーごと配ると\n"
-             "配った先の端末でも同じパスワードになります。")
-        return choose(ask, tell)
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         text = ask(TITLE, "設定を開くには、管理者パスワードを入力してください")
@@ -71,22 +64,22 @@ def unlock(ask: Ask, tell: Tell) -> bool:
 
 
 def choose(ask: Ask, tell: Tell) -> bool:
-    """新しいパスワードを決めてもらう。決まれば真。"""
+    """新しいパスワードを決めてもらう。決まれば真。
+
+    **1回だけ尋ねる** (確かめのためにもう一度、はしない)。打ち間違いに
+    気づけるよう、入力欄は伏せ字にしない (`ui.password.change`)。
+    """
     while True:
         first = ask(TITLE,
                     f"新しい管理者パスワード "
-                    f"({distribution.MIN_PASSWORD_LENGTH}文字以上)")
+                    f"({distribution.MIN_PASSWORD_LENGTH}文字以上)\n"
+                    "入力した文字はそのまま見えます。打ち間違いがないか見てから"
+                    "OK を押してください。")
         if first is None:
             return False
         problem = distribution.validate_new_password(first)
         if problem:
             tell("error", TITLE, problem)
-            continue
-        second = ask(TITLE, "確認のため、もう一度入力してください")
-        if second is None:
-            return False
-        if first != second:
-            tell("error", TITLE, "2回の入力が一致しません。もう一度決めてください。")
             continue
         break
 

@@ -32,8 +32,10 @@
   から明示的に置き換える
 
 【パスワード】
-設定とは別のファイルに置く。作り直してもパスワードは変わらず、
-パスワードを忘れたときは `password.json` だけ消せば決め直せる。
+設定とは別のファイルに置く。作り直してもパスワードは変わらない。
+**ファイルが無ければ既定のパスワード (`DEFAULT_PASSWORD`) で開く** (1.7.14。
+以前ははじめて開くときに決めさせ、2回入力させていた)。変えたパスワードを
+忘れたときは `password.json` だけ消せば、既定のパスワードに戻る。
 
 **これは誤操作を防ぐための鍵で、守りの固い鍵ではない。** このフォルダー
 を書き換えられる人なら外せる。ライン作業者が起動ファイルをうっかり
@@ -71,6 +73,10 @@ ITERATIONS = 200_000
 
 # パスワードの最短の長さ。短すぎると誤操作防止にもならない
 MIN_PASSWORD_LENGTH = 4
+
+# 変えるまでのパスワード (`password.json` が無いとき)。［設定］の
+# 「管理者パスワードを変える」で変えられる
+DEFAULT_PASSWORD = "nisk"
 
 # 差し替えを断られたときに試し直す回数と間隔
 REPLACE_ATTEMPTS = 5
@@ -294,9 +300,17 @@ def log_dir() -> str:
     return value if isinstance(value, str) else ""
 
 
+def tool_master() -> str:
+    """配布先フォルダに書かれた「ツール管理マスタの場所」。無ければ空。"""
+    data, _ = load()
+    master = (data or {}).get("tool_master")
+    value = master.get("path") if isinstance(master, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
 def export_tools(registry_tools, *, relative: bool = True,
                  bar_position_idle: str = "", bar_position_active: str = "",
-                 log_dir: str = "") -> Path:
+                 log_dir: str = "", tool_master: str = "") -> Path:
     """端末の設定から配布先フォルダを作る (作り直す)。
 
     **パスワードには触らない** (別のファイル)。作り直すたびに鍵が
@@ -339,6 +353,9 @@ def export_tools(registry_tools, *, relative: bool = True,
         # 共有フォルダーを書いておけば、配った全端末の記録が1か所に集まる
         # (端末ごとに、端末名のフォルダーに分けて書く)
         data["logs"] = {"dir": log_dir}
+    if tool_master:
+        # 配った全端末が同じマスタを読む。PC ごとの表示ツールはマスタで決まる
+        data["tool_master"] = {"path": tool_master}
     target = _write_json(settings_path(), data)
     _write_readme()
     log.info("配布先フォルダを作りました: %s (%d件)", folder(), len(items))
@@ -369,8 +386,10 @@ _README = """\
   設定済みの端末をこのフォルダーの内容で置き換えたいときは、その端末で
   ［設定］→「配布先フォルダの内容で置き換える」を押してください。
 ・ランチャーを新しい版に入れ替えるときも、このフォルダーは残してください。
-・管理者パスワードを忘れたときは password.json を消してください。
-  次に［設定］を開いたときに決め直せます (ツールの設定は消えません)。
+・password.json が無いときの管理者パスワードは、既定のもの (変えるまでの
+  パスワード) です。［設定］の「管理者パスワードを変える」で変えられます。
+・変えたパスワードを忘れたときは password.json を消してください。
+  既定のパスワードに戻ります (ツールの設定は消えません)。
 """
 
 
@@ -394,6 +413,7 @@ def load_password() -> tuple[Optional[dict], str]:
 
 
 def has_password() -> bool:
+    """パスワードを変えてあるか (`password.json` がある)。無ければ既定のパスワード。"""
     record, _ = load_password()
     return isinstance(record, dict) and bool(record.get("hash"))
 
@@ -427,8 +447,14 @@ def set_password(text: str) -> Path:
 
 
 def verify_password(text: str) -> bool:
-    """合っているか。**パスワードが無ければ常に偽。**"""
-    record, _ = load_password()
+    """合っているか。`password.json` が無ければ既定のパスワードと比べる。
+
+    ファイルが**壊れている**ときは常に偽 (確かめようがない。既定に戻さない)。
+    """
+    record, problem = load_password()
+    if record is None and not problem:
+        return hmac.compare_digest((text or "").encode("utf-8"),
+                                   DEFAULT_PASSWORD.encode("utf-8"))
     if not isinstance(record, dict) or record.get("algorithm") != ALGORITHM:
         return False
     try:
@@ -488,6 +514,6 @@ def describe() -> str:
     if broken:
         lines.append(f"  [エラー] {broken}")
     else:
-        lines.append(f"  パスワード: {'あり' if has_password() else 'なし'}")
+        lines.append(f"  パスワード: {'変えてある' if has_password() else '既定のまま'}")
     lines.append("  その端末にすでにある設定が優先されます")
     return "\n".join(lines)

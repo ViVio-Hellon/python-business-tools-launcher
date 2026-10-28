@@ -14,7 +14,9 @@
     │ ポート [8733] 起動引数 [--no-browser]         │
     │                                              │
     │ ログの出力先 [ 共有フォルダー ] [参照][既定][開く] │
-    │ 配布先フォルダ [作る] [置き換える] [パスワード] │
+    │ ツール管理マスタ [ 場所 ] [参照][開く]           │
+    │ 管理者パスワード [変える]                       │
+    │ 配布先フォルダ [作る] [置き換える]               │
     │                    [保存] [キャンセル]        │
     └──────────────────────────────────────────────┘
 """
@@ -25,9 +27,10 @@ import tkinter as tk
 from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Optional
 
 from .. import (app_config, distribution, fileprobe, tool_entries,
-               tool_registry, trace)
+               tool_master, tool_registry, trace)
 from ..logging_utils import get_logger
 from ..tool_registry import STOP_METHODS, UI_LABELS, Tool
 from . import password, theme
@@ -53,6 +56,8 @@ class SettingsDialog:
 
     def __init__(self, parent: tk.Misc) -> None:
         self.saved = False
+        # ツール管理マスタを書き換えた・反映した (［キャンセル］でもバーを描き直す)
+        self.tools_changed = False
         self.rows: list[_ToolRow] = []
 
         self.top = tk.Toplevel(parent)
@@ -83,7 +88,14 @@ class SettingsDialog:
                       "設定が出ます (ポート・停止方法・登録しないほうがよいもの)。",
                  justify="left",
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
-                 anchor="w").pack(fill="x", padx=16, pady=(0, 10))
+                 anchor="w").pack(fill="x", padx=16, pady=(0, 4))
+        # ツール管理マスタがこの端末のツールを決めているときの案内 (1.7.14)
+        self.master_banner = tk.Label(self.top, text="", bg=theme.BG,
+                                      fg=theme.STATE_COLORS["starting"],
+                                      font=theme.FONT_SMALL, anchor="w",
+                                      justify="left", wraplength=780)
+        self.master_banner.pack(fill="x", padx=16, pady=(0, 6))
+        self._update_master_banner()
 
         # ［保存］［キャンセル］は**いつも窓の下に見えている**。先に下へ置き、
         # 残りを巻物にする (ヒントが増えると、最後に置いた［保存］が画面の
@@ -95,11 +107,7 @@ class SettingsDialog:
         # ツールの行より下の設定。これも巻物の中 (行を足しても下に来る)
         self.area = tk.Frame(inner, bg=theme.BG)
         self.area.pack(fill="x")
-        tools = tool_registry.all_tools(include_disabled=True)
-        # 開いたときの設定。保存したとき**何が変わったか**を記録に残す
-        self._before_tools = list(tools)
-        for tool in tools:
-            self.rows.append(_ToolRow(self.body, tool))
+        tools = self._fill_rows()
         if not tools:
             # 出荷時は空。1行目の作り方を案内する
             self._empty_hint = tk.Label(
@@ -117,7 +125,25 @@ class SettingsDialog:
         self._build_pc_mode()
         self._build_bar_position()
         self._build_log_dir()
+        self._build_tool_master()
+        self._build_password()
         self._build_distribution()
+
+    def _fill_rows(self) -> list[Tool]:
+        """ツールの行を (作り直して) 並べる。"""
+        for row in self.rows:
+            row.box.destroy()
+        self.rows = []
+        tools = tool_registry.all_tools(include_disabled=True)
+        # 開いたときの設定。保存したとき**何が変わったか**を記録に残す
+        self._before_tools = list(tools)
+        for tool in tools:
+            self.rows.append(_ToolRow(self.body, tool))
+        hint = getattr(self, "_empty_hint", None)
+        if tools and hint is not None:
+            hint.destroy()
+            self._empty_hint = None
+        return tools
 
     def _scrollable_body(self) -> tk.Frame:
         """ツールの行と下の設定を巻物にする。窓は画面の高さに収める。"""
@@ -361,8 +387,6 @@ class SettingsDialog:
         reload.pack(side="left", padx=(8, 0))
         if not distribution.tools():
             reload.configure(state="disabled")
-        self._action_button(actions, "管理者パスワードを変える",
-                            self.change_password).pack(side="left", padx=(8, 0))
 
         # 配った先でもツールがランチャーと同じ並びに置かれるなら、相対
         # パスにしておくとドライブ名やフォルダー名が違っても動く
@@ -428,7 +452,8 @@ class SettingsDialog:
                         "場所をそのまま書きました。\n配る先でも同じ場所に"
                         "置いてください:\n  " + "\n  ".join(fixed))
         if not distribution.has_password():
-            message += "\n\n管理者パスワードが入っていません。"
+            message += ("\n\n管理者パスワードは既定のままです。"
+                        "変えるときは「管理者パスワードを変える」を押してください。")
         messagebox.showinfo("配布先フォルダ", message, parent=self.top)
         self.top.destroy()
 
@@ -463,7 +488,144 @@ class SettingsDialog:
         self.top.destroy()
 
     def change_password(self) -> None:
-        password.change(self.top)
+        if password.change(self.top):
+            self.password_state.configure(text=_password_state())
+
+    # --------------------------------------------------------------
+    # ツール管理マスタ (1.7.14)
+    # --------------------------------------------------------------
+    def _build_tool_master(self) -> None:
+        """ツール管理マスタの場所。PC ごとに出すツールを前もって決めておく。
+
+        共有フォルダーを指定し、配布先フォルダに入れて配ると、全端末が同じ
+        マスタを読む。**指定した場所に無ければ作る。**
+        """
+        self._master_before = tool_registry.get_pc_setting(tool_registry.TOOL_MASTER_KEY)
+        self.master_var = tk.StringVar(value=self._master_before)
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(12, 0))
+        tk.Label(frame, text="ツール管理マスタ", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD).pack(side="left")
+        tk.Entry(frame, textvariable=self.master_var, width=36,
+                 font=theme.FONT).pack(side="left", padx=(10, 0))
+        for text, command in (("参照", self.browse_master),
+                              ("ツール管理マスタを開く", self.open_master)):
+            self._action_button(frame, text, command).pack(side="left", padx=(6, 0))
+        shared = distribution.tool_master()
+        blank = (f"配布先フォルダの指定 ({shared})" if shared else "使いません")
+        tk.Label(self.area,
+                 text=f"空欄のとき: {blank}。フォルダーを指定すると、その中の "
+                      f"{tool_master.FILE_NAME} を使います (無ければ作ります)。"
+                      "ログインIDと PC 名ごとに、バーに出すツールを決めておけます",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w",
+                 justify="left", wraplength=640).pack(fill="x", padx=6, pady=(4, 0))
+        self.master_state = tk.Label(self.area, text="", bg=theme.BG, fg=theme.MUTED,
+                                     font=theme.FONT_SMALL, anchor="w", justify="left",
+                                     wraplength=640)
+        self.master_state.pack(fill="x", padx=6, pady=(2, 0))
+        self._update_master_state()
+
+    def _update_master_state(self) -> None:
+        result = tool_master.last_result()
+        text = f"いま: {result.describe()}" if result else ""
+        problem = result is not None and result.state in (tool_master.UNREACHABLE,
+                                                          tool_master.ERROR)
+        self.master_state.configure(
+            text=text, fg=theme.STATE_COLORS["error"] if problem else theme.MUTED)
+
+    def _update_master_banner(self) -> None:
+        result = tool_master.last_result()
+        if result is not None and result.state == tool_master.APPLIED and result.pc:
+            self.master_banner.configure(
+                text=f"この端末のバーのツールは、ツール管理マスタ (管理番号 {result.pc.pc_no})"
+                     " で決まっています。ここで［使う］を変えても、保存したとき・次に"
+                     "起動したときにマスタのとおりに戻ります (ポートなどの値は残ります)。"
+                     "出すツールを変えるときは［ツール管理マスタを開く］で。")
+        else:
+            self.master_banner.configure(text="")
+
+    def _master_path(self) -> Optional[Path]:
+        text = self.master_var.get().strip() or distribution.tool_master().strip()
+        return tool_master.path_for(text) if text else None
+
+    def browse_master(self) -> None:
+        current = self.master_var.get().strip()
+        start = tool_master.path_for(current).parent if current else Path.home()
+        chosen = filedialog.askdirectory(
+            parent=self.top, title="ツール管理マスタを置くフォルダー",
+            initialdir=str(start if os.path.isdir(start) else Path.home()))
+        if chosen:
+            self.master_var.set(str(Path(chosen)))
+
+    def open_master(self) -> None:
+        """マスタの画面を開く。閉じたら、この端末に反映して行を並べ直す。"""
+        from .master_dialog import MasterDialog
+
+        path = self._master_path()
+        if path is None:
+            messagebox.showinfo("ツール管理マスタ",
+                                "先にツール管理マスタの場所 (フォルダー) を入れてください。\n"
+                                "共有フォルダーにすると、全端末が同じマスタを読みます。",
+                                parent=self.top)
+            return
+        if self._unsaved_rows():
+            answer = messagebox.askyesnocancel(
+                "ツール管理マスタ",
+                "この画面に、保存していない変更があります。\n"
+                "保存してからツール管理マスタを開きますか?\n\n"
+                "［いいえ］なら、保存していない変更は使いません。", parent=self.top)
+            if answer is None:
+                return
+            if answer:
+                if not self._commit():
+                    return
+                self.saved = True
+        if self.master_var.get().strip() != self._master_before.strip():
+            # 場所を変えたばかり。マスタの画面より先に、この端末の設定にする
+            self._store_master_path()
+        dialog = MasterDialog(self.top, path)
+        result = tool_master.sync()
+        if dialog.changed or result.changed:
+            self.tools_changed = True
+        self._fill_rows()
+        self._update_master_state()
+        self._update_master_banner()
+
+    def _unsaved_rows(self) -> bool:
+        """ツールの行に、保存していない変更があるか。"""
+        if len(self.rows) != len(self._before_tools):
+            return True
+        for row in self.rows:
+            if row.is_new or row.marked_for_delete():
+                return True
+            tool, problem = row.collect()
+            if problem or replace(tool, updated_at="") != replace(row.tool, updated_at=""):
+                return True
+        return False
+
+    def _store_master_path(self) -> None:
+        text = self.master_var.get().strip()
+        if text:
+            tool_registry.set_pc_setting(tool_registry.TOOL_MASTER_KEY, text)
+        else:
+            tool_registry.clear_pc_setting(tool_registry.TOOL_MASTER_KEY)
+        trace.event("設定変更", trace.OK,
+                    detail=f"ツール管理マスタ「{self._master_before or '(なし)'}」→"
+                           f"「{text or '(なし)'}」")
+        self._master_before = text
+
+    # --------------------------------------------------------------
+    def _build_password(self) -> None:
+        """管理者パスワード (1.7.14 から既定のパスワードのまま使える)。"""
+        frame = tk.Frame(self.area, bg=theme.BG)
+        frame.pack(fill="x", padx=6, pady=(12, 0))
+        tk.Label(frame, text="管理者パスワード", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD).pack(side="left")
+        self.password_state = tk.Label(frame, text=_password_state(), bg=theme.BG,
+                                       fg=theme.MUTED, font=theme.FONT_SMALL)
+        self.password_state.pack(side="left", padx=(10, 0))
+        self._action_button(frame, "管理者パスワードを変える",
+                            self.change_password).pack(side="left", padx=(10, 0))
 
     def _build_buttons(self) -> None:
         frame = tk.Frame(self.top, bg=theme.BG)
@@ -576,6 +738,13 @@ class SettingsDialog:
             changes.append(f"ログの出力先「{self._log_dir_before or '(既定)'}」→"
                            f"「{log_dir or '(既定)'}」")
             trace.set_log_dir(log_dir)
+        if self.master_var.get().strip() != self._master_before.strip():
+            self._store_master_path()
+        # ツール管理マスタがこの端末のツールを決めていれば、そのとおりにそろえる
+        # (［使う］を外しても、マスタの表示ツールなら戻る)
+        result = tool_master.sync()
+        if result.changed:
+            self.tools_changed = True
         log.info("設定を保存しました (%d件 / 削除 %d件)", len(updated), len(removed))
         # 「昨日まで動いていたのに」を追うとき、**いつ何を変えたか**が要る
         if changes:
@@ -596,6 +765,7 @@ class _ToolRow:
 
         box = tk.Frame(parent, bg=theme.BG)
         box.pack(fill="x", pady=(0, 12), padx=6)
+        self.box = box
 
         title = tk.Frame(box, bg=theme.BG)
         title.pack(fill="x")
@@ -845,6 +1015,10 @@ class _ToolRow:
         if problem:
             return self.tool, problem
         return tool, ""
+
+
+def _password_state() -> str:
+    return "(変えてあります)" if distribution.has_password() else "(既定のまま)"
 
 
 def _hint_line(text: str) -> str:

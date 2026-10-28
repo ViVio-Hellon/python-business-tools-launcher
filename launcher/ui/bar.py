@@ -596,7 +596,8 @@ class LauncherBar:
         if not password.unlock(self.root):
             return
         dialog = SettingsDialog(self.root)
-        if dialog.saved:
+        # ［キャンセル］で閉じても、ツール管理マスタを書き換えて反映したなら描き直す
+        if dialog.saved or dialog.tools_changed:
             # ログの出力先が変わっていれば、書き先を移す
             logging_utils.reconfigure()
             self._build_tool_buttons()

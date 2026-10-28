@@ -63,10 +63,12 @@ ESSENTIAL_FILES = (
     "launcher/distribution.py", "launcher/fileprobe.py", "launcher/health.py",
     "launcher/logging_utils.py", "launcher/paths.py",
     "launcher/runtime_state.py", "launcher/startup_progress.py", "launcher/stopwatch.py",
-    "launcher/tool_entries.py", "launcher/tool_registry.py", "launcher/trace.py",
+    "launcher/tool_entries.py", "launcher/tool_master.py", "launcher/tool_registry.py",
+    "launcher/trace.py",
     "launcher/version_info.py",
     "launcher/ui/__init__.py", "launcher/ui/bar.py", "launcher/ui/geometry.py",
-    "launcher/ui/password.py", "launcher/ui/progress_window.py",
+    "launcher/ui/master_dialog.py", "launcher/ui/password.py",
+    "launcher/ui/progress_window.py",
     "launcher/ui/record_viewer.py", "launcher/ui/settings_dialog.py",
     "launcher/ui/splash.py", "launcher/ui/texts.py", "launcher/ui/theme.py",
     "launcher/ui/version_dialog.py",
@@ -475,10 +477,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             _, broken = distribution.load_password()
             if broken:
                 problems.append(StartupError(
-                    broken, f"{distribution.PASSWORD_FILE} を消すと決め直せます"
+                    broken, f"{distribution.PASSWORD_FILE} を消すと既定のパスワードに戻ります"
                             " (ツールの設定は消えません)"))
         except Exception as exc:              # noqa: BLE001 - 診断で落ちない
             print(f"配布先フォルダを読めませんでした: {exc}")
+        print()
+        # ツール管理マスタ。**この端末がどの行で並ぶか** (読むだけ。反映しない)
+        try:
+            from launcher import tool_master
+            print(tool_master.describe())
+        except Exception as exc:              # noqa: BLE001 - 診断で落ちない
+            print(f"ツール管理マスタを読めませんでした: {exc}")
         print()
         try:
             print(tool_registry.describe())

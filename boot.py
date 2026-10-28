@@ -9,7 +9,7 @@
 無い環境でも順番と中身を確かめられるようにするため。
 
     1. 二重起動していないか確かめる     (launch_guard)
-    2. 設定を読み込む                   (設定DB・配布先フォルダ)
+    2. 設定を読み込む                   (設定DB・配布先フォルダ・ツール管理マスタ)
     3. 動いているツールを探す           (/api/health を同時に当たる)
     4. バーを準備する
 
@@ -49,6 +49,8 @@ class BootResult:
     manager: Any = None
     # 起動中の窓を閉じたあとで出す知らせ。(題名, 本文)
     warnings: list[tuple[str, str]] = field(default_factory=list)
+    # バーの［詳細］に出す案内 (ダイアログを出すほどではないもの)
+    notices: list[str] = field(default_factory=list)
     # 段ごとにかかった秒。遅い端末で**どこが遅いか**を後から追えるように
     timings: list[tuple[str, float]] = field(default_factory=list)
 
@@ -111,6 +113,8 @@ def run(report: Report = lambda step: None, *,
                 "二重に起動することがあります。"
                 + (f"\n\n障害記録: {trace.real_path(path)}" if path else "")))
         result.manager = manager
+        for text in result.notices:
+            manager.notify(text)
         if guard.leftover is not None:
             _report_unclean_end(guard.leftover, manager)
 
@@ -261,9 +265,21 @@ def _load_settings(result: BootResult) -> None:
             f"{problem}\n\n"
             "パスワードを確かめられないため、［設定］は開けません。\n"
             f"{distribution.PASSWORD_FILE} を消すと、次に［設定］を開くときに"
-            "決め直せます (ツールの設定は消えません)。"))
+            "既定のパスワードに戻ります (ツールの設定は消えません)。"))
 
     tool_registry.initialize()
+
+    # ツール管理マスタ: この端末の行のツールだけを並べる (1.7.14)。
+    # **届かなくても起動は止めない** ── 前に読んだ内容 (設定DB) のまま並べる。
+    # 毎朝ダイアログが出ると困るので、バーの［詳細］で知らせる
+    from launcher import tool_master
+
+    synced = tool_master.sync()
+    if synced.state in (tool_master.UNREACHABLE, tool_master.ERROR):
+        result.notices.append(
+            "ツール管理マスタを読めませんでした。前に読んだ内容のままツールを並べています。\n"
+            f"{synced.problem}\n\n共有フォルダーにつながっているか確かめてください。"
+            "つながれば、次にランチャーを起動したときに読みます。")
 
     # 登録が無くなったツールの画面プロファイルを片付ける。
     # 起動時に1度だけ ── 消し忘れたキャッシュが端末に溜まらないように
