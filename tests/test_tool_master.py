@@ -225,6 +225,107 @@ class ApplyTests(MasterTestCase):
         self.assertNotIn("nlm.nippou", hidden)
 
 
+class CatalogTests(MasterTestCase):
+    """1.8.0: マスタのツールが全 PC のツールの一覧 (［設定］の［ツール］がそのまま)。"""
+
+    def test_行の無いPCにはマスタのツールを全部出す(self) -> None:
+        self.add_tool("日報", self.tool_dir("nlm.nippou", "日報"))
+        self.add_tool("看板", self.tool_dir("nlm.kanban", "看板"))
+        self.add_tool("点検表", r"C:\業務ツール\点検表\Start.vbs")    # この PC に無い
+        result = tool_master.sync()
+        self.assertEqual(result.state, tool_master.NO_ROW)
+        self.assertEqual(self.shown(), ["日報", "看板"])
+        self.assertIn("全部出しています: 日報、看板", result.describe())
+
+    def test_マスタに書いた細かい設定を使う(self) -> None:
+        start = self.tool_dir("nlm.nippou", "日報")
+        tool_master.save_tool(self.path, MasterTool(0, name="日報(現場)", start_command=start,
+                                                    app_id="nlm.nippou", port=8799,
+                                                    start_args="", stop_method="stop_bat",
+                                                    ui_mode="app"))
+        tool_master.sync()
+        tool = tool_registry.get("nlm.nippou")
+        self.assertEqual((tool.display_name, tool.port, tool.start_args, tool.stop_method,
+                          tool.ui_mode), ("日報(現場)", 8799, "", "stop_bat", "app"))
+
+    def test_マスタから消したツールはこの端末からも消す(self) -> None:
+        a = self.add_tool("日報", self.tool_dir("nlm.nippou", "日報"))
+        self.add_tool("看板", self.tool_dir("nlm.kanban", "看板"))
+        tool_registry.save(tool_registry.Tool(
+            app_id="nlm.local", display_name="この端末だけ",
+            start_command=self.tool_dir("nlm.local", "この端末だけ")))
+        tool_master.sync()
+        self.assertEqual(sorted(self.shown()), ["この端末だけ", "日報", "看板"])
+        tool_master.delete_tool(self.path, a)
+        result = tool_master.sync()
+        self.assertEqual(result.removed, ["日報"])
+        self.assertIsNone(tool_registry.get("nlm.nippou"))
+        # マスタに無かった、この端末だけのツールは残す
+        self.assertIsNotNone(tool_registry.get("nlm.local"))
+
+    def test_場所を変えても前のマスタのツールは消さない(self) -> None:
+        self.add_tool("日報", self.tool_dir("nlm.nippou", "日報"))
+        tool_master.sync()
+        tool_registry.set_pc_setting(tool_registry.TOOL_MASTER_KEY,
+                                     str(self.work_root / "other"))
+        result = tool_master.sync()
+        self.assertEqual(result.removed, [])
+        self.assertIsNotNone(tool_registry.get("nlm.nippou"))
+
+    def test_前の版のマスタも読めて列を足す(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        with sqlite3.connect(self.path) as conn:
+            conn.executescript("""
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE tools (tool_no INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL DEFAULT '', start_command TEXT NOT NULL DEFAULT '',
+                    order_no INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL DEFAULT '');
+                CREATE TABLE pcs (pc_no INTEGER PRIMARY KEY AUTOINCREMENT,
+                    login_id TEXT NOT NULL DEFAULT '', pc_name TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL DEFAULT '');
+                CREATE TABLE pc_tools (pc_no INTEGER NOT NULL, tool_no INTEGER NOT NULL,
+                    PRIMARY KEY (pc_no, tool_no));
+                INSERT INTO meta VALUES ('schema_version', '1');
+            """)
+            conn.execute("INSERT INTO tools(name, start_command, order_no) VALUES(?, ?, 10)",
+                         ("日報", self.tool_dir("nlm.nippou", "日報")))
+        master = tool_master.read(self.path)
+        self.assertEqual((master.tools[0].app_id, master.tools[0].port), ("", None))
+        tool_master.sync()
+        self.assertEqual(self.shown(), ["日報"])
+        tool_master.ensure(self.path)
+        with sqlite3.connect(self.path) as conn:
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(tools)")}
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
+        self.assertTrue({"app_id", "port", "start_args", "stop_method", "ui_mode"} <= columns)
+        self.assertEqual(version, str(tool_master.SCHEMA_VERSION))
+
+    def test_まとめて書く(self) -> None:
+        old = self.add_tool("日報", self.tool_dir("nlm.nippou", "日報"))
+        gone = self.add_tool("看板", self.tool_dir("nlm.kanban", "看板"))
+        numbers = tool_master.write_catalog(
+            self.path,
+            [MasterTool(0, name="点検表", start_command=r"C:\x\Start.vbs", app_id="nlm.i"),
+             MasterTool(old, name="日報", start_command=r"C:\x\start.bat")],
+            deleted_tools=[gone],
+            pcs=[MasterPc(0, login_id=LOGIN, pc_name=PC, tool_nos=(-1, old))],
+            known_tools=[old, gone])
+        master = tool_master.read(self.path)
+        self.assertEqual([t.name for t in master.tools], ["点検表", "日報"])
+        self.assertEqual(master.pcs[0].tool_nos, (numbers[0], old))
+        with self.assertRaises(ValueError):
+            tool_master.write_catalog(self.path, [], pcs=[MasterPc(0, login_id="a"),
+                                                         MasterPc(0, login_id="A")])
+
+    def test_起動ファイルの形(self) -> None:
+        self.assertEqual(tool_master.check_start(r"C:\a\start.bat;\\srv\a\Start.vbs"), "")
+        self.assertIn("絶対パス", tool_master.check_start(r"a\start.bat"))
+        self.assertIn(".bat", tool_master.check_start(r"C:\a\readme.txt"))
+
+
 class BootTests(MasterTestCase):
     """起動したときに読む。届かなくても起動は止めず、［詳細］で知らせる。"""
 

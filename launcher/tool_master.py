@@ -12,8 +12,10 @@
 【決まり】
 * マスタの場所は［設定］で決める (この端末の設定 → 配布先フォルダ の順)。
   決めていなければ使わない (これまでどおり［設定］の内容で並べる)
-* **指定した場所にマスタが無ければ作る** (中身は空。［設定］の
-  ［ツール管理マスタを開く］で書く)
+* **指定した場所にマスタが無ければ作る** (中身は空)
+* 1.8.0 から、**マスタのツールが全 PC のツールの一覧**。［設定］の［ツール］で
+  足す・直す・消すと、そのままマスタに書く。どの PC に出すかは［PCごとの表示］
+  (PC × ツールの表) で決める
 * この端末の行の探し方: 有効な行のうち、ログインIDと PC 名が合うもの。
   空欄は「どれでも」。両方合う行 > PC 名だけ合う行 > ログインIDだけ合う行
   > 両方空欄の行 (全端末の既定) の順に選び、同じなら管理番号の小さいほう
@@ -21,13 +23,16 @@
   (知らせない。並べるのは、この端末にあるものだけ)。起動ファイルは `;` で
   区切って複数書ける (この端末にある最初のものを使う)
 * 行が見つかれば、**表示ツール以外はバーから隠す** (消さない)。隠したツールは
-  覚えておき、行が無くなればもとに戻す。ポートなど、この端末で直した値は
-  起動ファイルが同じあいだは残す
+  覚えておき、行が無くなればもとに戻す。ポートなど、マスタに書いていない値は
+  この端末の値 (起動ファイルが同じあいだ) か、起動ファイルから読んだ値
+* **行が無い PC には、マスタのツールのうちその PC にあるものを全部出す**
+  (マスタに無い、その PC だけのツールもそのまま出す)
+* マスタから消したツールは、前にマスタから並べた PC からも消す (登録だけ)
 * マスタに届かない (共有フォルダーにつながらない) ときは、**前に読んだ
   内容のまま**起動する (設定DBに残っている)
 
 マスタは SQLite なので、共有フォルダーに置くときは WAL を使わない (既定の
-DELETE ジャーナル)。書くのは［ツール管理マスタ］の画面から、まれにだけ。
+DELETE ジャーナル)。書くのは［設定］の［保存］から、まれにだけ。
 """
 from __future__ import annotations
 
@@ -57,7 +62,9 @@ log = get_logger("tool_master")
 FILE_NAME = "launcher_ツール管理マスタ.sqlite3"
 # 場所にこの拡張子のファイルを指定したら、そのファイルを使う
 FILE_SUFFIXES = (".sqlite3", ".sqlite", ".db")
-SCHEMA_VERSION = 1
+# 2: ツールにアプリID・起動引数・ポート・停止方法・画面を足した (1.8.0)。
+# 全 PC で同じツールの一覧を使うため (［設定］の［ツール］がそのままマスタ)
+SCHEMA_VERSION = 2
 
 # 読むのを待つ上限 (秒)。共有フォルダーが遅くても、ランチャーの起動を止めない
 READ_TIMEOUT_SEC = 8.0
@@ -66,6 +73,9 @@ LOCK_TIMEOUT_SEC = 5.0
 
 # マスタが隠したツール (設定DBの PC 設定。JSON のアプリIDの並び)
 HIDDEN_KEY = "tool_master_hidden"
+# マスタのツールとして並べたことのあるツール。マスタから消されたら、この
+# 端末からも消す (消したツールがほかの PC に残り、保存でまた戻るのを防ぐ)
+MANAGED_KEY = "tool_master_managed"
 
 # 起動ファイルの区切り (複数書ける)
 _SPLIT = re.compile(r"[;\n]")
@@ -82,7 +92,12 @@ CREATE TABLE IF NOT EXISTS tools (
     order_no      INTEGER NOT NULL DEFAULT 0,
     note          TEXT NOT NULL DEFAULT '',
     updated_at    TEXT NOT NULL DEFAULT '',
-    updated_by    TEXT NOT NULL DEFAULT ''
+    updated_by    TEXT NOT NULL DEFAULT '',
+    app_id        TEXT NOT NULL DEFAULT '',
+    start_args    TEXT,
+    port          INTEGER,
+    stop_method   TEXT NOT NULL DEFAULT '',
+    ui_mode       TEXT
 );
 CREATE TABLE IF NOT EXISTS pcs (
     pc_no      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +114,14 @@ CREATE TABLE IF NOT EXISTS pc_tools (
     PRIMARY KEY (pc_no, tool_no)
 );
 """
+
+# 1.7.14 で作ったマスタに無い列 (ensure() で足す)。NULL は「決めていない」
+# (この端末の値・起動ファイルから読んだ値を使う)
+_TOOL_COLUMNS_V2 = (("app_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("start_args", "TEXT"),
+                    ("port", "INTEGER"),
+                    ("stop_method", "TEXT NOT NULL DEFAULT ''"),
+                    ("ui_mode", "TEXT"))
 
 
 class MasterError(Exception):
@@ -117,6 +140,12 @@ class MasterTool:
     start_command: str = ""
     order_no: int = 0
     note: str = ""
+    # 1.8.0 から。None は「決めていない」(起動ファイルから読む・この端末の値)
+    app_id: str = ""
+    start_args: Optional[str] = None
+    port: Optional[int] = None
+    stop_method: str = ""
+    ui_mode: Optional[str] = None
 
     def candidates(self) -> list[str]:
         """起動ファイルの候補 (`;` か改行で区切って複数書ける)。環境変数は展開する。"""
@@ -265,9 +294,14 @@ def ensure(path: Path) -> bool:
             from exc
     with _open(path) as conn:
         conn.executescript(_SCHEMA)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(tools)")}
+        for name, kind in _TOOL_COLUMNS_V2:
+            if name not in columns:
+                conn.execute(f"ALTER TABLE tools ADD COLUMN {name} {kind}")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                     (str(SCHEMA_VERSION),))
         now = _now()
-        for key, value in (("schema_version", str(SCHEMA_VERSION)),
-                           ("created_at", now),
+        for key, value in (("created_at", now),
                            ("created_on", this_pc()[1]),
                            ("created_by", this_pc()[0])):
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
@@ -284,12 +318,8 @@ def read(path: Path) -> Master:
         raise MasterError(f"ツール管理マスタがありません: {path}")
     with _open(path) as conn:
         try:
-            tools = tuple(
-                MasterTool(tool_no=r["tool_no"], name=r["name"],
-                           start_command=r["start_command"], order_no=r["order_no"],
-                           note=r["note"])
-                for r in conn.execute(
-                    "SELECT * FROM tools ORDER BY order_no, tool_no"))
+            tools = tuple(_tool_of(r) for r in conn.execute(
+                "SELECT * FROM tools ORDER BY order_no, tool_no"))
             links: dict[int, list[int]] = {}
             for r in conn.execute("SELECT pc_no, tool_no FROM pc_tools"):
                 links.setdefault(r["pc_no"], []).append(r["tool_no"])
@@ -301,6 +331,22 @@ def read(path: Path) -> Master:
         except sqlite3.Error as exc:
             raise MasterError(f"ツール管理マスタの形が違います: {path} ({exc})") from exc
     return Master(path=path, tools=tools, pcs=pcs)
+
+
+def _tool_of(r: sqlite3.Row) -> MasterTool:
+    keys = set(r.keys())
+
+    def col(name: str, default=None):
+        return r[name] if name in keys else default
+
+    port = col("port")
+    return MasterTool(tool_no=r["tool_no"], name=r["name"] or "",
+                      start_command=r["start_command"] or "", order_no=r["order_no"],
+                      note=r["note"] or "", app_id=col("app_id", "") or "",
+                      start_args=col("start_args"),
+                      port=int(port) if port is not None else None,
+                      stop_method=col("stop_method", "") or "",
+                      ui_mode=col("ui_mode"))
 
 
 def _read_waiting(path: Path, timeout: float = READ_TIMEOUT_SEC) -> Master:
@@ -324,6 +370,39 @@ def _read_waiting(path: Path, timeout: float = READ_TIMEOUT_SEC) -> Master:
     return box["master"]
 
 
+def load(path: Path, *, create: bool = True) -> Master:
+    """［設定］が開くときに読む。無ければ作る (`create`)。待つのは `READ_TIMEOUT_SEC` まで。"""
+    found = fileprobe.probe(path)
+    if found.unknown:
+        raise MasterError(f"届きません: {path} ({found.reason})")
+    if not found.found:
+        if not create:
+            raise MasterError(f"ありません: {path}")
+        ensure(path)
+    return _read_waiting(path)
+
+
+def as_tool(master_tool: MasterTool, tools: Iterable[Tool]) -> Tool:
+    """［設定］の［ツール］に出す形。起動ファイルはマスタに書いたまま (候補が複数でも)。
+
+    この端末にあたるツールがあればその値をもとにし、マスタに書いた値で上書きする。
+    """
+    before = {t.app_id: t for t in tools}
+    start, _why = resolve_start(master_tool)
+    candidates = master_tool.candidates()
+    tool = _local_tool(master_tool, start or (candidates[0] if candidates else ""), before)
+    return replace(tool, start_command=master_tool.start_command.strip())
+
+
+def check_pcs(pcs: Iterable[MasterPc]) -> str:
+    """同じログインID・PC 名の行が2つ無いか。あれば理由。"""
+    try:
+        _check_duplicates(pcs)
+    except ValueError as exc:
+        return str(exc)
+    return ""
+
+
 def save_tool(path: Path, tool: MasterTool) -> int:
     """ツールを書く (`tool_no` が 0 なら足す)。番号を返す。"""
     if not tool.start_command.strip():
@@ -333,18 +412,50 @@ def save_tool(path: Path, tool: MasterTool) -> int:
             raise ValueError(f"起動ファイルは .bat・.vbs・.exe にしてください: {part}")
     ensure(path)
     with _open(path) as conn:
-        values = (tool.name.strip(), tool.start_command.strip(), tool.note.strip(),
-                  _now(), this_pc()[0])
-        if tool.tool_no:
-            conn.execute("""UPDATE tools SET name = ?, start_command = ?, note = ?,
-                              updated_at = ?, updated_by = ? WHERE tool_no = ?""",
-                         (*values, tool.tool_no))
-            return tool.tool_no
-        order = conn.execute("SELECT COALESCE(MAX(order_no), 0) + 10 FROM tools").fetchone()[0]
-        cur = conn.execute("""INSERT INTO tools(name, start_command, note, updated_at,
-                                                updated_by, order_no)
-                              VALUES(?, ?, ?, ?, ?, ?)""", (*values, order))
-        return int(cur.lastrowid)
+        return _write_tool(conn, tool, order_no=None)
+
+
+_TOOL_FIELDS = ("name", "start_command", "note", "app_id", "start_args", "port",
+                "stop_method", "ui_mode", "updated_at", "updated_by")
+
+
+def _write_tool(conn: sqlite3.Connection, tool: MasterTool, *,
+                order_no: Optional[int]) -> int:
+    values = (tool.name.strip(), tool.start_command.strip(), tool.note.strip(),
+              tool.app_id.strip(), tool.start_args, tool.port, tool.stop_method.strip(),
+              tool.ui_mode, _now(), this_pc()[0])
+    if tool.tool_no and conn.execute("SELECT 1 FROM tools WHERE tool_no = ?",
+                                     (tool.tool_no,)).fetchone():
+        sets = ", ".join(f"{name} = ?" for name in _TOOL_FIELDS)
+        extra = (order_no,) if order_no is not None else ()
+        conn.execute(f"UPDATE tools SET {sets}"
+                     + (", order_no = ?" if order_no is not None else "")
+                     + " WHERE tool_no = ?", (*values, *extra, tool.tool_no))
+        return tool.tool_no
+    if order_no is None:
+        order_no = conn.execute(
+            "SELECT COALESCE(MAX(order_no), 0) + 10 FROM tools").fetchone()[0]
+    cur = conn.execute(f"INSERT INTO tools({', '.join(_TOOL_FIELDS)}, order_no) "
+                       f"VALUES({', '.join('?' * (len(_TOOL_FIELDS) + 1))})",
+                       (*values, order_no))
+    return int(cur.lastrowid)
+
+
+def check_start(text: str) -> str:
+    """マスタに書く起動ファイル (`;` 区切りで複数可) の形を確かめる。問題があれば理由。
+
+    **この端末に無くてもよい** (ほかの PC にだけあるツールもある)。形だけ見る。
+    """
+    parts = MasterTool(0, start_command=text).candidates()
+    if not parts:
+        return "起動ファイルを入れてください"
+    for part in parts:
+        if Path(part).suffix.lower() not in tool_registry.ENTRY_SUFFIXES:
+            return f"起動ファイルは .bat・.vbs・.exe にしてください: {part}"
+        if not (Path(part).is_absolute() or part.startswith("\\\\")
+                or re.match(r"^[A-Za-z]:[\\/]", part)):
+            return f"起動ファイルは絶対パスで書いてください: {part}"
+    return ""
 
 
 def delete_tool(path: Path, tool_no: int) -> None:
@@ -431,10 +542,94 @@ def import_tools(path: Path, tools: Iterable[Tool]) -> list[str]:
         start = tool.start_command.strip()
         if not start or normalize(start) in known:
             continue
-        save_tool(path, MasterTool(tool_no=0, name=tool.display_name, start_command=start))
+        save_tool(path, from_tool(tool))
         known.add(normalize(start))
         added.append(tool.display_name or tool.app_id)
     return added
+
+
+def from_tool(tool: Tool, *, tool_no: int = 0, start_command: str = "",
+              note: str = "") -> MasterTool:
+    """ランチャーのツールから、マスタのツールを作る (細かい設定もいっしょに)。"""
+    return MasterTool(tool_no=tool_no, name=tool.display_name,
+                      start_command=start_command or tool.start_command, note=note,
+                      app_id=tool.app_id, start_args=tool.start_args,
+                      port=tool.port, stop_method=tool.stop_method,
+                      ui_mode=tool.ui_mode)
+
+
+def write_catalog(path: Path, tools: list[MasterTool], *,
+                  deleted_tools: Iterable[int] = (),
+                  pcs: Iterable[MasterPc] = (), deleted_pcs: Iterable[int] = (),
+                  known_tools: Iterable[int] = ()) -> list[int]:
+    """［設定］の［保存］。ツール (この並び)・PC の行を **1回で** 書く。
+
+    `pcs` の `tool_nos` は、正の数ならマスタの番号、負の数 `-(i+1)` なら
+    `tools[i]` (まだ番号の無い新しいツール)。`known_tools` は画面を開いたときに
+    あったツールの番号。**画面を開いたあとでほかの PC が足したツール** は
+    消さず、行との結びつきも残す (知らないものは触らない)。
+
+    同じログインID・PC 名の行が2つになるときは `ValueError` (何も書かない)。
+    戻り値は `tools` と同じ並びの番号。
+    """
+    pcs = list(pcs)
+    deleted_pcs = set(deleted_pcs)
+    ensure(path)
+    with _open(path) as conn:
+        edited = {pc.pc_no for pc in pcs if pc.pc_no}
+        others = [MasterPc(pc_no=r["pc_no"], login_id=r["login_id"], pc_name=r["pc_name"])
+                  for r in conn.execute("SELECT pc_no, login_id, pc_name FROM pcs")
+                  if r["pc_no"] not in edited and r["pc_no"] not in deleted_pcs]
+        _check_duplicates(others + pcs)
+        numbers = [_write_tool(conn, tool, order_no=position * 10)
+                   for position, tool in enumerate(tools, start=1)]
+        for tool_no in deleted_tools:
+            conn.execute("DELETE FROM pc_tools WHERE tool_no = ?", (tool_no,))
+            conn.execute("DELETE FROM tools WHERE tool_no = ?", (tool_no,))
+        for pc_no in deleted_pcs:
+            conn.execute("DELETE FROM pc_tools WHERE pc_no = ?", (pc_no,))
+            conn.execute("DELETE FROM pcs WHERE pc_no = ?", (pc_no,))
+        known = set(known_tools) | set(numbers)
+        existing = {r[0] for r in conn.execute("SELECT tool_no FROM tools")}
+        for pc in pcs:
+            values = (pc.login_id.strip(), pc.pc_name.strip(), 1 if pc.enabled else 0,
+                      pc.note.strip(), _now(), this_pc()[0])
+            if pc.pc_no and conn.execute("SELECT 1 FROM pcs WHERE pc_no = ?",
+                                         (pc.pc_no,)).fetchone():
+                conn.execute("""UPDATE pcs SET login_id = ?, pc_name = ?, enabled = ?,
+                                  note = ?, updated_at = ?, updated_by = ?
+                                WHERE pc_no = ?""", (*values, pc.pc_no))
+                number = pc.pc_no
+            else:
+                number = int(conn.execute(
+                    """INSERT INTO pcs(login_id, pc_name, enabled, note, updated_at,
+                                       updated_by) VALUES(?, ?, ?, ?, ?, ?)""",
+                    values).lastrowid)
+            # 画面が知っているツールとの結びつきだけ入れ直す
+            for (tool_no,) in conn.execute("SELECT tool_no FROM pc_tools WHERE pc_no = ?",
+                                           (number,)).fetchall():
+                if tool_no in known:
+                    conn.execute("DELETE FROM pc_tools WHERE pc_no = ? AND tool_no = ?",
+                                 (number, tool_no))
+            for ref in dict.fromkeys(pc.tool_nos):
+                tool_no = numbers[-ref - 1] if ref < 0 else ref
+                if tool_no in existing:
+                    conn.execute("INSERT OR IGNORE INTO pc_tools(pc_no, tool_no) "
+                                 "VALUES(?, ?)", (number, tool_no))
+    return numbers
+
+
+def _check_duplicates(pcs: Iterable[MasterPc]) -> None:
+    seen: dict[tuple[str, str], MasterPc] = {}
+    for pc in pcs:
+        key = (pc.login_id.strip().casefold(), pc.pc_name.strip().casefold())
+        if key in seen:
+            first = seen[key]
+            who = " / ".join(text for text in (pc.login_id.strip(), pc.pc_name.strip())
+                             if text) or "(どちらも空欄)"
+            where = f"管理番号 {first.pc_no}" if first.pc_no else "新しい行"
+            raise ValueError(f"同じログインID・PC名の行が2つあります: {who} ({where} と重なります)")
+        seen[key] = pc
 
 
 def _now() -> str:
@@ -492,6 +687,7 @@ class SyncResult:
     shown: list[str] = field(default_factory=list)      # 並べたツール
     skipped: list[str] = field(default_factory=list)    # 起動ファイルが無いので飛ばした
     hidden: list[str] = field(default_factory=list)     # マスタが隠したツール
+    removed: list[str] = field(default_factory=list)    # マスタから消されたので消した
     created: bool = False
     changed: bool = False
     problem: str = ""
@@ -505,7 +701,11 @@ class SyncResult:
         if self.state in (UNREACHABLE, ERROR):
             return f"読めません。前に読んだ内容のまま並べています ({self.problem})"
         if self.state == NO_ROW:
-            return (f"{who} の行がありません。［設定］の内容で並べています")
+            text = (f"{who} の行がありません。マスタのツールのうち、この端末にあるものを"
+                    "全部出しています")
+            if self.shown:
+                text += f": {'、'.join(self.shown)}"
+            return text
         text = f"{who} は管理番号 {self.pc.pc_no if self.pc else '?'} の行で並べています"
         if self.shown:
             text += f": {'、'.join(self.shown)}"
@@ -542,6 +742,7 @@ def _sync(*, create: bool) -> SyncResult:
     text, _source = configured()
     if not text:
         changed = _restore_hidden()
+        _set_managed([])
         return SyncResult(OFF, changed=changed)
     path = path_for(text)
     found = fileprobe.probe(path)
@@ -562,11 +763,7 @@ def _sync(*, create: bool) -> SyncResult:
         return SyncResult(UNREACHABLE if "遅い" in str(exc) else ERROR,
                           path=path, problem=str(exc), created=created)
     login, pc_name = this_pc()
-    row = master.row_for(login, pc_name)
-    if row is None:
-        changed = _restore_hidden()
-        return SyncResult(NO_ROW, path=path, created=created, changed=changed)
-    result = _apply(master, row)
+    result = _apply(master, master.row_for(login, pc_name))
     result.path, result.created = path, created
     return result
 
@@ -582,14 +779,33 @@ def resolve_start(tool: MasterTool) -> tuple[Optional[str], str]:
     return None, " / ".join(reasons) or "起動ファイルが書かれていません"
 
 
-def _apply(master: Master, row: MasterPc) -> SyncResult:
-    result = SyncResult(APPLIED, pc=row)
+def local_match(master_tool: MasterTool, tools: Iterable[Tool]) -> Optional[Tool]:
+    """マスタのツールにあたる、この端末のツール (アプリID → 起動ファイルの順に探す)。"""
+    tools = list(tools)
+    if master_tool.app_id.strip():
+        found = next((t for t in tools if t.app_id == master_tool.app_id.strip()), None)
+        if found is not None:
+            return found
+    starts = {normalize(c) for c in master_tool.candidates()}
+    return next((t for t in tools if t.start_command
+                 and normalize(t.start_command) in starts), None)
+
+
+def _apply(master: Master, row: Optional[MasterPc]) -> SyncResult:
+    """この端末のツールを、マスタのとおりにそろえる。
+
+    * 行があれば、その行の表示ツールだけを出す (ほかは隠す)
+    * 行が無ければ、**マスタのツールのうちこの端末にあるもの全部**を出す。
+      マスタに無い、この端末だけのツールはそのまま
+    * どちらでも、マスタから消されたツール (前にマスタから並べたもの) は消す
+    """
+    result = SyncResult(APPLIED if row is not None else NO_ROW, pc=row)
     before = {t.app_id: t for t in tool_registry.all_tools(include_disabled=True)}
-    by_start = {normalize(t.start_command): t for t in before.values() if t.start_command}
+    wanted = master.tools_of(row) if row is not None else list(master.tools)
     shown_ids: list[str] = []
     after: dict[str, Tool] = {}
     order = 10
-    for master_tool in master.tools_of(row):
+    for master_tool in wanted:
         start, why = resolve_start(master_tool)
         if start is None:
             # **この端末に無ければ飛ばす** (知らせない)
@@ -597,27 +813,43 @@ def _apply(master: Master, row: MasterPc) -> SyncResult:
                      master_tool.label, why)
             result.skipped.append(master_tool.label)
             continue
-        tool = by_start.get(normalize(start)) or _from_start(master_tool, start, before)
+        tool = _local_tool(master_tool, start, before)
         if tool.app_id in shown_ids:
             log.warning("同じツール (アプリID %s) が2つ選ばれています。2つ目は出しません: %s",
                         tool.app_id, master_tool.label)
             result.skipped.append(master_tool.label)
             continue
-        tool = replace(tool, enabled=True, order_no=order,
-                       display_name=master_tool.name.strip() or tool.display_name)
+        tool = replace(tool, enabled=True, order_no=order)
         order += 10
         shown_ids.append(tool.app_id)
         after[tool.app_id] = tool
         result.shown.append(tool.display_name)
 
-    # 前に隠したもの (まだ登録があるもの) と、今回隠すもの
-    hidden = (set(_hidden()) & set(before)) - set(shown_ids)
-    for app_id, tool in before.items():
-        if app_id in after:
-            continue
-        if tool.enabled:
-            hidden.add(app_id)
-            after[app_id] = replace(tool, enabled=False)
+    # マスタのツールにあたる、この端末のツール
+    in_master = {t.app_id for t in before.values()
+                 if any(local_match(m, [t]) for m in master.tools)} | set(shown_ids)
+    removed = [a for a in _managed(master.path) if a in before and a not in in_master]
+    for app_id in removed:
+        # マスタから消されたツール。この端末からも消す (登録だけ。ツール本体は消さない)
+        tool_registry.delete_tool(app_id)
+        result.removed.append(before[app_id].display_name)
+        result.changed = True
+    _set_managed(sorted(in_master & (set(before) | set(after))), master.path)
+
+    hidden = (set(_hidden()) & set(before)) - set(shown_ids) - set(removed)
+    if row is not None:
+        for app_id, tool in before.items():
+            if app_id in after or app_id in removed:
+                continue
+            if tool.enabled:
+                hidden.add(app_id)
+                after[app_id] = replace(tool, enabled=False)
+    else:
+        # 行が無くなった: 前に隠したものを戻す
+        for app_id in hidden:
+            if not before[app_id].enabled:
+                after[app_id] = replace(before[app_id], enabled=True)
+        hidden = set()
     for app_id, tool in after.items():
         old = before.get(app_id)
         if old is None or _differs(old, tool):
@@ -628,6 +860,31 @@ def _apply(master: Master, row: MasterPc) -> SyncResult:
     return result
 
 
+def _local_tool(master_tool: MasterTool, start: str, before: dict[str, Tool]) -> Tool:
+    """マスタのツールから、この端末のランチャーのツールを作る。
+
+    この端末にもうあり、起動ファイルが同じなら、その値 (ポートなど) をもとにする。
+    マスタに書いてある値 (None でないもの) はマスタを使う。
+    """
+    existing = local_match(master_tool, before.values())
+    if existing is not None and normalize(existing.start_command) == normalize(start):
+        tool = existing
+    else:
+        tool = _from_start(master_tool, start, before)
+    changes: dict = {}
+    if master_tool.name.strip():
+        changes["display_name"] = master_tool.name.strip()
+    if master_tool.start_args is not None:
+        changes["start_args"] = master_tool.start_args
+    if master_tool.port is not None:
+        changes["port"] = int(master_tool.port)
+    if master_tool.stop_method.strip():
+        changes["stop_method"] = master_tool.stop_method.strip()
+    if master_tool.ui_mode is not None:
+        changes["ui_mode"] = master_tool.ui_mode
+    return replace(tool, **changes)
+
+
 def _from_start(master_tool: MasterTool, start: str, before: dict[str, Tool]) -> Tool:
     """マスタの起動ファイルから、ランチャーのツールを作る (［＋ ツールを追加］と同じ読み方)。
 
@@ -636,9 +893,9 @@ def _from_start(master_tool: MasterTool, start: str, before: dict[str, Tool]) ->
     """
     found = tool_registry.probe_tool_folder(start)
     entry = Path(start)
-    app_id = found.get("app_id") or (tool_registry.exe_app_id(entry)
-                                     if entry.suffix.lower() == ".exe"
-                                     else tool_registry.script_app_id(entry))
+    app_id = (master_tool.app_id.strip() or found.get("app_id")
+              or (tool_registry.exe_app_id(entry) if entry.suffix.lower() == ".exe"
+                  else tool_registry.script_app_id(entry)))
     args, _why = tool_registry.recommend_start_args(start)
     name = (master_tool.name.strip() or found.get("display_name")
             or entry.parent.name or entry.stem)
@@ -667,6 +924,27 @@ def _set_hidden(app_ids: list[str]) -> None:
         tool_registry.clear_pc_setting(HIDDEN_KEY)
 
 
+def _managed(path: Path) -> list[str]:
+    """前にこのマスタ (`path`) から並べたツール。**ほかのマスタのものは返さない**
+    (マスタの場所を変えたとき、前のマスタのツールを消さないため)。"""
+    try:
+        value = json.loads(tool_registry.get_pc_setting(MANAGED_KEY) or "{}")
+    except ValueError:
+        return []
+    if not isinstance(value, dict) or value.get("path") != normalize(str(path)):
+        return []
+    ids = value.get("app_ids")
+    return [str(v) for v in ids] if isinstance(ids, list) else []
+
+
+def _set_managed(app_ids: list[str], path: Optional[Path] = None) -> None:
+    if app_ids and path is not None:
+        tool_registry.set_pc_setting(MANAGED_KEY, json.dumps(
+            {"path": normalize(str(path)), "app_ids": app_ids}, ensure_ascii=False))
+    elif tool_registry.get_pc_setting(MANAGED_KEY):
+        tool_registry.clear_pc_setting(MANAGED_KEY)
+
+
 def _restore_hidden() -> bool:
     """マスタが隠したツールを戻す (この端末の行が無くなった・マスタをやめた)。"""
     changed = False
@@ -687,11 +965,14 @@ def _record(result: SyncResult) -> None:
     if result.state in (UNREACHABLE, ERROR):
         trace.event("ツール管理マスタ", trace.WARNING, cause=result.problem,
                     detail=str(result.path or ""))
-    elif result.state == APPLIED and (result.changed or result.skipped):
+    elif result.changed or (result.state == APPLIED and result.skipped):
         trace.event("ツール管理マスタ", trace.OK,
-                    cause=f"管理番号 {result.pc.pc_no if result.pc else '?'} の行で並べた",
+                    cause=(f"管理番号 {result.pc.pc_no if result.pc else '?'} の行で並べた"
+                           if result.state == APPLIED else "行が無いのでマスタのツールを全部"),
                     detail=(f"出す: {'、'.join(result.shown) or 'なし'}"
                             + (f" / 起動ファイルが無い: {'、'.join(result.skipped)}"
                                if result.skipped else "")
                             + (f" / 隠す: {'、'.join(result.hidden)}"
-                               if result.hidden else "")))
+                               if result.hidden else "")
+                            + (f" / マスタから消された: {'、'.join(result.removed)}"
+                               if result.removed else "")))

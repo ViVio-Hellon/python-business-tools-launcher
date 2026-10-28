@@ -1,7 +1,12 @@
-"""ツール管理マスタの画面と、［設定］のマスタ・パスワードの欄 (1.7.14)
+"""［設定］の画面 (1.8.0 で作り直した: 見出し・ツールの一覧と詳細・PC × ツールの表)
 
-画面の部品をそのまま動かし、ダイアログ (messagebox) と待ち (wait_window) だけを
-差し替える。
+画面の部品をそのまま動かし、ダイアログ (messagebox・filedialog) と待ち
+(wait_window) だけを差し替える。
+
+1.7.14 で言われたこと:
+* ［＋］でツールを足しても、マスタを開くと消えている (一覧が2つあった)
+* PC の行を足そうとすると「先に［ツール］でツールを登録してください」と断られる
+→ ツールの一覧は1つ。PC の行はツールより先に足せる。［保存］は1つ。
 """
 from __future__ import annotations
 
@@ -31,10 +36,9 @@ class UiTestCase(LocalAreaTestCase):
         super().setUp()
         import tkinter as tk
 
-        from launcher.ui import master_dialog, settings_dialog
+        from launcher.ui import settings_dialog
 
         self.tk = tk
-        self.master_module = master_dialog
         self.settings_module = settings_dialog
         patcher = mock.patch.dict(os.environ, {"USERNAME": LOGIN, "COMPUTERNAME": PC})
         patcher.start()
@@ -54,13 +58,15 @@ class UiTestCase(LocalAreaTestCase):
         self.path = tool_master.path_for(str(self.shared))
         self.questions: list[str] = []
         self.answer: object = True
-        for module in (master_dialog, settings_dialog):
-            for name, effect in (("showerror", None), ("showinfo", None),
-                                 ("askyesno", self._ask), ("askyesnocancel", self._ask)):
-                patch = mock.patch.object(module.messagebox, name,
-                                          side_effect=effect)
-                patch.start()
-                self.addCleanup(patch.stop)
+        self.errors: list[str] = []
+        for name, effect in (("showerror", self._error), ("showinfo", None),
+                             ("askyesno", self._ask), ("askyesnocancel", self._ask)):
+            patch = mock.patch.object(settings_dialog.messagebox, name, side_effect=effect)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _error(self, title, text, **_):
+        self.errors.append(text)
 
     def _ask(self, title, text, **_):
         self.questions.append(text)
@@ -93,180 +99,72 @@ class UiTestCase(LocalAreaTestCase):
         return holder.get("dialog")
 
 
-class MasterDialogTests(UiTestCase):
-
-    def labels(self, dialog) -> list[str]:
-        return [w.cget("text") for w in dialog.table.inner.winfo_children()
-                if isinstance(w, self.tk.Label)]
-
-    def test_開くとマスタを作って書ける(self) -> None:
-        seen = {}
-
-        def scenario(dialog):
-            self.assertTrue(self.path.exists(), "マスタを作っていません")
-            self.assertEqual(dialog.store_tool(MasterTool(0, name="日報",
-                                                          start_command=str(self.daily))), "")
-            self.assertEqual(dialog.store_tool(MasterTool(0, name="看板",
-                                                          start_command=str(self.board))), "")
-            dialog.show_tab(self.master_module.PC_TAB)
-            nos = tuple(t.tool_no for t in dialog.master.tools)
-            self.assertEqual(dialog.store_pc(MasterPc(0, login_id=LOGIN, pc_name=PC,
-                                                      tool_nos=nos[:1], note="管理用")), "")
-            seen["labels"] = self.labels(dialog)
-            seen["here"] = dialog.here.cget("text")
-            # 同じ組み合わせの行はもう作れない (理由を返し、編集の窓は閉じない)
-            seen["dup"] = dialog.store_pc(MasterPc(0, login_id=LOGIN, pc_name=PC))
-
-        dialog = self.run_modal(self.master_module.MasterDialog, self.parent, self.path,
-                                scenario=scenario)
-        self.assertTrue(dialog.changed)
-        self.assertIn("管理用", seen["labels"])
-        self.assertIn("日報", seen["labels"])
-        self.assertIn("管理番号 1 の行で並べます (日報)", seen["here"])
-        self.assertIn("管理番号 1", seen["dup"])
-
-    def test_今の設定から取り込んで消す(self) -> None:
-        def scenario(dialog):
-            dialog.show_tab(self.master_module.TOOL_TAB)
-            dialog.import_current()
-            self.assertEqual([t.label for t in dialog.master.tools], ["日報", "看板"])
-            dialog.delete_tool(dialog.master.tools[1])
-            self.assertEqual([t.label for t in dialog.master.tools], ["日報"])
-
-        self.run_modal(self.master_module.MasterDialog, self.parent, self.path,
-                       scenario=scenario)
-        self.assertTrue(any("消します" in q for q in self.questions))
-
-    def test_ツールが無ければ先にツールを登録させる(self) -> None:
-        def scenario(dialog):
-            with mock.patch.object(self.master_module, "PcEditor") as editor:
-                dialog.add_this_pc()
-            editor.assert_not_called()
-            self.assertEqual(dialog.tab, self.master_module.TOOL_TAB)
-
-        self.run_modal(self.master_module.MasterDialog, self.parent, self.path,
-                       scenario=scenario)
-
-
-class EditorTests(UiTestCase):
-
-    def test_PCの行の編集はこの端末の値と選んだツールを返す(self) -> None:
-        tool_master.ensure(self.path)
-        a = tool_master.save_tool(self.path, MasterTool(0, name="日報",
-                                                        start_command=str(self.daily)))
-        b = tool_master.save_tool(self.path, MasterTool(0, name="看板",
-                                                        start_command=str(self.board)))
-        master = tool_master.read(self.path)
-        saved = []
-        answers = iter(["同じ行があります", ""])
-
-        def on_save(pc):
-            saved.append(pc)
-            return next(answers)
-
-        def scenario(editor):
-            dict(editor.tool_vars)[b].set(True)
-            editor.note_var.set("HVC")
-            editor.save()
-            self.assertIn("同じ行があります", editor.error.cget("text"))
-            editor.save()
-
-        self.run_modal(self.master_module.PcEditor, self.parent, master,
-                       MasterPc(0, login_id=LOGIN, pc_name=PC, tool_nos=(a,)),
-                       on_save=on_save, scenario=scenario)
-        self.assertEqual(saved[-1], MasterPc(0, login_id=LOGIN, pc_name=PC,
-                                             tool_nos=(a, b), enabled=True, note="HVC"))
-
-    def test_ツールの編集(self) -> None:
-        saved = []
-
-        def scenario(editor):
-            editor.name_var.set("日報")
-            editor.start_var.set(str(self.daily))
-            editor.save()
-
-        self.run_modal(self.master_module.ToolEditor, self.parent, MasterTool(0),
-                       on_save=lambda tool: saved.append(tool) or "", scenario=scenario)
-        self.assertEqual(saved[0].start_command, str(self.daily))
-
-
-class SettingsMasterTests(UiTestCase):
+class SettingsTestCase(UiTestCase):
 
     def run_settings(self, scenario):
         return self.run_modal(self.settings_module.SettingsDialog, self.parent,
                               scenario=scenario)
 
-    def test_場所を入れて保存するとマスタを作り反映する(self) -> None:
+    def use_master(self) -> None:
+        tool_registry.set_pc_setting(tool_registry.TOOL_MASTER_KEY, str(self.shared))
+        tool_master.ensure(self.path)
+
+    def pick(self, start: Path):
+        """［＋ ツールを追加］のファイル選択で `start` を選ぶ。"""
+        return mock.patch.object(self.settings_module.filedialog, "askopenfilename",
+                                 return_value=str(start))
+
+    @staticmethod
+    def row(dialog, app_id: str):
+        return next(r for r in dialog.rows if r.app_id_var.get() == app_id)
+
+    def shown(self) -> list[str]:
+        return [t.display_name for t in tool_registry.all_tools()]
+
+
+class LayoutTests(SettingsTestCase):
+
+    def test_見出しを切り替えても入力は残り保存は1つ(self) -> None:
+        seen = {}
+
         def scenario(dialog):
-            dialog.master_var.set(str(self.shared))
+            self.assertEqual([k for k, _ in self.settings_module.SECTIONS],
+                             ["tools", "pcs", "local", "records", "password"])
+            self.row(dialog, "nlm.nippou").name_var.set("日報(2ライン)")
+            for key, _ in self.settings_module.SECTIONS:
+                dialog.show_section(key)
+                dialog.top.update()
+                seen.setdefault("saves", []).append(sum(
+                    1 for w in _walk(dialog.top) if isinstance(w, self.tk.Button)
+                    and w.cget("text") == "保存" and w.winfo_ismapped()))
+            dialog.mode_var.set("中板")
             dialog.save()
 
         dialog = self.run_settings(scenario)
         self.assertTrue(dialog.saved)
-        self.assertEqual(tool_registry.get_pc_setting(tool_registry.TOOL_MASTER_KEY),
-                         str(self.shared))
-        self.assertTrue(self.path.exists())
-        self.assertEqual(tool_master.last_result().state, tool_master.NO_ROW)
+        self.assertEqual(seen["saves"], [1, 1, 1, 1, 1], "［保存］がいつも1つ見えていません")
+        self.assertEqual(tool_registry.get("nlm.nippou").display_name, "日報(2ライン)")
+        self.assertEqual(tool_registry.pc_mode(), "中板")
 
-    def test_マスタの行があればそのツールだけにして案内を出す(self) -> None:
-        tool_registry.set_pc_setting(tool_registry.TOOL_MASTER_KEY, str(self.shared))
-        tool_master.ensure(self.path)
-        a = tool_master.save_tool(self.path, MasterTool(0, name="日報",
-                                                        start_command=str(self.daily)))
-        tool_master.save_pc(self.path, MasterPc(0, login_id=LOGIN, pc_name=PC, tool_nos=(a,)))
-        tool_master.sync()
+    def test_一覧で選ぶと右に詳しい設定が出る(self) -> None:
         seen = {}
 
         def scenario(dialog):
-            seen["banner"] = dialog.master_banner.cget("text")
-            seen["state"] = dialog.master_state.cget("text")
-            # ［使う］を外しても、保存すればマスタのとおりに戻る
-            row = next(r for r in dialog.rows if r.tool.app_id == "nlm.nippou")
-            row.enabled_var.set(False)
+            dialog.top.update()
+            seen["first"] = dialog.rows[0].box.winfo_ismapped()
+            dialog.select(dialog.rows[1])
+            dialog.top.update()
+            seen["mapped"] = [r.box.winfo_ismapped() for r in dialog.rows]
+            dialog.move_selected(-1)
             dialog.save()
 
         self.run_settings(scenario)
-        self.assertIn("管理番号 1", seen["banner"])
-        self.assertIn("管理番号 1 の行で並べています", seen["state"])
-        self.assertEqual([t.display_name for t in tool_registry.all_tools()], ["日報"])
+        self.assertTrue(seen["first"])
+        self.assertEqual(seen["mapped"], [False, True])
+        # 並べ替えはバーの並びになる
+        self.assertEqual(self.shown(), ["看板", "日報"])
 
-    def test_保存していない変更があればマスタを開く前に聞く(self) -> None:
-        tool_registry.set_pc_setting(tool_registry.TOOL_MASTER_KEY, str(self.shared))
-        self.answer = None                    # ［キャンセル］
-
-        def scenario(dialog):
-            dialog.rows[0].name_var.set("日報(2ライン)")
-            with mock.patch.object(self.master_module, "MasterDialog") as opened:
-                dialog.open_master()
-            opened.assert_not_called()
-
-        self.run_settings(scenario)
-        self.assertTrue(any("保存していない変更" in q for q in self.questions))
-
-    def test_マスタを閉じたら行を並べ直してバーを描き直す(self) -> None:
-        tool_registry.set_pc_setting(tool_registry.TOOL_MASTER_KEY, str(self.shared))
-        tool_master.ensure(self.path)
-        a = tool_master.save_tool(self.path, MasterTool(0, name="看板",
-                                                        start_command=str(self.board)))
-
-        class FakeMaster:
-            def __init__(fake, parent, path):
-                tool_master.save_pc(path, MasterPc(0, login_id=LOGIN, pc_name=PC,
-                                                   tool_nos=(a,)))
-                fake.changed = True
-
-        seen = {}
-
-        def scenario(dialog):
-            with mock.patch.object(self.master_module, "MasterDialog", FakeMaster):
-                dialog.open_master()
-            seen["rows"] = {r.tool.app_id: r.enabled_var.get() for r in dialog.rows}
-
-        dialog = self.run_settings(scenario)
-        self.assertTrue(dialog.tools_changed)
-        self.assertEqual(seen["rows"], {"nlm.nippou": False, "nlm.kanban": True})
-
-    def test_パスワードの欄が見える所にある(self) -> None:
+    def test_パスワードの欄がある(self) -> None:
         seen = {}
 
         def scenario(dialog):
@@ -277,6 +175,195 @@ class SettingsMasterTests(UiTestCase):
         distribution.set_password("line-01")
         self.run_settings(scenario)
         self.assertEqual(seen["state"], "(変えてあります)")
+
+
+class MasterTests(SettingsTestCase):
+
+    def test_ここで場所を決めると足したツールもマスタに入る(self) -> None:
+        """1.7.14 の「＋で足してもマスタを開くと消えている」。"""
+        third = make_web_tool(self.work_root, "点検表", app_id="nlm.inspection", port=8736)
+
+        def scenario(dialog):
+            with self.pick(third):
+                dialog.add_tool()
+            dialog.show_section("pcs")
+            dialog.master_var.set(str(self.shared))
+            dialog.use_master()
+            self.assertTrue(dialog.shared)
+            self.assertEqual([r.label() for r in dialog.rows], ["日報", "看板", "点検表"])
+            dialog.add_this_pc()
+            dialog.save()
+
+        dialog = self.run_settings(scenario)
+        self.assertTrue(dialog.saved, self.errors)
+        master = tool_master.read(self.path)
+        self.assertEqual([t.name for t in master.tools], ["日報", "看板", "点検表"])
+        self.assertEqual([t.app_id for t in master.tools],
+                         ["nlm.nippou", "nlm.kanban", "nlm.inspection"])
+        self.assertEqual(master.tools[2].port, 8736)
+        self.assertEqual(len(master.pcs), 1)
+        self.assertEqual((master.pcs[0].login_id, master.pcs[0].pc_name), (LOGIN, PC))
+        self.assertEqual(len(master.pcs[0].tool_nos), 3)
+        self.assertEqual(self.shown(), ["日報", "看板", "点検表"])
+        self.assertEqual(tool_master.last_result().state, tool_master.APPLIED)
+
+    def test_PCの行はツールより先に足せる(self) -> None:
+        """1.7.14 の「先に［ツール］でツールを登録してください」。"""
+        for tool in tool_registry.all_tools(include_disabled=True):
+            tool_registry.delete_tool(tool.app_id)
+        self.use_master()
+
+        def scenario(dialog):
+            self.assertEqual(dialog.rows, [])
+            dialog.show_section("pcs")
+            dialog.add_pc()
+            dialog.pc_rows[-1].login_var.set("Xfa-Ngyshizai")
+            dialog.pc_rows[-1].pc_var.set("NLM-NGY-250962")
+            dialog.pc_rows[-1].note_var.set("倉庫右")
+            dialog.save()
+
+        dialog = self.run_settings(scenario)
+        self.assertTrue(dialog.saved, self.errors)
+        master = tool_master.read(self.path)
+        self.assertEqual([(p.login_id, p.pc_name, p.note, p.tool_nos) for p in master.pcs],
+                         [("Xfa-Ngyshizai", "NLM-NGY-250962", "倉庫右", ())])
+
+    def test_足したツールはこの端末の行に入る(self) -> None:
+        self.use_master()
+        a = tool_master.save_tool(self.path, MasterTool(0, name="日報",
+                                                        start_command=str(self.daily)))
+        tool_master.save_pc(self.path, MasterPc(0, login_id=LOGIN, pc_name=PC, tool_nos=(a,)))
+        tool_master.sync()
+        self.assertEqual(self.shown(), ["日報"])
+        third = make_web_tool(self.work_root, "点検表", app_id="nlm.inspection", port=8736)
+
+        def scenario(dialog):
+            with self.pick(third):
+                dialog.add_tool()
+            self.assertIn("この端末の行 (管理番号 1)", dialog.rows[-1].note.cget("text"))
+            dialog.save()
+
+        self.run_settings(scenario)
+        self.assertEqual(self.shown(), ["日報", "点検表"])
+
+    def test_表のチェックで出すツールを決める(self) -> None:
+        self.use_master()
+        tool_master.import_tools(self.path, tool_registry.all_tools(include_disabled=True))
+        master = tool_master.read(self.path)
+        tool_master.save_pc(self.path, MasterPc(0, login_id=LOGIN, pc_name=PC,
+                                                tool_nos=tuple(t.tool_no for t in master.tools)))
+        tool_master.save_pc(self.path, MasterPc(0, login_id=LOGIN, pc_name="OTHER-PC"))
+        seen = {}
+
+        def scenario(dialog):
+            dialog.show_section("pcs")
+            dialog.top.update()
+            mine = dialog._this_pc_row()
+            seen["mine"] = mine.pc_no
+            kanban = self.row(dialog, "nlm.kanban")
+            mine.set(kanban, False)
+            dialog.pc_rows[1].set(kanban, True)
+            dialog.save()
+
+        self.run_settings(scenario)
+        self.assertEqual(seen["mine"], 1)
+        self.assertEqual(self.shown(), ["日報"])
+        master = tool_master.read(self.path)
+        kanban = next(t.tool_no for t in master.tools if t.app_id == "nlm.kanban")
+        self.assertEqual(master.pcs[1].tool_nos, (kanban,))
+
+    def test_マスタから消すとこの端末からも消える(self) -> None:
+        self.use_master()
+        tool_master.import_tools(self.path, tool_registry.all_tools(include_disabled=True))
+        tool_master.sync()
+
+        def scenario(dialog):
+            self.row(dialog, "nlm.kanban").delete_var.set(True)
+            dialog.save()
+
+        self.run_settings(scenario)
+        self.assertTrue(any("全 PC のバーから消えます" in q for q in self.questions))
+        self.assertEqual([t.name for t in tool_master.read(self.path).tools], ["日報"])
+        self.assertIsNone(tool_registry.get("nlm.kanban"))
+
+    def test_同じログインIDとPC名の行は保存しない(self) -> None:
+        self.use_master()
+
+        def scenario(dialog):
+            dialog.add_this_pc()
+            dialog.add_pc()
+            dialog.pc_rows[-1].login_var.set(LOGIN.lower())
+            dialog.pc_rows[-1].pc_var.set(PC)
+            dialog.save()
+
+        dialog = self.run_settings(scenario)
+        self.assertFalse(dialog.saved)
+        self.assertIn("同じログインID・PC名の行が2つあります", self.errors[0])
+        self.assertEqual(tool_master.read(self.path).pcs, ())
+
+    def test_開いたあとでほかのPCが足したツールは消さない(self) -> None:
+        self.use_master()
+        tool_master.import_tools(self.path, tool_registry.all_tools(include_disabled=True))
+        other = {}
+
+        def scenario(dialog):
+            other["no"] = tool_master.save_tool(
+                self.path, MasterTool(0, name="点検表",
+                                      start_command=r"C:\業務ツール\点検表\Start.vbs"))
+            pc = tool_master.save_pc(self.path, MasterPc(0, login_id="X", pc_name="Y",
+                                                         tool_nos=(other["no"],)))
+            other["pc"] = pc
+            dialog.save()
+
+        self.run_settings(scenario)
+        master = tool_master.read(self.path)
+        self.assertIn("点検表", [t.name for t in master.tools])
+        self.assertEqual(next(p for p in master.pcs if p.pc_no == other["pc"]).tool_nos,
+                         (other["no"],))
+
+    def test_起動ファイルは候補をいくつも書ける(self) -> None:
+        self.use_master()
+        tool_master.import_tools(self.path, tool_registry.all_tools(include_disabled=True))
+        both = r"C:\無い場所\日報\start.bat;" + str(self.daily)
+
+        def scenario(dialog):
+            row = self.row(dialog, "nlm.nippou")
+            row.path_var.set(both)
+            row.refresh_hints()
+            self.assertEqual(row.entry_path(), str(self.daily))
+            self.assertTrue(row.here())
+            dialog.save()
+
+        dialog = self.run_settings(scenario)
+        self.assertTrue(dialog.saved, self.errors)
+        self.assertEqual(tool_master.read(self.path).tools[0].start_command, both)
+        self.assertEqual(tool_registry.get("nlm.nippou").start_command, str(self.daily))
+
+    def test_読めないマスタならこの端末だけ直す(self) -> None:
+        self.use_master()
+        seen = {}
+
+        def scenario(dialog):
+            seen["shared"] = dialog.shared
+            seen["status"] = dialog.status.cget("text")
+            self.row(dialog, "nlm.nippou").port_var.set("8799")
+            dialog.save()
+
+        with mock.patch.object(tool_master, "load",
+                               side_effect=tool_master.MasterError("届きません: 応答なし")), \
+                mock.patch.object(tool_master, "sync"):
+            dialog = self.run_settings(scenario)
+        self.assertTrue(dialog.saved, self.errors)
+        self.assertFalse(seen["shared"])
+        self.assertIn("読めません", seen["status"])
+        self.assertEqual(tool_registry.get("nlm.nippou").port, 8799)
+        self.assertEqual(tool_master.read(self.path).tools, ())
+
+
+def _walk(widget):
+    for child in widget.winfo_children():
+        yield child
+        yield from _walk(child)
 
 
 @unittest.skipUnless(have_tk(), "tkinter と画面が要る")

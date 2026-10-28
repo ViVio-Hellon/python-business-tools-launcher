@@ -67,7 +67,7 @@ ESSENTIAL_FILES = (
     "launcher/trace.py",
     "launcher/version_info.py",
     "launcher/ui/__init__.py", "launcher/ui/bar.py", "launcher/ui/geometry.py",
-    "launcher/ui/master_dialog.py", "launcher/ui/password.py",
+    "launcher/ui/password.py",
     "launcher/ui/progress_window.py",
     "launcher/ui/record_viewer.py", "launcher/ui/settings_dialog.py",
     "launcher/ui/splash.py", "launcher/ui/texts.py", "launcher/ui/theme.py",
