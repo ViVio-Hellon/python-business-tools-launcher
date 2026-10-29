@@ -971,8 +971,8 @@ def looks_like_desktop_app(entry: Path) -> bool:
     """起動ファイル (bat / vbs) が、**自分の窓を出す Python のツール**を起こすか。
 
     次がそろうとき: ツールの入口 (`launcher_check.bat` など) が無い・ツールの
-    直下の .py が tkinter を使い、`--no-browser` (ランチャーの画面で開く Web の
-    ツールの印) を知らない。pythonw で起こすことだけでは決めない ── Web の
+    直下の .py が tkinter か pygame を使う (または requirements.txt が pygame を
+    求める)・`--no-browser` (ランチャーの画面で開く Web のツールの印) を知らない。pythonw で起こすことだけでは決めない ── Web の
     ツールの Start.vbs も pythonw で起こす (ふつうは config/app.json のポートで、
     呼ぶ前に外れている)。素性のファイルが**ポートを持たない**と言っていれば、
     `--no-browser` があっても窓のツール (Web から作り直した Ainputcollect。1.7.10)。
@@ -986,7 +986,8 @@ def looks_like_desktop_app(entry: Path) -> bool:
     except OSError:
         return False
     texts = [_read_text_head(script) for script in scripts]
-    if not any("tkinter" in text for text in texts):
+    if not (any(lib in text for text in texts for lib in WINDOW_LIBRARIES)
+            or _requires_window_library(entry.parent)):
         return False
     declared = _read_app_json(entry)
     if declared.get("app_id") and not _first_port(declared.get("server")):
@@ -995,6 +996,24 @@ def looks_like_desktop_app(entry: Path) -> bool:
         return True
     # ランチャーの画面を知っている = Web のツール
     return not any(NO_BROWSER_ARG in text for text in texts)
+
+
+# 自分の窓を出す Python の部品。tkinter (photo-cleaner・Ainputcollect) と
+# pygame (ゲーム。neon-coil-zero。1.8.3)
+WINDOW_LIBRARIES = ("tkinter", "pygame")
+
+
+def _requires_window_library(folder: Path) -> bool:
+    """requirements.txt が窓の部品 (pygame・pygame-ce) を求めているか。
+
+    pygame のゲームは、直下の main.py が `game` の中を呼ぶだけで、pygame の
+    import は直下に無いことが多い (neon-coil-zero)。
+    """
+    for line in _read_text_head(folder / "requirements.txt", 20_000).splitlines():
+        name = re.split(r"[<>=!~;\[\s]", line.strip().lower(), maxsplit=1)[0]
+        if name in ("pygame", "pygame-ce"):
+            return True
+    return False
 
 
 def _read_text_head(path: Path, limit: int = 200_000) -> str:
