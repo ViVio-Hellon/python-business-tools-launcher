@@ -245,8 +245,12 @@ class CatalogTests(MasterTestCase):
                                                     ui_mode="app"))
         tool_master.sync()
         tool = tool_registry.get("nlm.nippou")
-        self.assertEqual((tool.display_name, tool.port, tool.start_args, tool.stop_method,
-                          tool.ui_mode), ("日報(現場)", 8799, "", "stop_bat", "app"))
+        self.assertEqual((tool.display_name, tool.start_args, tool.stop_method,
+                          tool.ui_mode), ("日報(現場)", "", "stop_bat", "app"))
+        # ポートだけは、ツール自身の設定 (config/app.json) が言う番号が勝つ (1.8.5。
+        # ツールはその番号で待ち受ける)
+        self.assertEqual(tool.port, tool_registry.declared_port(start))
+        self.assertNotEqual(tool.port, 8799)
 
     def test_マスタから消したツールはこの端末からも消す(self) -> None:
         a = self.add_tool("日報", self.tool_dir("nlm.nippou", "日報"))

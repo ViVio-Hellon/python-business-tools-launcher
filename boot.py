@@ -281,6 +281,18 @@ def _load_settings(result: BootResult) -> None:
             f"{synced.problem}\n\n共有フォルダーにつながっているか確かめてください。"
             "つながれば、次にランチャーを起動したときに読みます。")
 
+    # ツールが自分のポートを変えていたら (DBビューア 0.37.0: 8743 → 8790)、登録を合わせる。
+    # 古い番号のままだと、その番号を使うほかのツールに問い合わせてしまう
+    try:
+        moved = tool_registry.follow_declared_ports()
+    except Exception:                         # noqa: BLE001 - 起動を止めない
+        log.warning("ツールのポートを確かめられませんでした", exc_info=True)
+        moved = []
+    if moved:
+        trace.event("ポートをツールの設定に合わせた", trace.OK, detail="、".join(moved))
+        result.notices.append("ツールが使うポートが変わっていたので、登録を合わせました"
+                              " (ツールの config/app.json の番号):\n  " + "\n  ".join(moved))
+
     # 登録が無くなったツールの画面プロファイルを片付ける。
     # 起動時に1度だけ ── 消し忘れたキャッシュが端末に溜まらないように
     try:

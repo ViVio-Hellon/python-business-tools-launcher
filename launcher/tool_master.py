@@ -978,6 +978,13 @@ def _local_tool(master_tool: MasterTool, start: str, before: dict[str, Tool]) ->
         changes["start_args"] = master_tool.start_args
     if master_tool.port is not None:
         changes["port"] = int(master_tool.port)
+        # ツール自身の設定のポートが違えば、そちらを使う (ツールはその番号で待ち受ける。
+        # マスタに古い番号が残っていても、全 PC で古い番号を見に行かせない。1.8.5)
+        declared = tool_registry.declared_port(start) if master_tool.port else 0
+        if declared and declared != master_tool.port:
+            log.info("マスタのポート %s ではなく、ツールの設定の %s を使います: %s",
+                     master_tool.port, declared, master_tool.label)
+            changes["port"] = declared
     if master_tool.stop_method.strip():
         changes["stop_method"] = master_tool.stop_method.strip()
     if master_tool.ui_mode is not None:

@@ -1117,6 +1117,48 @@ def port_retry(tool: Tool) -> int:
     return max((v for v in values if isinstance(v, int) and v > 0), default=0)
 
 
+def declared_port(start_command: str) -> int:
+    """ツール自身の設定 (`config/app.json`) が言う、待ち受けのポート。
+
+    **言い切れないときは 0**: 起動ファイルが exe (app.json のポートはブラウザー版のもの)・
+    役割でポートが違う (どれを使うかは PC ごと)・設定ファイルが無い・ポートを持たない。
+    """
+    path = (start_command or "").strip().strip('"')
+    if not path or Path(path).suffix.lower() == ".exe":
+        return 0
+    found = probe_tool_folder(path)
+    if found.get("role_ports"):
+        return 0
+    return int(found.get("port") or 0)
+
+
+def follow_declared_ports() -> list[str]:
+    """ツールの設定のポートが変わっていたら、登録をそれに合わせる (1.8.5)。
+
+    ツールは自分の `config/app.json` の番号で待ち受ける。登録は**登録したときの番号**
+    のままなので、ツールが番号を変えると (DBビューア 0.37.0: 8743 → 8790)、ランチャーは
+    古い番号 (ほかのツールが使っているかもしれない) を見に行く。ポートが空の登録
+    (exe・窓のツール) と、言い切れないもの (`declared_port` が 0) は触らない。
+
+    変えたものを「名前: 古い → 新しい」で返す。起動ファイルは**まとめて確かめてから**
+    読む (つながらない共有フォルダーで待たない)。
+    """
+    tools = [t for t in all_tools(include_disabled=True) if t.port > 0 and t.start_command]
+    found = fileprobe.probe_many(t.start_command for t in tools)
+    changes = []
+    for tool in tools:
+        probe = found.get(tool.start_command.strip().strip('"'))
+        if probe is None or not probe.found:
+            continue
+        new = declared_port(tool.start_command)
+        if new and new != tool.port:
+            save(replace(tool, port=new))
+            changes.append(f"{tool.display_name or tool.app_id}: {tool.port} → {new}")
+            log.info("ツールの設定に合わせてポートを変えました: %s %s → %s",
+                     tool.app_id, tool.port, new)
+    return changes
+
+
 # ------------------------------------------------------------------
 # 起動引数を決める
 # ------------------------------------------------------------------
