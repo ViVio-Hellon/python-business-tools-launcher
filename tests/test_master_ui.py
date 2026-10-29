@@ -164,6 +164,23 @@ class LayoutTests(SettingsTestCase):
         # 並べ替えはバーの並びになる
         self.assertEqual(self.shown(), ["看板", "日報"])
 
+    def test_ツールが多いときのバーと配布先フォルダの場所(self) -> None:
+        from launcher import distribution as dist
+        seen = {}
+
+        def scenario(dialog):
+            dialog.show_section("records")
+            dialog.top.update()
+            seen["where"] = [w.cget("text") for w in _walk(dialog.top)
+                             if isinstance(w, self.tk.Label)
+                             and str(w.cget("text")).startswith("場所: ")]
+            dialog.select_over_var.set("4")
+            dialog.save()
+
+        self.run_settings(scenario)
+        self.assertEqual(seen["where"], [f"場所: {dist.folder()}"])
+        self.assertEqual(tool_registry.bar_select_over(), 4)
+
     def test_パスワードの欄がある(self) -> None:
         seen = {}
 
@@ -309,6 +326,41 @@ class MasterTests(SettingsTestCase):
         self.assertTrue(any("全 PC のバーから消えます" in q for q in self.questions))
         self.assertEqual([t.name for t in tool_master.read(self.path).tools], ["日報"])
         self.assertIsNone(tool_registry.get("nlm.kanban"))
+
+    def test_表は案Bの形でこの端末の行がいちばん上(self) -> None:
+        self.use_master()
+        tool_master.import_tools(self.path, tool_registry.all_tools(include_disabled=True))
+        master = tool_master.read(self.path)
+        tool_master.save_pc(self.path, MasterPc(0, login_id=LOGIN, pc_name="OTHER-PC"))
+        tool_master.save_pc(self.path, MasterPc(0, login_id=LOGIN, pc_name=PC,
+                                                tool_nos=(master.tools[0].tool_no,)))
+        seen = {}
+
+        def scenario(dialog):
+            dialog.show_section("pcs")
+            dialog.top.update()
+            top_row = dialog.matrix_inner.grid_slaves(row=0, column=0)[0]
+            seen["first"] = top_row.winfo_children()[0].cget("text")
+            checks = [w for w in _walk(dialog.matrix_inner)
+                      if isinstance(w, self.settings_module._Check)]
+            seen["checks"] = len(checks)
+            # 大きいチェックを押すと、その行・その列が変わる
+            mine = dialog._this_pc_row()
+            kanban = self.row(dialog, "nlm.kanban")
+            before = mine.has(kanban)
+            next(c for c in checks if c.var is mine.var(kanban)).toggle()
+            seen["toggled"] = (before, mine.has(kanban))
+            # 見出しを押すと、そのツールの詳しい設定へ
+            dialog._open_tool(kanban)
+            seen["section"] = (dialog.current_section, dialog.selected is kanban)
+            dialog.save()
+
+        self.run_settings(scenario)
+        self.assertEqual(seen["first"], "2 ★", "この端末の行がいちばん上にありません")
+        self.assertEqual(seen["checks"], 2 * 2 + 2)       # 2行 × (ツール2 + 有効)
+        self.assertEqual(seen["toggled"], (False, True))
+        self.assertEqual(seen["section"], ("tools", True))
+        self.assertEqual(self.shown(), ["日報", "看板"])
 
     def test_同じログインIDとPC名の行は保存しない(self) -> None:
         self.use_master()

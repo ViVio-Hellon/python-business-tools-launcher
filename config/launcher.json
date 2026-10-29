@@ -12,7 +12,8 @@
     "health_poll_seconds": 5,
     "health_failures_before_dead": 3,
     "start_timeout_seconds": 90,
-    "stop_timeout_seconds": 30
+    "stop_timeout_seconds": 30,
+    "select_over": 6
   },
   "browser": {
     "mode": "app_window",

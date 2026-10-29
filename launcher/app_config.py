@@ -55,6 +55,9 @@ _FALLBACK: dict[str, Any] = {
         "health_failures_before_dead": 3,
         "start_timeout_seconds": 90,
         "stop_timeout_seconds": 30,
+        # ツールがこの数を超えたら、バーはボタンを並べず「選ぶ ▼」と［開く］にする
+        # (0 = いつもボタン)。［設定］の「この端末」で PC ごとに変えられる
+        "select_over": 6,
     },
     "tools": [],
     "logs": {

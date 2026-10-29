@@ -1464,6 +1464,33 @@ def set_active_bar_position(value: str) -> None:
     _set_bar_position(BAR_POSITION_ACTIVE_KEY, value)
 
 
+# バーを「選ぶ ▼」の形にするツールの数 (これを超えたら)。0 = いつもボタン (1.8.4)
+BAR_SELECT_OVER_KEY = "bar_select_over"
+# 「選ぶ ▼」で最後に選んだツール (次に起動したときも同じものを出しておく)
+BAR_SELECTED_KEY = "bar_selected"
+
+
+def bar_select_over() -> int:
+    """ツールがこの数を超えたら、バーを「選ぶ ▼」の形にする。0 ならいつもボタン。"""
+    value = get_pc_setting(BAR_SELECT_OVER_KEY).strip()
+    if not value:
+        value = str(app_config.ui_setting("select_over"))
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 0
+
+
+def set_bar_select_over(count: int) -> None:
+    set_pc_setting(BAR_SELECT_OVER_KEY, str(max(0, int(count))))
+
+
+def uses_select(count: int) -> bool:
+    """ツールが `count` 個のとき、バーを「選ぶ ▼」の形にするか。"""
+    limit = bar_select_over()
+    return limit > 0 and count > limit
+
+
 def pc_mode() -> str:
     return get_pc_setting(PC_MODE_KEY)
 

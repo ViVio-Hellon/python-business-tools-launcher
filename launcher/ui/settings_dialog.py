@@ -43,7 +43,7 @@ from . import password, theme
 log = get_logger("ui.settings")
 
 # 窓の大きさ。**1366×768 の画面 (ライン PC) に収める** (タスクバーと窓の枠のぶんを残す)
-WINDOW_WIDTH = 1160
+WINDOW_WIDTH = 1340
 WINDOW_HEIGHT = 650
 # 画面の高さのうち、窓の外 (タイトルバー・タスクバー) に残すぶん
 SCREEN_MARGIN = 110
@@ -57,9 +57,24 @@ SECTIONS = (("tools", "ツール"),
             ("records", "記録・配布"),
             ("password", "管理者パスワード"))
 
-# PC × ツールの表。ツールの列の幅 (px) と、斜めに書く見出しの高さ
-MATRIX_COLUMN = 34
-MATRIX_HEADER = 112
+# PC × ツールの表 (案B の見た目)。ツールの列の幅 (px)・見出しと行の高さ・色
+MATRIX_COLUMN_MIN = 54
+MATRIX_COLUMN_MAX = 72
+MATRIX_HEADER = 104
+MATRIX_ROW = 36
+MATRIX_HEAD_BG = "#222a35"
+MATRIX_MINE_BG = "#243041"          # この端末の行
+MATRIX_LINE = "#2c3644"             # 行の区切り
+MATRIX_ABSENT = "#e0857c"           # この端末に無い
+MATRIX_SMALL_FONT = ("Yu Gothic UI", 8)
+MATRIX_BOLD_FONT = ("Yu Gothic UI", 9, "bold")
+# ツールの頭文字の色 (案B と同じ並び。足りなければ繰り返す)
+CHIP_COLORS = ("#4a7fd6", "#c97b22", "#3f9b62", "#c25a43", "#7a62c4", "#2f8fa3",
+               "#a0703a", "#5b74b8", "#8a8f3a", "#b05c8a", "#4f8a6a", "#7d6a5a")
+CHECK_ON = "#2e9e5e"
+CHECK_ON_DIM = "#2f5e48"
+CHECK_OFF = "#f2f5f8"
+CHECK_OFF_DIM = "#6f7b88"
 
 # 起動ファイルを選ぶダイアログの種類
 ENTRY_FILETYPES = [("起動ファイル", "*.bat *.vbs *.exe"),
@@ -545,31 +560,109 @@ class SettingsDialog:
     # 見出し「PCごとの表示」: PC × ツールの表
     # ==============================================================
     def _build_pcs_section(self, frame: tk.Frame) -> None:
-        self._section_title(
-            frame, "PCごとの表示",
-            "縦に PC、横にツールを並べた表です。その PC のバーに出すツールにチェックを"
-            "付けます。ログインID・PC名の空欄は「どれでも」。\n"
-            "行の無い PC には、その PC にあるツールを全部出します。"
-            "起動ファイルがその PC に無いツールは、チェックがあっても出しません。")
-        # マスタの場所 (いつも上に出す。使っていなければ、ここで決める)
+        """［PCごとの表示］。案B の「PC × ツール」の表 (1.8.4 で案の見た目に寄せた)。"""
+        head = tk.Frame(frame, bg=theme.BG)
+        head.pack(fill="x", pady=(0, 8))
+        tk.Label(head, text="PC × ツール", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_TOOL).pack(side="left")
+        tk.Label(head, text="チェックを付けたツールが、その PC のバーに出ます。"
+                            "ツール名を押すと詳しい設定",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL).pack(
+            side="left", padx=(10, 0))
+        self.pcs_buttons = tk.Frame(head, bg=theme.BG)
+        self.pcs_buttons.pack(side="right")
+        add_tool = self._action_button(self.pcs_buttons, "＋ ツールを追加",
+                                       self.add_tool_from_matrix)
+        add_tool.configure(bg=theme.BUTTON_CURRENT, activebackground=theme.TOOL_RUNNING_ACTIVE)
+        add_tool.pack(side="right")
+        self._action_button(self.pcs_buttons, "＋ PCを追加", self.add_pc).pack(
+            side="right", padx=(0, 8))
+        self._action_button(self.pcs_buttons, "＋ この端末", self.add_this_pc).pack(
+            side="right", padx=(0, 8))
+
+        # マスタを使っていないときの案内と場所の欄 (使っているときは表の下に1行)
         self.master_panel = tk.Frame(frame, bg=theme.BG)
-        self.master_panel.pack(fill="x", pady=(0, 8))
         self.matrix_area = tk.Frame(frame, bg=theme.BG)
         self.matrix_area.pack(fill="both", expand=True)
-        actions = tk.Frame(self.matrix_area, bg=theme.BG)
-        actions.pack(side="bottom", fill="x", pady=(8, 10))
-        self._action_button(actions, "＋ この端末を追加", self.add_this_pc).pack(side="left")
-        self._action_button(actions, "＋ PCを追加", self.add_pc).pack(side="left", padx=(8, 0))
-        tk.Label(actions, text="★ = この端末にあたる行", bg=theme.BG, fg=theme.MUTED,
-                 font=theme.FONT_SMALL).pack(side="left", padx=(14, 0))
-        self.matrix_inner, self.matrix_outer = self._scrolled(self.matrix_area,
-                                                              horizontal=True)
-        self.matrix_outer.pack(fill="both", expand=True)
+
+        # 表の下: 凡例とマスタの場所
+        self.matrix_foot = tk.Frame(self.matrix_area, bg=theme.BG)
+        self.matrix_foot.pack(side="bottom", fill="x", pady=(8, 8))
+        self.matrix_legend = tk.Label(self.matrix_foot, text="", bg=theme.BG, fg=theme.MUTED,
+                                      font=theme.FONT_SMALL, anchor="w", justify="left")
+        self.matrix_legend.pack(fill="x")
+        self.master_line = tk.Frame(self.matrix_foot, bg=theme.BG)
+        self.master_line.pack(fill="x", pady=(4, 0))
+
+        # 表: 見出し (上に固定) と行 (縦に巻く)。横は両方いっしょに巻く
+        table = tk.Frame(self.matrix_area, bg=MATRIX_LINE, bd=0)
+        table.pack(fill="both", expand=True)
+        self.matrix_hbar = ttk.Scrollbar(table, orient="horizontal",
+                                         command=self._matrix_xview)
+        self.matrix_hbar.pack(side="bottom", fill="x")
+        self.matrix_vbar = ttk.Scrollbar(table, orient="vertical")
+        self.matrix_vbar.pack(side="right", fill="y")
+        self.matrix_head_canvas = tk.Canvas(table, bg=MATRIX_HEAD_BG, highlightthickness=0,
+                                            height=10)
+        self.matrix_head_canvas.pack(side="top", fill="x", padx=(1, 0), pady=(1, 0))
+        self.matrix_body_canvas = tk.Canvas(table, bg=theme.BG, highlightthickness=0)
+        self.matrix_body_canvas.pack(side="top", fill="both", expand=True, padx=(1, 0))
+        self.matrix_head = tk.Frame(self.matrix_head_canvas, bg=MATRIX_HEAD_BG)
+        self.matrix_inner = tk.Frame(self.matrix_body_canvas, bg=theme.BG)
+        self.matrix_head_canvas.create_window((0, 0), window=self.matrix_head, anchor="nw")
+        self.matrix_body_canvas.create_window((0, 0), window=self.matrix_inner, anchor="nw")
+        self.matrix_body_canvas.configure(xscrollcommand=self.matrix_hbar.set,
+                                          yscrollcommand=self.matrix_vbar.set)
+        self.matrix_vbar.configure(command=self.matrix_body_canvas.yview)
+
+        def fit(_event=None) -> None:
+            head, body = self.matrix_head_canvas, self.matrix_body_canvas
+            head.configure(height=self.matrix_head.winfo_reqheight(),
+                           scrollregion=(0, 0, self.matrix_head.winfo_reqwidth(),
+                                         self.matrix_head.winfo_reqheight()))
+            body.configure(scrollregion=(0, 0, self.matrix_inner.winfo_reqwidth(),
+                                         self.matrix_inner.winfo_reqheight()))
+
+        self.matrix_head.bind("<Configure>", fit)
+        self.matrix_inner.bind("<Configure>", fit)
+        self._bind_wheel(self.matrix_body_canvas)
+        # 外から見る名前 (巻物の枠)
+        self.matrix_outer = table
+        table.canvas = self.matrix_body_canvas      # type: ignore[attr-defined]
+
+    def _matrix_xview(self, *args) -> None:
+        self.matrix_head_canvas.xview(*args)
+        self.matrix_body_canvas.xview(*args)
 
     def _build_master_panel(self) -> None:
+        """ツール管理マスタの場所。使っていなければ大きく案内、使っていれば表の下に1行。"""
         panel = self.master_panel
         for child in panel.winfo_children():
             child.destroy()
+        for child in self.master_line.winfo_children():
+            child.destroy()
+        shared = distribution.tool_master()
+        blank = (f"配布先フォルダの指定 ({shared})" if shared else "使いません")
+        if self.shared:
+            panel.pack_forget()
+            self.pcs_buttons.pack(side="right")
+            self.matrix_area.pack(fill="both", expand=True)
+            tk.Label(self.master_line, text="ツール管理マスタ", bg=theme.BG, fg=theme.MUTED,
+                     font=theme.FONT_SMALL).pack(side="left")
+            tk.Entry(self.master_line, textvariable=self.master_var, width=60,
+                     font=theme.FONT_SMALL, highlightthickness=0).pack(side="left",
+                                                                     padx=(8, 0))
+            self._action_button(self.master_line, "参照", self.browse_master).pack(
+                side="left", padx=(6, 0))
+            self._action_button(self.master_line, "読み直す", self.use_master).pack(
+                side="left", padx=(6, 0))
+            tk.Label(self.master_line, text=f"全 PC で共有 ・ 空欄のとき: {blank}",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL).pack(
+                side="left", padx=(10, 0))
+            return
+        self.matrix_area.pack_forget()
+        self.pcs_buttons.pack_forget()
+        panel.pack(fill="x", pady=(0, 8))
         line = tk.Frame(panel, bg=theme.BG)
         line.pack(fill="x")
         tk.Label(line, text="ツール管理マスタの場所", bg=theme.BG, fg=theme.FG,
@@ -577,28 +670,25 @@ class SettingsDialog:
         tk.Entry(line, textvariable=self.master_var, width=46, font=theme.FONT,
                  highlightthickness=0).pack(side="left", padx=(10, 0))
         self._action_button(line, "参照", self.browse_master).pack(side="left", padx=(6, 0))
-        self._action_button(line, "この場所を使う" if not self.shared else "読み直す",
-                            self.use_master).pack(side="left", padx=(6, 0))
-        shared = distribution.tool_master()
-        blank = (f"配布先フォルダの指定 ({shared})" if shared else "使いません")
-        if self.shared:
-            text = (f"{self._master_path()} を全 PC で共有します。空欄のとき: {blank}")
-        else:
-            text = ("PCごとに出すツールを決めるには、全 PC が読める場所 (共有フォルダー) を"
-                    "入れて［この場所を使う］を押してください。その中に "
-                    f"{tool_master.FILE_NAME} を作ります (あれば読みます)。"
-                    "いまの［ツール］の一覧は、保存するとマスタに入ります。"
-                    f"\n空欄のとき: {blank}")
-            if self.master_problem:
-                text = f"読めません: {self.master_problem}\n" + text
+        self._action_button(line, "この場所を使う", self.use_master).pack(side="left",
+                                                                         padx=(6, 0))
+        text = ("PCごとに出すツールを決めるには、全 PC が読める場所 (共有フォルダー) を"
+                "入れて［この場所を使う］を押してください。その中に "
+                f"{tool_master.FILE_NAME} を作ります (あれば読みます)。"
+                "いまの［ツール］の一覧は、保存するとマスタに入ります。"
+                f"\n空欄のとき: {blank}")
+        if self.master_problem:
+            text = f"読めません: {self.master_problem}\n" + text
         tk.Label(panel, text=text, bg=theme.BG,
                  fg=theme.STATE_COLORS["error"] if self.master_problem else theme.MUTED,
                  font=theme.FONT_SMALL, anchor="w", justify="left",
                  wraplength=920).pack(fill="x", pady=(4, 0))
-        if self.shared:
-            self.matrix_area.pack(fill="both", expand=True)
-        else:
-            self.matrix_area.pack_forget()
+
+    def add_tool_from_matrix(self) -> None:
+        """表の上の［＋ ツールを追加］。足したら表に列が増える (見出しは移らない)。"""
+        self.add_tool()
+        if self.current_section == "pcs":
+            self._render_matrix()
 
     def browse_master(self) -> None:
         current = self.master_var.get().strip()
@@ -681,98 +771,150 @@ class SettingsDialog:
             self.deleted_pcs.append(pc.pc_no)
         self._render_matrix()
 
+    def _matrix_widths(self, count: int) -> tuple[list[int], int, list[int]]:
+        """列の幅 (px)。左の固定の列・ツール1列・右の列 (有効・消す)。
+
+        ツールの列は窓の幅に合わせる (案B は 66px)。狭くなりすぎるなら横に巻く。
+        """
+        fixed = [40, 122, 140, 80]
+        tail = [46, 40]
+        width = self.top.winfo_width()
+        if width < 200:                      # まだ描いていない
+            width = min(WINDOW_WIDTH, self.top.winfo_screenwidth() - 20)
+        room = width - NAV_WIDTH - 32 - 22 - sum(fixed) - sum(tail)
+        each = room // max(1, count)
+        return fixed, max(MATRIX_COLUMN_MIN, min(MATRIX_COLUMN_MAX, each)), tail
+
+    def _cell(self, parent: tk.Widget, row: int, column: int, width: int, height: int,
+              bg: str) -> tk.Frame:
+        cell = tk.Frame(parent, bg=bg, width=width, height=height)
+        cell.grid(row=row, column=column, sticky="nsew", pady=(0, 1))
+        cell.pack_propagate(False)
+        return cell
+
     def _render_matrix(self, *, focus_last: bool = False) -> None:
         """PC × ツールの表を描き直す (チェックなどの値は _PcRow が持つ)。"""
-        inner = self.matrix_inner
-        for child in inner.winfo_children():
-            child.destroy()
+        for holder in (self.matrix_head, self.matrix_inner):
+            for child in holder.winfo_children():
+                child.destroy()
         if not self.shared:
             return
         tools = [r for r in self.rows if not r.marked_for_delete()]
-        fixed = (("No", 5), ("ログインID", 15), ("PC名", 17), ("備考", 11), ("有効", 4))
-        first_tool = len(fixed)
-        for column, (title, _width) in enumerate(fixed):
-            tk.Label(inner, text=title, bg=theme.BG, fg=theme.MUTED, font=theme.FONT_BOLD,
-                     anchor="sw").grid(row=0, column=column, sticky="sw", padx=(4, 2),
-                                       pady=(0, 4))
-        # ツールの名前は斜めに書く (列を狭くして、ツールが多くても横に収める)。
-        # 見出しの枠は列の幅を変えないよう細く作り、右の余白の列まで伸ばす
-        spare = first_tool + len(tools) + 1
-        header = tk.Canvas(inner, bg=theme.BG, highlightthickness=0,
-                           height=MATRIX_HEADER, width=1)
-        header.grid(row=0, column=first_tool, columnspan=len(tools) + 2, sticky="ew")
-        for column in range(first_tool, spare + 1):
-            inner.grid_columnconfigure(column, minsize=0, uniform="")
-        for index in range(len(tools)):
-            inner.grid_columnconfigure(first_tool + index, minsize=MATRIX_COLUMN,
-                                       uniform="tool")
-        inner.grid_columnconfigure(spare, minsize=110)
-        self._later(lambda: self._place_headers(header, tools, first_tool))
-        if not tools:
-            tk.Label(inner, text="(ツールがまだありません。PC の行は先に足せます)",
-                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL).grid(
-                row=0, column=first_tool, sticky="sw", padx=6)
+        fixed, each, tail = self._matrix_widths(len(tools))
+        widths = fixed + [each] * len(tools) + tail
 
-        mine = self._this_pc_row()
-        visible = [pc for pc in self.pc_rows if not pc.deleted]
-        last_entry = None
-        for line, pc in enumerate(visible, start=1):
-            bg = theme.BG
-            number = f"{pc.pc_no}" if pc.pc_no else "新"
-            tk.Label(inner, text=number + (" ★" if pc is mine else ""),
-                     bg=theme.TOOL_ACTIVE if pc is mine else theme.BG,
-                     fg=theme.FG, font=theme.FONT_SMALL, width=fixed[0][1],
-                     anchor="w").grid(row=line, column=0, sticky="nsew", padx=(4, 2), pady=1)
-            entries = []
-            for column, var, width in ((1, pc.login_var, fixed[1][1]),
-                                       (2, pc.pc_var, fixed[2][1]),
-                                       (3, pc.note_var, fixed[3][1])):
-                entry = tk.Entry(inner, textvariable=var, width=width, font=theme.FONT_SMALL,
-                                 highlightthickness=0)
-                entry.grid(row=line, column=column, sticky="ew", padx=2, pady=1)
-                entry.bind("<FocusOut>", lambda _e: self._after_pc_edit())
-                entries.append(entry)
-            last_entry = entries[0]
-            tk.Checkbutton(inner, variable=pc.enabled_var, bg=bg,
-                           selectcolor=theme.BUTTON_BG, activebackground=bg,
-                           bd=0, highlightthickness=0,
-                           command=self._after_pc_edit).grid(row=line, column=4, pady=1)
-            for index, row in enumerate(tools):
-                tk.Checkbutton(inner, variable=pc.var(row), bg=bg,
-                               selectcolor=theme.BUTTON_BG, activebackground=bg,
-                               bd=0, highlightthickness=0,
-                               command=self._refresh_list).grid(
-                    row=line, column=first_tool + index, pady=1)
-            tk.Button(inner, text="消す", command=lambda p=pc: self.remove_pc(p),
-                      bg=theme.BUTTON_BG, fg=theme.MUTED, relief="flat", bd=0, padx=8,
-                      font=theme.FONT_SMALL, cursor="hand2").grid(
-                row=line, column=first_tool + len(tools), sticky="w", padx=(8, 4), pady=1)
-        if not visible:
-            tk.Label(inner, text="PC の行はまだありません。［＋ この端末を追加］か"
-                                 "［＋ PCを追加］で足してください。\n"
-                                 "行が無いあいだは、どの PC にも、その PC にあるツールを"
-                                 "全部出します。",
-                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, justify="left",
-                     anchor="w").grid(row=1, column=0, columnspan=first_tool + len(tools) + 1,
-                                      sticky="w", padx=4, pady=(8, 0))
-        self._update_status()
-        if focus_last and last_entry is not None:
-            last_entry.focus_set()
-            self._later(lambda: self.matrix_outer.canvas.yview_moveto(1.0))
-
-    def _place_headers(self, header: tk.Canvas, tools: list["_ToolRow"],
-                       first_tool: int) -> None:
-        """斜めの見出しを、チェックの列の真上に書く (列の位置は描いたあとで分かる)。"""
-        if not header.winfo_exists():
-            return
-        header.delete("all")
-        inner = self.matrix_inner
-        origin = inner.grid_bbox(first_tool, 0)[0]
+        # --- 見出し (上に固定) ---
+        head_bg = MATRIX_HEAD_BG
+        titles = ["No", "ログインID", "PC名", "備考"]
+        for column, title in enumerate(titles):
+            cell = self._cell(self.matrix_head, 0, column, widths[column], MATRIX_HEADER,
+                              head_bg)
+            tk.Label(cell, text=title, bg=head_bg, fg=theme.MUTED, font=theme.FONT_SMALL,
+                     anchor="w").pack(side="bottom", fill="x", padx=6, pady=(0, 8))
         for index, row in enumerate(tools):
-            x, _y, width, _h = inner.grid_bbox(first_tool + index, 0)
-            header.create_text(x - origin + width // 2 - 5, MATRIX_HEADER - 6,
-                               text=row.label(), angle=55, anchor="w",
-                               fill=theme.FG, font=theme.FONT_SMALL)
+            column = len(fixed) + index
+            cell = self._cell(self.matrix_head, 0, column, each, MATRIX_HEADER, head_bg)
+            self._tool_head(cell, row, index, each)
+        for offset, title in enumerate(("有効", "")):
+            column = len(fixed) + len(tools) + offset
+            cell = self._cell(self.matrix_head, 0, column, tail[offset], MATRIX_HEADER,
+                              head_bg)
+            tk.Label(cell, text=title, bg=head_bg, fg=theme.MUTED, font=theme.FONT_SMALL).pack(
+                side="bottom", pady=(0, 8))
+
+        # --- 行。この端末の行をいちばん上に ---
+        mine = self._this_pc_row()
+        self._last_mine = mine
+        visible = [pc for pc in self.pc_rows if not pc.deleted]
+        if mine is not None:
+            visible.remove(mine)
+            visible.insert(0, mine)
+        here = {id(r): r.here() for r in tools}
+        for line, pc in enumerate(visible):
+            bg = MATRIX_MINE_BG if pc is mine else theme.BG
+            cells = [self._cell(self.matrix_inner, line, c, w, MATRIX_ROW, bg)
+                     for c, w in enumerate(widths)]
+            number = f"{pc.pc_no}" if pc.pc_no else "新"
+            tk.Label(cells[0], text=number + (" ★" if pc is mine else ""), bg=bg,
+                     fg=theme.FG if pc is mine else theme.MUTED,
+                     font=theme.FONT_SMALL, anchor="w").pack(fill="both", expand=True,
+                                                             padx=(8, 0))
+            for cell, var, font, color in ((cells[1], pc.login_var, MATRIX_BOLD_FONT, theme.FG),
+                                           (cells[2], pc.pc_var, MATRIX_BOLD_FONT, theme.FG),
+                                           (cells[3], pc.note_var, theme.FONT_SMALL,
+                                            theme.MUTED)):
+                entry = _flat_entry(cell, var, bg=bg, fg=color, font=font)
+                entry.bind("<FocusOut>", lambda _e: self._after_pc_edit())
+                entry.bind("<Return>", lambda _e: self._after_pc_edit())
+            for index, row in enumerate(tools):
+                _Check(cells[len(fixed) + index], pc.var(row), bg=bg,
+                       dim=not here[id(row)], command=self._refresh_list).place(
+                    relx=0.5, rely=0.5, anchor="center")
+            _Check(cells[-2], pc.enabled_var, bg=bg, command=self._after_pc_edit).place(
+                relx=0.5, rely=0.5, anchor="center")
+            remove = tk.Label(cells[-1], text="×", bg=bg, fg=theme.MUTED, font=theme.FONT_BOLD,
+                              cursor="hand2")
+            remove.place(relx=0.5, rely=0.5, anchor="center")
+            remove.bind("<Button-1>", lambda _e, p=pc: self.remove_pc(p))
+            remove.bind("<Enter>", lambda _e, w=remove: w.configure(
+                fg=theme.STATE_COLORS["error"]))
+            remove.bind("<Leave>", lambda _e, w=remove: w.configure(fg=theme.MUTED))
+
+        # 表の終わり: PC の行を足す (ツールより先でもよい)
+        add = tk.Button(self.matrix_inner, text="＋ PCを追加（ツールは後で選べます）",
+                        command=self.add_pc, bg=theme.BG, fg=theme.MUTED, relief="flat",
+                        bd=0, padx=12, pady=6, font=theme.FONT_SMALL, cursor="hand2",
+                        activebackground=theme.BUTTON_BG, activeforeground=theme.FG,
+                        highlightthickness=1, highlightbackground=theme.TOOL_ACTIVE)
+        add.grid(row=len(visible), column=0, columnspan=len(widths), sticky="w",
+                 padx=10, pady=10)
+        if not visible:
+            tk.Label(self.matrix_inner,
+                     text="PC の行はまだありません。行が無いあいだは、どの PC にも、"
+                          "その PC にあるツールを全部出します。",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w").grid(
+                row=len(visible) + 1, column=0, columnspan=len(widths), sticky="w", padx=10)
+
+        login, pc_name = tool_master.this_pc()
+        if mine is not None:
+            legend = (f"★ この端末（{login} / {pc_name}）の行はいちばん上 ・ "
+                      "列の下の「なし」= この端末に起動ファイルが無いツール（この端末では出ません）")
+        else:
+            legend = (f"この端末（{login} / {pc_name}）にあたる行はありません（この端末には、"
+                      "ある ツールを全部出します）・ 薄い色の列は、この端末に起動ファイルが無いツール")
+        self.matrix_legend.configure(text=legend)
+        self._update_status()
+        if focus_last and visible:
+            # 足したばかりの行 (いちばん下) のログインIDに入れるようにする
+            entries = [w for w in self.matrix_inner.grid_slaves(row=len(visible) - 1, column=1)]
+            for cell in entries:
+                for child in cell.winfo_children():
+                    child.focus_set()
+            self._later(lambda: self.matrix_body_canvas.yview_moveto(1.0))
+
+    def _tool_head(self, cell: tk.Frame, row: "_ToolRow", index: int, width: int) -> None:
+        """ツールの列の見出し: 色の付いた頭文字・名前・この端末にあるか。押すと詳しい設定。"""
+        here = row.here()
+        bg = MATRIX_HEAD_BG
+        mark = tk.Label(cell, text="✓ ある" if here else "なし", bg=bg,
+                        fg=theme.STATE_COLORS["running"] if here else MATRIX_ABSENT,
+                        font=MATRIX_SMALL_FONT)
+        mark.pack(side="bottom", pady=(0, 6))
+        name = tk.Label(cell, text=_short_name(row.label()), bg=bg,
+                        fg=theme.FG if here else theme.MUTED, font=MATRIX_SMALL_FONT,
+                        wraplength=width - 6, justify="center")
+        name.pack(side="bottom", pady=(0, 2))
+        chip = tk.Label(cell, text=_initial(row.label()), bg=_chip_color(index, here),
+                        fg="#ffffff", font=theme.FONT_BOLD, width=2)
+        chip.pack(side="bottom", pady=(0, 3))
+        for widget in (cell, mark, name, chip):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", lambda _e, r=row: self._open_tool(r))
+
+    def _open_tool(self, row: "_ToolRow") -> None:
+        """表の見出しを押した: ［ツール］へ移り、そのツールの詳しい設定を出す。"""
+        self.show_section("tools")
+        self.select(row)
 
     def _after_pc_edit(self) -> None:
         """ログインID・PC名を直した。★ (この端末の行) を付け直す。"""
@@ -840,6 +982,26 @@ class SettingsDialog:
                          state="readonly", font=theme.FONT).pack(side="left")
         tk.Label(parent, text="(手で動かした位置は、次にツールを起動・停止すると"
                               "ここで選んだ場所に戻ります)",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                 anchor="w").pack(fill="x", padx=12, pady=(2, 0))
+        self._build_select_over(parent)
+
+    def _build_select_over(self, parent: tk.Frame) -> None:
+        """ツールが多いとき、バーをボタンの列ではなく「選ぶ ▼」と［開く］にする (1.8.4)。"""
+        tk.Label(parent, text="ツールが多いときのバー", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD, anchor="w").pack(fill="x", pady=(16, 0))
+        line = tk.Frame(parent, bg=theme.BG)
+        line.pack(fill="x", pady=(4, 0))
+        tk.Label(line, text="ツールが", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_SMALL).pack(side="left", padx=(12, 4))
+        self.select_over_var = tk.StringVar(value=str(tool_registry.bar_select_over()))
+        tk.Spinbox(line, from_=0, to=50, width=4, textvariable=self.select_over_var,
+                   font=theme.FONT).pack(side="left")
+        tk.Label(line, text="個を超えたら、ボタンを並べずに「選ぶ ▼」と［開く］にする",
+                 bg=theme.BG, fg=theme.FG, font=theme.FONT_SMALL).pack(side="left",
+                                                                    padx=(4, 0))
+        tk.Label(parent, text="(0 にすると、いつもボタンを並べます。選んだだけでは起動せず、"
+                              "［開く］で起動します)",
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(fill="x", padx=12, pady=(2, 0))
 
@@ -935,6 +1097,18 @@ class SettingsDialog:
         tk.Label(frame, text=distribution.state_text(), bg=theme.BG,
                  fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(side="left", padx=(10, 0))
+        # **どこにできるか**をいつも出す (ランチャーの起動ファイル Start.vbs と同じ場所)
+        where = tk.Frame(parent, bg=theme.BG)
+        where.pack(fill="x", pady=(4, 0))
+        tk.Label(where, text=f"場所: {distribution.folder()}", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_SMALL, anchor="w").pack(side="left")
+        self._action_button(where, "開く", self.open_distribution).pack(side="left",
+                                                                        padx=(8, 0))
+        tk.Label(parent, text="ランチャーの起動ファイル (Start.vbs) と同じ場所に"
+                              f"「{distribution.FOLDER_NAME}」フォルダーを作ります。"
+                              "ランチャーのフォルダーごと配ってください。",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                 anchor="w").pack(fill="x", pady=(2, 0))
 
         actions = tk.Frame(parent, bg=theme.BG)
         actions.pack(fill="x", pady=(6, 0))
@@ -961,6 +1135,15 @@ class SettingsDialog:
                               " (配った先の PC も同じマスタを読みます)。",
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
                  anchor="w").pack(fill="x", pady=(4, 0))
+
+    def open_distribution(self) -> None:
+        """配布先フォルダを開く (まだ無ければ、ランチャーのフォルダーを開く)。"""
+        target = distribution.folder()
+        if not target.is_dir():
+            target = target.parent
+        if not trace.open_path(target):
+            messagebox.showinfo("配布先フォルダ", f"開けませんでした。\n{target}",
+                                parent=self.top)
 
     def export_distribution(self) -> None:
         """いまの画面を保存してから、配布先フォルダを作る。
@@ -1251,6 +1434,13 @@ class SettingsDialog:
         if tool_registry.pc_mode() != mode_before:
             changes.append(f"このPCのモード「{mode_before or '(空)'}」→"
                            f"「{tool_registry.pc_mode() or '(空)'}」")
+        try:
+            select_over = max(0, int(self.select_over_var.get().strip() or "0"))
+        except ValueError:
+            select_over = tool_registry.bar_select_over()
+        if select_over != tool_registry.bar_select_over():
+            changes.append(f"バーを「選ぶ ▼」にするツールの数「{select_over} 個を超えたら」")
+            tool_registry.set_bar_select_over(select_over)
         log_dir = self.log_dir_var.get().strip()
         if log_dir != self._log_dir_before.strip():
             changes.append(f"ログの出力先「{self._log_dir_before or '(既定)'}」→"
@@ -1260,6 +1450,83 @@ class SettingsDialog:
 
     def cancel(self) -> None:
         self.top.destroy()
+
+
+class _Check(tk.Canvas):
+    """大きめのチェック (案B の表)。tk の Checkbutton は小さく、地の色に埋もれる。
+
+    `dim` は、この端末に起動ファイルが無いツールの列 (薄く出す)。
+    """
+
+    SIZE = 20
+
+    def __init__(self, parent: tk.Widget, var: tk.BooleanVar, *, bg: str,
+                 dim: bool = False, command=None) -> None:
+        super().__init__(parent, width=self.SIZE, height=self.SIZE, bg=bg,
+                         highlightthickness=0, cursor="hand2")
+        self.var, self.dim, self.command = var, dim, command
+        self._trace = var.trace_add("write", lambda *_: self._draw())
+        self.bind("<Button-1>", self.toggle)
+        self.bind("<Destroy>", self._forget)
+        self._draw()
+
+    def toggle(self, _event=None) -> None:
+        self.var.set(not self.var.get())
+        if self.command is not None:
+            self.command()
+
+    def _forget(self, _event=None) -> None:
+        try:
+            self.var.trace_remove("write", self._trace)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _draw(self) -> None:
+        try:
+            self.delete("all")
+        except tk.TclError:
+            return
+        size = self.SIZE - 2
+        on = bool(self.var.get())
+        if on:
+            fill = CHECK_ON_DIM if self.dim else CHECK_ON
+            outline = fill
+        else:
+            fill = CHECK_OFF_DIM if self.dim else CHECK_OFF
+            outline = "#8d99a6"
+        r = 4
+        points = (1 + r, 1, size - r, 1, size, 1, size, 1 + r, size, size - r, size, size,
+                  size - r, size, 1 + r, size, 1, size, 1, size - r, 1, 1 + r, 1, 1)
+        self.create_polygon(points, smooth=True, fill=fill, outline=outline)
+        if on:
+            self.create_line(5, 10, 8.5, 13.5, 15, 6, fill="#ffffff", width=2.4,
+                             capstyle="round", joinstyle="round")
+
+
+def _flat_entry(parent: tk.Widget, var: tk.StringVar, *, bg: str, fg: str,
+                font) -> tk.Entry:
+    """文字に見える入力欄 (案B の表のセル)。押すと直せる。入力中だけ枠が出る。"""
+    entry = tk.Entry(parent, textvariable=var, bg=bg, fg=fg, font=font, relief="flat", bd=0,
+                     insertbackground=theme.FG, highlightthickness=1,
+                     highlightbackground=bg, highlightcolor=theme.TOOL_ACTIVE,
+                     disabledbackground=bg)
+    entry.pack(fill="both", expand=True, padx=(4, 4), pady=6)
+    return entry
+
+
+def _initial(name: str) -> str:
+    """頭文字 (表の見出しの色の付いた四角)。"""
+    text = (name or "?").strip() or "?"
+    return text[0].upper()
+
+
+def _short_name(name: str, limit: int = 16) -> str:
+    text = (name or "").strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _chip_color(index: int, here: bool) -> str:
+    return CHIP_COLORS[index % len(CHIP_COLORS)] if here else "#4a535e"
 
 
 class _PcRow:

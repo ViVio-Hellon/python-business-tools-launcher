@@ -146,6 +146,11 @@ class LauncherBar:
                                      activebackground=theme.BUTTON_ACTIVE,
                                      activeforeground=theme.FG, bd=0)
         self._hidden: list[str] = []
+        # ツールが多いときの「選ぶ ▼」と［開く］(1.8.4)。少ないときは作らない
+        self._select_mode = False
+        self.selector: Optional[tk.Menubutton] = None
+        self.open_button: Optional[tk.Button] = None
+        self.selected_var = tk.StringVar(value="")
         self._build_tool_buttons()
 
         # --- 右側の操作 ---
@@ -209,8 +214,10 @@ class LauncherBar:
         self._order.clear()
         self._hidden.clear()
         self.overflow_button.pack_forget()
+        self.selector = self.open_button = None
 
         tools = tool_registry.all_tools()
+        self._select_mode = tool_registry.uses_select(len(tools))
         if not tools:
             # 出荷時はツールを1つも持たない。何をすればよいかを出す
             tk.Label(self.tool_frame,
@@ -225,7 +232,8 @@ class LauncherBar:
             button = self._tool_button(
                 tool.display_name,
                 lambda app_id=tool.app_id: self.on_select(app_id))
-            button.pack(side="left", padx=(0, 4))
+            if not self._select_mode:
+                button.pack(side="left", padx=(0, 4))
             self.buttons[tool.app_id] = button
             self._names[tool.app_id] = tool.display_name
             self._order.append(tool.app_id)
@@ -234,8 +242,100 @@ class LauncherBar:
             # 押せば、確かめられない理由を出す
             self._configured[tool.app_id] = bool(found) and (found.found
                                                               or found.unknown)
-        self._apply_overflow()
+        if self._select_mode:
+            self._build_selector()
+        else:
+            self._apply_overflow()
         self._paint_buttons(self.manager.status)
+
+    # --------------------------------------------------------------
+    # ツールが多いとき: 「選ぶ ▼」と［開く］(1.8.4)
+    # --------------------------------------------------------------
+    def _build_selector(self) -> None:
+        """ボタンを並べるとバーが長くなりすぎるので、1つ選んで［開く］にする。
+
+        **選んだだけでは起動しない** (選び間違えて起動しないように)。［開く］で
+        起動する (動いていれば前に出す)。選んだツールは覚えておく。
+        """
+        remembered = tool_registry.get_pc_setting(tool_registry.BAR_SELECTED_KEY)
+        first = (self._focus_id if self._focus_id in self._names
+                 else remembered if remembered in self._names else self._order[0])
+        self.selected_var.set(first)
+        font = tkfont.Font(font=theme.FONT_TOOL)
+        longest = max(font.measure(f"● {name}（動作中）  ▼") for name in self._names.values())
+        chars = max(10, -(-longest // max(1, font.measure("0"))))
+        self.selector = tk.Menubutton(
+            self.tool_frame, text="", width=chars, anchor="w",
+            bg=theme.TOOL_BG, fg=theme.FG, activebackground=theme.TOOL_ACTIVE,
+            activeforeground=theme.FG, relief="flat", bd=0, padx=14, pady=5,
+            font=theme.FONT_TOOL, cursor="hand2", direction="below")
+        self.selector_menu = tk.Menu(self.selector, tearoff=0, bg=theme.BUTTON_BG,
+                                     fg=theme.FG, activebackground=theme.BUTTON_ACTIVE,
+                                     activeforeground=theme.FG, selectcolor=theme.FG,
+                                     font=theme.FONT_TOOL,
+                                     postcommand=self._fill_selector_menu)
+        self.selector.configure(menu=self.selector_menu)
+        self.selector.pack(side="left", padx=(0, 4))
+        self.open_button = tk.Button(
+            self.tool_frame, text="開く", command=self.open_selected,
+            bg=theme.BUTTON_CURRENT, fg=theme.FG, activebackground=theme.TOOL_RUNNING_ACTIVE,
+            activeforeground=theme.FG, relief="flat", bd=0, padx=18, pady=5,
+            font=theme.FONT_TOOL, cursor="hand2")
+        self.open_button.pack(side="left", padx=(0, 4))
+        log.info("ツールが %d 個あるので、バーを「選ぶ ▼」にしました (%d 個を超えたら)",
+                 len(self._order), tool_registry.bar_select_over())
+
+    def _selector_label(self, app_id: str, status) -> str:
+        name = self._names.get(app_id, app_id)
+        if app_id in set(status.starting_ids) | set(status.stopping_ids):
+            return f"… {name}"
+        if app_id in set(status.running_ids):
+            return f"● {name}（動作中）"
+        if not self._configured.get(app_id):
+            return f"{name}（未設定）"
+        return name
+
+    def _fill_selector_menu(self) -> None:
+        """「選ぶ ▼」を開く直前に、動いているかの印を付け直す。"""
+        menu = self.selector_menu
+        menu.delete(0, "end")
+        status = self.manager.status
+        for app_id in self._order:
+            menu.add_radiobutton(label=self._selector_label(app_id, status),
+                                 variable=self.selected_var, value=app_id,
+                                 command=self._on_pick)
+
+    def _on_pick(self) -> None:
+        """一覧で選んだ。**起動はしない** (［開く］で起動する)。"""
+        app_id = self.selected_var.get()
+        tool_registry.set_pc_setting(tool_registry.BAR_SELECTED_KEY, app_id)
+        self._paint_buttons(self.manager.status)
+
+    def open_selected(self) -> None:
+        """［開く］。選んだツールを起動する (動いていれば画面を前に出す)。"""
+        app_id = self.selected_var.get()
+        if app_id in self._names:
+            tool_registry.set_pc_setting(tool_registry.BAR_SELECTED_KEY, app_id)
+            self.on_select(app_id)
+
+    def _paint_selector(self, status) -> None:
+        if self.selector is None:
+            return
+        app_id = self.selected_var.get()
+        running = set(status.running_ids)
+        busy = set(status.starting_ids) | set(status.stopping_ids)
+        if app_id in busy:
+            bg, fg, active = theme.TOOL_BUSY, theme.FG, theme.TOOL_BUSY
+        elif app_id in running:
+            bg, fg, active = theme.TOOL_RUNNING, theme.FG, theme.TOOL_RUNNING_ACTIVE
+        elif not self._configured.get(app_id):
+            bg, fg, active = theme.TOOL_UNSET, theme.TOOL_UNSET_FG, theme.TOOL_UNSET
+        else:
+            bg, fg, active = theme.TOOL_BG, theme.FG, theme.TOOL_ACTIVE
+        # ほかに動いているツールは、状態表示 (右) と一覧の ● で分かる
+        text = self._selector_label(app_id, status)
+        self.selector.configure(text=f"{text}  ▼", bg=bg, fg=fg, activebackground=active)
+        self.open_button.configure(text="前に出す" if app_id in running else "開く")
 
     # --------------------------------------------------------------
     # 入りきらないツール
@@ -484,6 +584,8 @@ class LauncherBar:
         いれば画面を前に出す。
         """
         self._engaged = True
+        if self._select_mode and app_id in self._names:
+            self.selected_var.set(app_id)
         # ツールを押したら、［設定］の「ツールを使っているとき」へ寄せ直す
         # (手で動かしていても。押すたびに置き場所がそろう)
         self._anchor = ""
@@ -826,6 +928,8 @@ class LauncherBar:
         """
         running = set(status.running_ids)
         busy = set(status.starting_ids) | set(status.stopping_ids)
+        if self._select_mode:
+            self._paint_selector(status)
         hidden_running = [a for a in running | busy if a in self._hidden]
         if hidden_running:
             # 動いているツールが［▼］の中に隠れている。**どれが動いて
