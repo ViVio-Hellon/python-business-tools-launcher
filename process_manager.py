@@ -51,6 +51,7 @@ if str(APP_ROOT) not in sys.path:
 from launcher import (desktop, fileprobe, health,  # noqa: E402
                       runtime_state, tool_entries)
 from launcher.logging_utils import get_logger  # noqa: E402
+from launcher import paths as _paths  # noqa: E402
 from launcher.paths import normalize as _normalize_path  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 
@@ -707,17 +708,19 @@ def _stop_by_bat(running: RunningTool, *, force: bool,
 
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
-    command = [str(script)]
-    if force:
-        # 4つの業務ツールの `stop.bat` は引数をそのまま
-        # `process_manager.py` へ渡す。中断してよいときだけ付ける
-        command.append("--force")
-    log.info("stop.bat に任せます: %s", " ".join(command))
+    # 4つの業務ツールの `stop.bat` は引数をそのまま `process_manager.py` へ渡す。
+    # 中断してよいときだけ --force を付ける。**道はいつも " で囲む** (全角の空白の
+    # あるフォルダー名「コイルライン用　包装仕様表示」で止められなかった。1.8.6)
+    command = _paths.entry_command(script, ["--force"] if force else [])
+    log.info("stop.bat に任せます: %s",
+             command if isinstance(command, str) else " ".join(command))
 
     try:
         completed = subprocess.run(
             command,
             cwd=running.work_dir or str(script.parent),
+            # 最後の pause を飛ばす合図 (コイル包装仕様の stop.bat が読む。ほかは無視する)
+            env={**os.environ, "STOP_NOPAUSE": "1"},
             stdin=subprocess.DEVNULL,      # BAT末尾の `pause` で固まらせない
             capture_output=True, text=True, errors="replace",
             timeout=timeout, creationflags=NO_WINDOW,

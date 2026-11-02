@@ -59,7 +59,7 @@ if str(APP_ROOT) not in sys.path:
 import process_manager  # noqa: E402
 from launcher import (app_config, browser, desktop, fileprobe,  # noqa: E402
                       health, logging_utils, runtime_state, tool_registry,
-                      trace, tool_entries)
+                      paths, trace, tool_entries)
 from launcher.logging_utils import get_logger  # noqa: E402
 from launcher.runtime_state import RunningTool  # noqa: E402
 from launcher.stopwatch import SLEEP_GAP_SEC, Stopwatch  # noqa: E402
@@ -1580,9 +1580,9 @@ class ToolManager:
         command = _entry_command(tool)
         out_path = tool_log_path(tool.app_id)
         log.info("起動開始: %s — %s (cwd=%s)",
-                 tool.display_name, " ".join(command), tool.resolved_work_dir)
+                 tool.display_name, _command_text(command), tool.resolved_work_dir)
         trace.event("起動開始", trace.INFO, tool=tool, op=op,
-                    detail=f"{' '.join(command)} (作業フォルダー {tool.resolved_work_dir or '-'})")
+                    detail=f"{_command_text(command)} (作業フォルダー {tool.resolved_work_dir or '-'})")
         if tool.start_args.strip() and not tool.forwards_args:
             # **届かない引数を、届いたつもりで扱わない。**
             # `.vbs` は引数を転送するとは限らない (4ツールの Start.vbs は
@@ -1627,7 +1627,7 @@ class ToolManager:
                 f"{tool.display_name}を起動できなかった", tool=tool, op=op,
                 whys=["ツールのバックエンドが立ち上がらなかった",
                       cause],
-                observed=[("実行したコマンド", " ".join(command)),
+                observed=[("実行したコマンド", _command_text(command)),
                           ("起動ファイル", tool.start_command),
                           ("ファイルがあるか",
                            fileprobe.probe(tool.start_command).describe()),
@@ -2476,19 +2476,19 @@ def _launched_exe(record: Optional[RunningTool]) -> bool:
     return record.start_command.strip().strip('"').lower().endswith(".exe")
 
 
-def _entry_command(tool: Tool) -> list[str]:
-    """起動入口を実行するためのコマンド。
+def _entry_command(tool: Tool):
+    """起動入口を実行するためのコマンド (`paths.entry_command`)。
 
     `.vbs` は `wscript.exe` 経由で呼ぶ。`Popen` が使う `CreateProcess` は
     **ファイルの関連付けを解決しない**ので、`.vbs` を直接渡しても動かない
-    (エクスプローラのダブルクリックとは仕組みが違う)。`.exe` はそのまま。
+    (エクスプローラのダブルクリックとは仕組みが違う)。**道はいつも " で囲む**
+    (全角の空白のあるフォルダー名でも動くように。1.8.6)。
     """
-    path = tool.start_command.strip().strip('"')
-    args = tool.start_args.split()
-    if tool.entry_kind == "vbs":
-        return ["wscript.exe", path] + args
-    # .bat と .exe はそのまま実行する。exe には引数がそのまま届く
-    return [path] + args
+    return paths.entry_command(tool.start_command, tool.start_args.split())
+
+
+def _command_text(command) -> str:
+    return command if isinstance(command, str) else " ".join(command)
 
 
 def _leftover_note(running: RunningTool, name: str) -> str:

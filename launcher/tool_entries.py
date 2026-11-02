@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import fileprobe, health
+from . import fileprobe, health, paths
 from .logging_utils import get_logger
 
 log = get_logger("tool_entries")
@@ -261,7 +261,8 @@ def _run(path: str, folder: str, timeout: float,
     try:
         with tempfile.TemporaryFile() as out:
             proc = subprocess.Popen(
-                [path, *args], cwd=folder or None,
+                # 道はいつも " で囲む (全角の空白のあるフォルダー名。1.8.6)
+                paths.entry_command(path, args), cwd=folder or None,
                 stdin=subprocess.DEVNULL,      # `pause` で固まらせない
                 stdout=out, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
             try:
