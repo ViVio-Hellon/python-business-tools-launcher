@@ -942,6 +942,16 @@ def probe_tool_folder(start_command: str) -> dict:
             found["kind"] = "desktop"
             found.setdefault("display_name", _readme_title(entry.parent) or entry.parent.name)
             found.setdefault("app_id", script_app_id(entry))
+        elif not raw and "port" not in found and "ui_mode" not in found:
+            # 素性のファイルも /api/health も持たない、ふつうの Web のツール
+            # (accdb_converter: Flask + waitress、ポート 5000 を決め打ち)。
+            # **プログラムに書いてあるポート**を読む (1.8.6)
+            port = sniff_port(entry.parent)
+            if port:
+                found["port"] = port
+                found["kind"] = "plain-web"
+                found["display_name"] = _readme_title(entry.parent) or entry.parent.name
+                found["app_id"] = web_app_id(entry)
         return found
 
     from . import desktop
@@ -1031,11 +1041,79 @@ def _read_text_head(path: Path, limit: int = 200_000) -> str:
 
 
 def _readme_title(folder: Path) -> str:
-    """README.md の最初の見出し (`# Photo Cleaner`)。無ければ空。"""
+    """README.md の最初の見出し (`# Photo Cleaner`)。無ければ README.txt の最初の文の行
+    (`====` などの飾りの行は飛ばし、後ろの「 (…)」の説明は落とす)。無ければ空。"""
     for line in _read_text_head(folder / "README.md", 4000).splitlines():
         if line.startswith("# "):
             return line[2:].strip()
+    for line in _read_text_head(folder / "README.txt", 4000).splitlines():
+        text = line.strip()
+        if not text or not re.search(r"[0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]", text):
+            continue
+        text = re.split(r"\s{2,}[(（]|\s[(（]", text)[0].strip()
+        return text[:40]
     return ""
+
+
+# ふつうの Web のツール (素性のファイルが無い) のポートの書き方
+_PORT_PATTERNS = (re.compile(r"^\s*PORT\s*=\s*(\d{2,5})\s*(?:#.*)?$", re.M),
+                  re.compile(r"\bserve\([^)]*?\bport\s*=\s*(\d{2,5})"),
+                  re.compile(r"\.run\([^)]*?\bport\s*=\s*(\d{2,5})"))
+# Web サーバーの印 (これが無ければ、ポートらしき数字があっても Web のツールとみなさない)
+_WEB_MARKS = ("flask", "waitress", "http.server", "bottle", "uvicorn", "fastapi")
+# 先に見るファイル (起動の入口になりやすい名前)
+_ENTRY_SCRIPTS = ("run_waitress.py", "start_app.py", "server.py", "app.py", "main.py")
+
+
+def sniff_port(folder: Path) -> int:
+    """素性のファイルが無い Web のツールの、プログラムに書いてあるポート。無ければ 0。
+
+    直下の .py (入口になりやすい名前から) で `PORT = 5000`・`serve(..., port=5000)`・
+    `app.run(port=5000)` を探す。Web サーバーの部品 (Flask・waitress など) を
+    使っていなければ 0。
+    """
+    try:
+        scripts = sorted(folder.glob("*.py"))[:30]
+    except OSError:
+        return 0
+    first = [folder / name for name in _ENTRY_SCRIPTS if (folder / name) in scripts]
+    ordered = first + [s for s in scripts if s not in first]
+    texts = [_read_text_head(script) for script in ordered]
+    if not any(mark in text.lower() for text in texts for mark in _WEB_MARKS):
+        return 0
+    for text in texts:
+        for pattern in _PORT_PATTERNS:
+            match = pattern.search(text)
+            if match and 1024 <= int(match.group(1)) <= 65535:
+                return int(match.group(1))
+    return 0
+
+
+def web_app_id(entry: Path) -> str:
+    """素性のファイルが無い Web のツールのアプリID。フォルダー名から作る (`web.<名前>`)。"""
+    stem = re.sub(r"[^0-9A-Za-z._-]+", "-", entry.parent.name).strip("-").lower()
+    return f"web.{stem or 'tool'}"
+
+
+def confirms_by_port(tool: Tool) -> bool:
+    """起動と生死を「ツールのプロセスがポートで待ち受けているか」で確かめるツールか (1.8.6)。
+
+    素性のファイル (`config/app.json` の `app_id`) も起動確認の入口も無い Web のツール。
+    `/api/health` が無いので、アプリIDの照合はできない。代わりに**そのツールの
+    プロセス**が待ち受けていることで本人と確かめる (ほかのアプリを取り違えない)。
+    """
+    if tool.port <= 0 or tool.is_app or tool.health_url_override.strip():
+        return False
+    path = (tool.start_command or "").strip().strip('"')
+    if not path or tool.entry_kind == "exe":
+        # exe は窓とポート探しで確かめる (これまでどおり)
+        return False
+    from . import tool_entries
+
+    if tool_entries.for_tool(tool).any:
+        return False
+    raw = _read_app_json(Path(path))
+    return not str((raw or {}).get("app_id") or "").strip()
 
 
 def script_app_id(entry: Path) -> str:

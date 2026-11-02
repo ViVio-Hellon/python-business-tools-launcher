@@ -153,6 +153,9 @@ def is_running(running: RunningTool) -> bool:
     entries = tool_entries.for_record(running)
     if entries.has_check:
         return tool_entries.check(entries).alive
+    if running.by_port:
+        # /api/health の無いツール。**そのツールのプロセスが**ポートで待ち受けているか
+        return port_owned(running, tool_pids(running))
     alive = app_alive(running)
     if alive is False:
         return False
@@ -284,6 +287,21 @@ def app_pids(running: RunningTool) -> set[int]:
         # exe そのものを実行しているプロセスだけを見る
         return desktop.process_tree(roots | set(desktop.find_by_exe(exe)))
     return desktop.related_pids(folder, roots)
+
+
+def port_owned(tool, pids) -> bool:
+    """そのツールのプロセス (`pids`) が、ツールのポートで待ち受けているか。
+
+    待ち受けの一覧が取れない環境では、ポートが開いていてプロセスが動いていればよい。
+    """
+    if not pids or tool.port <= 0:
+        return False
+    if any(port == tool.port for _, port in desktop.listening_ports(pids)):
+        return True
+    if desktop.port_listening(tool.port) is None:
+        # 待ち受けの一覧が取れない。開いていれば、動いているツールのものとみなす
+        return health.is_port_accepting(tool.port)
+    return False
 
 
 def app_alive(running: RunningTool) -> Optional[bool]:
@@ -739,6 +757,13 @@ def _wait_stopped(running: RunningTool, timeout: float) -> bool:
         # ツールの起動確認の入口が「動いていない」と言うまで
         return tool_entries.wait_until(entries, want_alive=False, timeout=timeout)
     deadline = time.monotonic() + timeout
+    if running.by_port:
+        # /api/health の無いツール。ツールのプロセスがポートを手放すまで
+        while port_owned(running, tool_pids(running)):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.3)
+        return True
     while True:
         alive = app_alive(running)
         server = (bool(running.health_url)

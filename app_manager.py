@@ -1068,6 +1068,10 @@ class ToolManager:
             how = self._wait_by_entries(tool, proc, entries, timeout,
                                         early_exit, seen, op, watch=watch)
             payload = {} if how == "entry" else None
+        elif tool_registry.confirms_by_port(tool):
+            # /api/health の無いツール (accdb_converter)。**ツールのプロセスが
+            # ポートで待ち受けた**ら起動できたとする (1.8.6)
+            payload = self._wait_port(tool, proc, timeout, early_exit, op, watch=watch)
         elif tool.is_app:
             how, payload, window_note = self._wait_app(tool, proc, timeout,
                                                        early_exit, seen, op,
@@ -1193,6 +1197,9 @@ class ToolManager:
                                        confirmed=not tool.health_url)
         else:
             running = _running_from_health(tool, payload, launch_pid=proc.pid)
+            if payload.get("_by_port"):
+                running.by_port = True
+                running.health_url = ""
             if tool.is_app and int(payload.get("port") or 0) != tool.port \
                     and payload.get("_health_url"):
                 window_note = _port_note(tool, int(payload["port"]))
@@ -1322,6 +1329,38 @@ class ToolManager:
                   detail=(f"{whys[0]}。\n" + (whys[1] + "\n" if len(whys) > 1 else "")
                           + _records_note(path)),
                   incident=path)
+
+    def _wait_port(self, tool: Tool, proc: subprocess.Popen, timeout: float,
+                   early_exit: dict, op: Optional[trace.Operation] = None, *,
+                   watch: Optional[Stopwatch] = None) -> Optional[dict]:
+        """/api/health の無いツールの起動を待つ。待ち受けたら `{"port": …}`、だめなら None。
+
+        **ツールのプロセス (起こしたもの・ツールのフォルダーのもの、その子・孫) が
+        ポートで待ち受けた**ことで、本人が起動したと確かめる。同じポートをほかの
+        アプリが使っていても取り違えない。
+        """
+        watch = watch or Stopwatch()
+        while True:
+            if tool.app_id in self._cancelled:
+                return None
+            elapsed = watch.elapsed()
+            code = proc.poll()
+            pids = process_manager.tool_pids(tool, launched=proc.pid)
+            if process_manager.port_owned(tool, pids):
+                log.info("ポート %s で待ち受けました: %s (%.1f秒)",
+                         tool.port, tool.display_name, elapsed)
+                if op is not None:
+                    op.step(f"ポート {tool.port} で待ち受けた ({elapsed:.1f}秒)")
+                return {"port": tool.port, "_by_port": True}
+            if code is not None and not pids:
+                early_exit["code"] = code
+                return None
+            stage = f"ポート {tool.port} で待ち受けるのを待っています"
+            self._set(State.STARTING, f"{tool.display_name}: {stage}", tool,
+                      elapsed=elapsed, phase=PHASE_WAIT, stage=stage, timeout=timeout)
+            if elapsed >= timeout:
+                return None
+            time.sleep(0.25)
 
     def _wait_app(self, tool: Tool, proc: subprocess.Popen, timeout: float,
                   early_exit: dict, seen: dict,

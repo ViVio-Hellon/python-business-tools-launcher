@@ -73,6 +73,9 @@ class RunningTool:
     # 動いていることで「起動した」とみなしたものは偽。確かめられるまでは、
     # 応答が無くても「落ちた」とは判断しない (プロセスの生死で見る)
     confirmed: bool = True
+    # /api/health の無いツール (1.8.6)。生死は「ツールのプロセスがポートで
+    # 待ち受けているか」で見る
+    by_port: bool = False
 
     @property
     def started_text(self) -> str:
