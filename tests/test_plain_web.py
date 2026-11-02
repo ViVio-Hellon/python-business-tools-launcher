@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from test_app_manager import ManagerTestCase  # noqa: E402
 
 import process_manager  # noqa: E402
 from app_manager import State  # noqa: E402
-from launcher import tool_registry  # noqa: E402
+from launcher import health, tool_registry  # noqa: E402
 from launcher.tool_registry import Tool  # noqa: E402
 
 SERVER = '''# -*- coding: utf-8 -*-
@@ -114,6 +115,32 @@ class LifecycleTests(ManagerTestCase):
         self.assertIn(tool.app_id, self.manager.running, "見回りで外しました")
         self.assertTrue(self.manager._stop_blocking(tool.app_id), self.manager.status.detail)
         self.assertFalse(process_manager.is_running(running))
+        self.assertFalse(health.is_port_accepting(port), "サーバーが残っています")
+
+    def test_すぐ戻る起動ファイルでもサーバーを止める(self) -> None:
+        """start_silent.vbs の形: start.bat を窓なしで起こして、すぐ戻る。"""
+        port = free_port()
+        start = make_plain_web(self.work_root, port=port)
+        silent = start.parent / "start_silent.bat"
+        # Windows では窓なしの `cmd /c "…\\start.bat"` が残り、そのコマンドラインに
+        # ツールの場所が入る。ここでは本体の Python を、場所の入ったコマンドラインで起こす
+        silent.write_text(f'#!/bin/sh\n"{sys.executable}" "{start.parent / "run_waitress.py"}" '
+                          '</dev/null >/dev/null 2>&1 &\nexit 0\n', encoding="utf-8")
+        os.chmod(silent, 0o755)
+        tool_registry.save(Tool(app_id="web.accdb_converter", display_name="DB", port=port,
+                                start_command=str(silent)))
+        tool = tool_registry.get("web.accdb_converter")
+        self.start(tool)
+        self.assertEqual(self.manager.status.state, State.RUNNING, self.manager.status.detail)
+        running = self.manager.running[tool.app_id]
+        self.assertTrue(running.pid, "待ち受けている本体の PID を覚えていません")
+        self.manager.poll_health()
+        self.assertIn(tool.app_id, self.manager.running)
+        self.assertTrue(self.manager._stop_blocking(tool.app_id), self.manager.status.detail)
+        deadline = time.monotonic() + 5
+        while health.is_port_accepting(port) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(health.is_port_accepting(port), "サーバーが残っています")
 
     def test_同じポートをほかのアプリが使っていても取り違えない(self) -> None:
         import socket

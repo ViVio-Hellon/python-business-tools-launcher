@@ -155,7 +155,9 @@ def is_running(running: RunningTool) -> bool:
         return tool_entries.check(entries).alive
     if running.by_port:
         # /api/health の無いツール。**そのツールのプロセスが**ポートで待ち受けているか
-        return port_owned(running, tool_pids(running))
+        if desktop.port_listening(running.port) is None:
+            return port_owned(running, tool_pids(running))   # 待ち受けの一覧が取れない
+        return bool(port_servers(running))
     alive = app_alive(running)
     if alive is False:
         return False
@@ -302,6 +304,24 @@ def port_owned(tool, pids) -> bool:
         # 待ち受けの一覧が取れない。開いていれば、動いているツールのものとみなす
         return health.is_port_accepting(tool.port)
     return False
+
+
+def port_servers(running) -> set[int]:
+    """ツールのプロセスのうち、ツールのポートで待ち受けているもの (本体)。
+
+    ツールのプロセス = ツールのフォルダーから起動したもの・ランチャーが起こした
+    起動ファイル、その子・孫、起動したときに待ち受けていた本体 (記録した PID)。
+    **待ち受けているのがそのどれかのときだけ**本人とみなす (ほかのアプリを取り違えない)。
+    """
+    owners = desktop.port_owners(running.port)
+    if not owners:
+        return set()
+    mine = set(tool_pids(running))
+    if running.launch_pid:
+        mine |= desktop.process_tree({running.launch_pid})
+    if running.pid:
+        mine.add(running.pid)
+    return owners & mine
 
 
 def app_alive(running: RunningTool) -> Optional[bool]:
@@ -759,7 +779,8 @@ def _wait_stopped(running: RunningTool, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     if running.by_port:
         # /api/health の無いツール。ツールのプロセスがポートを手放すまで
-        while port_owned(running, tool_pids(running)):
+        while (port_servers(running) if desktop.port_listening(running.port) is not None
+               else port_owned(running, tool_pids(running))):
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.3)
@@ -940,9 +961,15 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
     result = StopResult(app_id=running.app_id,
                         display_name=running.display_name)
 
+    tree = True
     if running.is_app and (app_exe(running) or script_app_folder(running)):
         # 起動した exe (start.bat) が終わっていても、ツールのフォルダーのプロセスを止める
         targets = sorted(app_pids(running))
+    elif running.by_port:
+        # /api/health の無いツール: ポートで待ち受けている本体と、起動ファイル。
+        # 子・孫はたどらない (本体が開いた利用者のブラウザーを巻き込まない)
+        targets = sorted(port_servers(running) | tool_processes(running))
+        tree = False
     else:
         targets = [pid for pid in (running.pid, running.launch_pid)
                    if pid and _is_alive(pid)]
@@ -965,7 +992,7 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
             continue
 
         log.info("PID %s を停止します (%s)", pid, verdict.reason)
-        if terminate(pid, force=False) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
+        if terminate(pid, force=False, tree=tree) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
             stopped_any = True
             continue
         if not force:
@@ -973,7 +1000,7 @@ def _stop_by_pid(running: RunningTool, *, force: bool) -> Optional[StopResult]:
                               "中断してでも止めるには --force を付けてください")
             refused = True
             continue
-        if terminate(pid, force=True) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
+        if terminate(pid, force=True, tree=tree) and _wait_pid_gone(pid, TERMINATE_WAIT_SEC):
             stopped_any = True
             result.method = "kill"
         else:
@@ -1016,6 +1043,11 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
         return Verdict(True, f"実行ファイルが {exe} です")
     if running.is_app and pid in app_pids(running):
         return Verdict(True, "ツールのフォルダーから起動したプロセスです")
+    if running.by_port and pid in port_servers(running):
+        # /api/health の無いツールの本体。コマンドラインに置き場所が入らない
+        # (`python run_waitress.py`) ので、**ツールのプロセスで、ツールのポートで
+        # 待ち受けている**ことで確かめる
+        return Verdict(True, f"ツールのプロセスで、ポート {running.port} で待ち受けています")
 
     command = process_command_line(pid)
     if not command:

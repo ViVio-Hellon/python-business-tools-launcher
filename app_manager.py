@@ -1340,6 +1340,7 @@ class ToolManager:
         アプリが使っていても取り違えない。
         """
         watch = watch or Stopwatch()
+        exited_at: Optional[float] = None
         while True:
             if tool.app_id in self._cancelled:
                 return None
@@ -1351,10 +1352,15 @@ class ToolManager:
                          tool.port, tool.display_name, elapsed)
                 if op is not None:
                     op.step(f"ポート {tool.port} で待ち受けた ({elapsed:.1f}秒)")
-                return {"port": tool.port, "_by_port": True}
+                owners = sorted(desktop.port_owners(tool.port) & set(pids))
+                return {"port": tool.port, "_by_port": True,
+                        "pid": owners[0] if owners else 0}
             if code is not None and not pids:
-                early_exit["code"] = code
-                return None
+                # 起動ファイルがすぐ戻る作り (start_silent.vbs) は、本体が見えるまで少し待つ
+                exited_at = exited_at if exited_at is not None else elapsed
+                if code != 0 or elapsed - exited_at >= STUB_GRACE_SEC:
+                    early_exit["code"] = code
+                    return None
             stage = f"ポート {tool.port} で待ち受けるのを待っています"
             self._set(State.STARTING, f"{tool.display_name}: {stage}", tool,
                       elapsed=elapsed, phase=PHASE_WAIT, stage=stage, timeout=timeout)

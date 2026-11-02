@@ -655,6 +655,17 @@ def listening_ports(pids: Pids) -> list[tuple[str, int]]:
     return sorted(found, key=lambda item: (item[1], item[0]))
 
 
+def port_owners(port: int) -> set[int]:
+    """そのポートで待ち受けているプロセスの PID。分からなければ空。"""
+    if port <= 0:
+        return set()
+    try:
+        rows = _listeners_windows() if IS_WINDOWS else _listeners_proc()
+    except Exception:                         # noqa: BLE001
+        return set()
+    return {pid for _, p, pid in rows if p == port and pid}
+
+
 def port_listening(port: int) -> Optional[bool]:
     """そのポートで**誰かが待ち受けているか**。分からなければ None。
 
