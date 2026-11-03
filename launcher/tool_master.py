@@ -759,12 +759,15 @@ def _check_duplicates(pcs: Iterable[MasterPc]) -> None:
 # 管理者が「更新中」の印を付けると、各 PC のランチャーが自分でそのツールを止め、
 # どうなったかを書き返す。処理中で止まらない PC は、利用者に知らせて待つ。
 # 管理者は PC ごとに強制終了を頼める。
+# ランチャー自身の更新の印 (アプリIDの代わり。1.8.11)
+LAUNCHER_MARK = "__launcher__"
+CLOSED = "closed"            # ランチャーを閉じた (待ち番が起動し直す)
 STOPPED = "stopped"          # 止めた
 NOT_RUNNING = "not_running"  # 使っていなかった
 BUSY = "busy"                # 処理中なので止まらない (利用者に知らせて待っている)
 FAILED = "failed"            # 止められなかった
 REPORT_LABELS = {STOPPED: "止めた", NOT_RUNNING: "使っていない", BUSY: "処理中 (待っています)",
-                 FAILED: "止められない"}
+                 FAILED: "止められない", CLOSED: "閉じた"}
 
 
 @dataclass(frozen=True)
@@ -782,6 +785,10 @@ class Maintenance:
     @property
     def started_text(self) -> str:
         return self.started_at[:19]
+
+    def set_by_this_pc(self) -> bool:
+        """この PC (このログインID) が付けた印か。"""
+        return self.started_by == " / ".join(this_pc())
 
 
 @dataclass(frozen=True)

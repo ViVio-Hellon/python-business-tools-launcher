@@ -155,6 +155,9 @@ class LauncherBar:
         self._maintenance = maintenance.Watcher(self.manager)
         self._maintenance_queue: queue.Queue = queue.Queue()
         self._maintenance_busy = False
+        # ランチャー自身の更新で閉じる最中か・閉じられなかった印 (同じ印で何度も試さない)
+        self._closing_for_update = False
+        self._update_failed: set[str] = set()
         # ツールが多いときの「選ぶ ▼」と［開く］(1.8.4)。少ないときは作らない
         self._select_mode = False
         self.selector: Optional[tk.Menubutton] = None
@@ -1027,6 +1030,59 @@ class LauncherBar:
             self._paint_buttons(self.manager.status)
         for app_id, name in result.ask_user:
             self._ask_to_close(name)
+        if result.close_launcher is not None:
+            self._close_for_update(result.close_launcher, result.master)
+
+    UPDATE_CLOSE_DELAY_MS = 5000
+
+    def _close_for_update(self, mark, master) -> None:
+        """ランチャー自身の更新 (1.8.11)。**ツールは止めずに**ランチャーだけ閉じる。
+
+        閉じる前に、その PC の中に「待ち番」を置く。管理者が更新を終えると、
+        待ち番がランチャーをもう一度起動する (動いているツールは引き継ぐ)。
+        ツールの起動・停止の途中・［設定］などを開いているあいだは閉じない (次に見たとき)。
+        """
+        if self._closing_for_update or mark.started_at in self._update_failed:
+            return
+        busy = self.manager.starting_ids or any(
+            self.manager.is_busy(a) for a in self.manager.running)
+        if busy or self._modal_window():
+            log.info("ランチャーの更新: 途中の操作があるので、終わってから閉じます")
+            return
+        if not maintenance.start_waiter(master):
+            self._update_failed.add(mark.started_at)
+            self.manager.notify(
+                "管理者がランチャーを更新しようとしていますが、自動で起動し直す準備が"
+                "できませんでした。\nランチャーを［終了］で閉じ、更新が終わってから起動してください。")
+            return
+        self._closing_for_update = True
+        maintenance.report_closed(master)
+        trace.event("ランチャーの更新のため閉じる", trace.INFO,
+                    detail=f"{mark.started_by} が {mark.started_text} に更新を始めた")
+        top = tk.Toplevel(self.root)
+        top.title("ランチャーの更新")
+        top.configure(bg=theme.BG)
+        top.attributes("-topmost", True)
+        tk.Label(top, text="ランチャーを更新します", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_TOOL, anchor="w").pack(fill="x", padx=18, pady=(16, 6))
+        tk.Label(top, text="管理者がランチャーを新しい版にしています。ランチャーはいったん閉じ、\n"
+                           "更新が終わると自動でもう一度起動します。\n"
+                           "使っているツールはそのまま使えます。",
+                 bg=theme.BG, fg=theme.FG, font=theme.FONT, justify="left",
+                 anchor="w").pack(fill="x", padx=18, pady=(0, 16))
+        top.update_idletasks()
+        x = (top.winfo_screenwidth() - top.winfo_reqwidth()) // 2
+        y = (top.winfo_screenheight() - top.winfo_reqheight()) // 3
+        top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.root.after(self.UPDATE_CLOSE_DELAY_MS, self._finish_close_for_update)
+
+    def _finish_close_for_update(self) -> None:
+        log.info("ランチャーの更新のため閉じます (ツールは動かしたまま)")
+        trace.event("ランチャー終了", trace.INFO, cause="ランチャーの更新 (ツールは動かしたまま)")
+        try:
+            self.manager.shutdown(stop_tools=False)
+        finally:
+            self.root.destroy()
 
     def _ask_to_close(self, name: str) -> None:
         """処理中で止まらなかった。**利用者に終了を頼む** (作業中のデータを失わない)。

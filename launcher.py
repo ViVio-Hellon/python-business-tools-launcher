@@ -62,6 +62,7 @@ ESSENTIAL_FILES = (
     "launcher/bar_positions.py", "launcher/browser.py", "launcher/desktop.py",
     "launcher/distribution.py", "launcher/fileprobe.py", "launcher/health.py",
     "launcher/logging_utils.py", "launcher/maintenance.py", "launcher/paths.py",
+    "launcher/restart_waiter.py",
     "launcher/runtime_state.py", "launcher/startup_progress.py", "launcher/stopwatch.py",
     "launcher/tool_entries.py", "launcher/tool_master.py", "launcher/tool_registry.py",
     "launcher/trace.py",
@@ -251,6 +252,9 @@ def start() -> int:
         # 窓を出す部品が読めない。窓なしで進める
         result = boot.run()
 
+    if not result.started and getattr(result, "held", False):
+        _show_message("ランチャーを更新しています", result.reason)
+        return 0
     if not result.started:
         _show_message("すでに起動しています",
                       f"{result.reason}\n\n"

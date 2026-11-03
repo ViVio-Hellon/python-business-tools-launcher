@@ -51,6 +51,8 @@ class BootResult:
     warnings: list[tuple[str, str]] = field(default_factory=list)
     # バーの［詳細］に出す案内 (ダイアログを出すほどではないもの)
     notices: list[str] = field(default_factory=list)
+    # ランチャーの更新中なので起動しなかった (待ち番が、終わったら起動する。1.8.11)
+    held: bool = False
     # 段ごとにかかった秒。遅い端末で**どこが遅いか**を後から追えるように
     timings: list[tuple[str, float]] = field(default_factory=list)
 
@@ -93,6 +95,9 @@ def run(report: Report = lambda step: None, *,
     try:
         enter(SETTINGS)
         _load_settings(result)
+        if _held_for_update(result):
+            launch_guard.remove_lock()
+            return result
 
         enter(ADOPT)
         from app_manager import ToolManager
@@ -228,6 +233,30 @@ def _check_start_files(manager) -> None:
             + "\n\nツールの置き場所が変わっていれば、［設定］の［参照］で"
               "指定し直してください。共有フォルダーなら、つながっているか"
               "確かめてください。")
+
+
+def _held_for_update(result: BootResult) -> bool:
+    """管理者がランチャーを更新している最中なら、起動しない (1.8.11)。
+
+    更新の途中のファイル (古い版と新しい版の混ざったもの) で動かさない。待ち番を
+    置いておき、更新が終わったら待ち番が起動する。
+    """
+    from launcher import maintenance, tool_master
+
+    mark = maintenance.launcher_hold()
+    if mark is None:
+        return False
+    path = tool_master.current_path()
+    if path is not None:
+        maintenance.start_waiter(path)
+    result.started = False
+    result.held = True
+    result.reason = (f"管理者がランチャーを更新しています ({mark.started_text} から)。\n"
+                     "更新が終わると、自動で起動します。")
+    log.info("ランチャーの更新中なので起動しません: %s", mark.started_by)
+    trace.event("ランチャー起動", trace.CANCELLED, cause="ランチャーの更新中",
+                detail=mark.started_by)
+    return True
 
 
 def _load_settings(result: BootResult) -> None:

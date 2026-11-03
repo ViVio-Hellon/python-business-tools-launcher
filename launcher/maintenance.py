@@ -16,9 +16,15 @@
 """
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from . import fileprobe, tool_master, tool_registry
@@ -39,6 +45,9 @@ READ_TIMEOUT_SEC = 5.0
 class PollResult:
     blocked: dict[str, str] = field(default_factory=dict)    # 更新中のツール (アプリID → 表示名)
     ask_user: list[tuple[str, str]] = field(default_factory=list)  # 終了を頼む (アプリID, 表示名)
+    # ランチャー自身の更新の印 (この PC で閉じる)。印を付けた PC では None
+    close_launcher: Optional[tool_master.Maintenance] = None
+    master: Optional[Path] = None
 
 
 class Watcher:
@@ -73,13 +82,17 @@ class Watcher:
         marks = _read(path)
         if marks is None:
             return None
+        launcher_mark = marks.pop(tool_master.LAUNCHER_MARK, None)
         local = tool_registry.all_tools(include_disabled=True)
         # 印 → この PC のツールのアプリID (アプリIDが違っても、起動ファイルで見つける)
         targets = {app_id: _local_ids(mark, local) for app_id, mark in marks.items()}
         blocked = {target: (mark.name or app_id)
                    for app_id, mark in marks.items() for target in targets[app_id]}
         self.manager.set_blocked(set(blocked))
-        result = PollResult(blocked=blocked)
+        result = PollResult(blocked=blocked, master=path)
+        if launcher_mark is not None and not launcher_mark.set_by_this_pc():
+            # ランチャー自身の更新。閉じるのはバー (画面) の仕事
+            result.close_launcher = launcher_mark
         for app_id, mark in marks.items():
             try:
                 self._handle(path, mark, targets[app_id], result)
@@ -188,6 +201,107 @@ def _take_force(path, app_id: str) -> bool:
     except tool_master.MasterError as exc:
         log.warning("強制終了の依頼を確かめられません: %s", exc)
         return False
+
+
+# ------------------------------------------------------------------
+# ランチャー自身の更新 (1.8.11)
+# ------------------------------------------------------------------
+WAITER_NAME = "restart_waiter.py"
+WAITER_PID = "restart_waiter.pid"
+
+
+def launcher_hold() -> Optional[tool_master.Maintenance]:
+    """ランチャー更新中の印 (この PC が付けたものは除く)。無い・読めなければ None。
+
+    起動したときに見る。印があれば起動せず、待ち番に任せる。
+    """
+    try:
+        path = tool_master.current_path()
+        if path is None or not fileprobe.probe(path).found:
+            return None
+        marks = _read(path) or {}
+    except Exception:                         # noqa: BLE001 - 起動を止めない
+        log.warning("ランチャー更新中の印を確かめられませんでした", exc_info=True)
+        return None
+    mark = marks.get(tool_master.LAUNCHER_MARK)
+    if mark is None or mark.set_by_this_pc():
+        return None
+    return mark
+
+
+def restart_command() -> list[str]:
+    """待ち番がランチャーを起動し直すコマンド (更新したあとの、新しい版の起動ファイル)。"""
+    from . import app_config
+
+    start = app_config.APP_ROOT / "Start.vbs"
+    if os.name == "nt" and start.is_file():
+        return ["wscript.exe", str(start)]
+    return [sys.executable, str(app_config.APP_ROOT / "launcher.py")]
+
+
+def waiter_running() -> bool:
+    """待ち番が動いているか (番号が使い回されていても取り違えない)。"""
+    from . import app_config
+
+    import process_manager
+
+    pid_file = app_config.local_dir("runtime") / WAITER_PID
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    if not process_manager._is_alive(pid):
+        return False
+    command = process_manager.process_command_line(pid)
+    return not command or WAITER_NAME in command
+
+
+def start_waiter(master: Path) -> bool:
+    """待ち番を**この PC の中にコピーして**動かす。動いていればそのまま。動かせたら真。"""
+    from . import app_config
+
+    if waiter_running():
+        return True
+    folder = app_config.local_dir("runtime")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        script = folder / WAITER_NAME
+        shutil.copyfile(Path(__file__).with_name(WAITER_NAME), script)
+        command = [_pythonw(), "-I", str(script), "--master", str(master),
+                   "--command", json.dumps(restart_command(), ensure_ascii=False),
+                   "--pid-file", str(folder / WAITER_PID)]
+        flags = 0
+        if os.name == "nt":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                     | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.Popen(command, cwd=str(folder), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, creationflags=flags,
+                         start_new_session=os.name != "nt")
+    except (OSError, ValueError) as exc:
+        log.error("ランチャーの更新の待ち番を動かせませんでした: %s", exc)
+        return False
+    log.info("ランチャーの更新の待ち番を動かしました: %s", script)
+    return True
+
+
+def _pythonw() -> str:
+    """窓を出さない Python (Windows の pythonw.exe)。無ければいまの Python。"""
+    exe = Path(sys.executable)
+    if os.name == "nt" and exe.name.lower() == "python.exe":
+        quiet = exe.with_name("pythonw.exe")
+        if quiet.is_file():
+            return str(quiet)
+    return str(exe)
+
+
+def report_closed(master: Path) -> None:
+    try:
+        tool_master.report(master, tool_master.LAUNCHER_MARK, tool_master.CLOSED,
+                           "更新が終わると自動で起動します")
+    except tool_master.MasterError as exc:
+        log.warning("ランチャーを閉じたことを書き返せませんでした: %s", exc)
 
 
 def _read(path) -> Optional[dict[str, tool_master.Maintenance]]:

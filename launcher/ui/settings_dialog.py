@@ -334,6 +334,68 @@ class SettingsDialog:
                      "PCごとに出すツールを決めるときは［PCごとの表示］へ。")
         self._update_status()
         self._build_master_panel()
+        if hasattr(self, "launcher_update_box"):
+            self._build_launcher_update_box()
+
+    def _build_launcher_update_box(self) -> None:
+        """［ランチャーの更新のため全 PC で閉じる］(1.8.11)。"""
+        box = self.launcher_update_box
+        for child in box.winfo_children():
+            child.destroy()
+        tk.Label(box, text="ランチャーの更新", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_BOLD, anchor="w").pack(fill="x")
+        if not self.shared:
+            tk.Label(box, text="ツール管理マスタを使うと、全 PC のランチャーを閉じて更新できます"
+                               " (［PCごとの表示］で場所を決めます)",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                     anchor="w").pack(fill="x", pady=(4, 0))
+            return
+        line = tk.Frame(box, bg=theme.BG)
+        line.pack(fill="x", pady=(4, 0))
+        if self.master_var.get().strip() != self._master_before.strip():
+            tk.Label(line, text="ツール管理マスタの場所を変えました。保存してから使えます",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left")
+            return
+        mark = self._marks(fresh=True).get(tool_master.LAUNCHER_MARK)
+        if mark is None:
+            self._action_button(line, "ランチャーの更新のため全 PC で閉じる",
+                                self.begin_launcher_update).pack(side="left")
+            tk.Label(box, text="各 PC のランチャーを閉じます (ツールは止めません)。"
+                               "ランチャーのフォルダーを上書きして［更新を終える］を押すと、"
+                               "各 PC で自動でもう一度起動します。この PC のランチャーは閉じません",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w",
+                     justify="left", wraplength=900).pack(fill="x", pady=(4, 0))
+        else:
+            self._action_button(line, "更新の状況を見る",
+                                self.open_launcher_update).pack(side="left")
+            tk.Label(line, text=f"ランチャーを更新中 ({mark.started_text} から・{mark.started_by})",
+                     bg=theme.BG, fg=theme.STATE_COLORS["starting"],
+                     font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
+
+    def begin_launcher_update(self) -> None:
+        if not messagebox.askyesno(
+                "ランチャーの更新",
+                "全 PC のランチャーを閉じます (この PC は閉じません)。\n\n"
+                "・各 PC のランチャーが 10 秒ほどのうちに閉じます。ツールは止めません\n"
+                "・ツールの起動・停止の途中や［設定］を開いている PC は、終わってから閉じます\n"
+                "・更新を終えるまで、ランチャーを起動しても「更新しています」と出て閉じます\n"
+                "・［更新を終える］で、各 PC のランチャーが自動でもう一度起動します\n\n"
+                "ツール管理マスタや配布先フォルダを、ランチャーのフォルダーの中に置いていると、\n"
+                "上書きで消えます。よろしいですか?", parent=self.top):
+            return
+        try:
+            tool_master.begin_maintenance(self._master_path(), tool_master.LAUNCHER_MARK,
+                                          "ランチャー")
+        except MasterError as exc:
+            messagebox.showerror("ランチャーの更新",
+                                 f"ツール管理マスタに書けませんでした。\n{exc}", parent=self.top)
+            return
+        self.open_launcher_update()
+
+    def open_launcher_update(self) -> None:
+        UpdateDialog(self.top, self._master_path(), tool_master.LAUNCHER_MARK, "ランチャー",
+                     launcher=True)
+        self._build_launcher_update_box()
 
     def _update_status(self) -> None:
         path = self._master_path()
@@ -1101,6 +1163,9 @@ class SettingsDialog:
                             "ログの書き先と、ほかの PC へ配るための配布先フォルダです。")
         self._build_log_dir(frame)
         self._build_distribution(frame)
+        # ランチャー自身の更新 (1.8.11)。ツール管理マスタを使っているときだけ
+        self.launcher_update_box = tk.Frame(frame, bg=theme.BG)
+        self.launcher_update_box.pack(fill="x", pady=(22, 0))
 
     def _build_log_dir(self, parent: tk.Frame) -> None:
         """ログの出力先 (後追い・なぜなぜ分析の記録)。
@@ -1549,8 +1614,10 @@ class UpdateDialog:
     REFRESH_MS = 3000
 
     def __init__(self, parent: tk.Misc, path: Path, app_id: str, name: str, *,
-                 master_no: int = 0) -> None:
+                 master_no: int = 0, launcher: bool = False) -> None:
         self.path, self.app_id, self.name, self.master_no = path, app_id, name, master_no
+        # ランチャー自身の更新 (1.8.11)。返事は「閉じた」、待つのは PC の行の全部
+        self.launcher = launcher
         self.ended = False
         self._job = None
         self.parent = parent
@@ -1575,9 +1642,13 @@ class UpdateDialog:
         self.table = tk.Frame(self.top, bg=theme.UTIL_BG)
         self.table.pack(fill="both", expand=True, padx=16)
         tk.Label(self.top,
-                 text="全部が「止めた」か「使っていない」になったら、ツールのフォルダーを上書きして"
-                      "ください。\n「返事なし」は、ランチャーを起動していない・電源が切れている・"
-                      "共有フォルダーにつながっていない PC です (その PC では、起きたときに止めます)。",
+                 text=("全部が「閉じた」になったら、ランチャーのフォルダーを上書きしてください。\n"
+                       "「返事なし」は、ランチャーを起動していない・電源が切れている・共有フォルダーに"
+                       "つながっていない PC です (閉じる必要はありません。次に起動したとき新しい版に"
+                       "なります)。" if launcher else
+                       "全部が「止めた」か「使っていない」になったら、ツールのフォルダーを上書きして"
+                       "ください。\n「返事なし」は、ランチャーを起動していない・電源が切れている・"
+                       "共有フォルダーにつながっていない PC です (その PC では、起きたときに止めます)。"),
                  bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w",
                  justify="left").pack(fill="x", padx=16, pady=(8, 0))
         buttons = tk.Frame(self.top, bg=theme.BG)
@@ -1618,9 +1689,15 @@ class UpdateDialog:
             master = tool_master.read(self.path)
         except MasterError:
             master = None
-        if master is not None and self.master_no:
+        login, here = tool_master.this_pc()
+        if master is not None and (self.master_no or self.launcher):
             for pc in master.pcs:
-                if not pc.enabled or self.master_no not in pc.tool_nos or not pc.pc_name:
+                if not pc.enabled or not pc.pc_name:
+                    continue
+                if self.launcher:
+                    if pc.pc_name.casefold() == here.casefold():
+                        continue              # この PC (印を付けた PC) は閉じない
+                elif self.master_no not in pc.tool_nos:
                     continue
                 key = (pc.pc_name.casefold(), pc.login_id.casefold())
                 if key in seen or (not pc.login_id and pc.pc_name.casefold() in seen_pc):
@@ -1651,7 +1728,8 @@ class UpdateDialog:
         for row in rows:
             counts[row[2]] = counts.get(row[2], 0) + 1
         self._show_verdict(rows)
-        order = ("止めた", "使っていない", "処理中 (待っています)", "止められない", "返事なし")
+        order = ("閉じた", "止めた", "使っていない", "処理中 (待っています)", "止められない",
+                 "返事なし")
         self.summary.configure(text="  ・  ".join(f"{k} {counts[k]}" for k in order
                                                 if counts.get(k)) or "まだ返事がありません")
         for child in self.table.winfo_children():
@@ -1661,6 +1739,7 @@ class UpdateDialog:
                      font=theme.FONT_SMALL, anchor="w").grid(row=0, column=column, sticky="w",
                                                              padx=(8, 4), pady=(6, 2))
         colors = {"止めた": theme.STATE_COLORS["running"],
+                  "閉じた": theme.STATE_COLORS["running"],
                   "使っていない": theme.MUTED,
                   "処理中 (待っています)": theme.STATE_COLORS["starting"],
                   "止められない": theme.STATE_COLORS["error"],
@@ -1681,7 +1760,7 @@ class UpdateDialog:
                     row=line, column=5, sticky="w", padx=(8, 8), pady=1)
         self._job = self.top.after(self.REFRESH_MS, self.refresh)
 
-    DONE_STATES = ("止めた", "使っていない")
+    DONE_STATES = ("止めた", "使っていない", "閉じた")
 
     def _show_verdict(self, rows) -> None:
         """全部止まったか。止まっていなければ、**どの PC か**を名前で出す。"""
@@ -1694,6 +1773,10 @@ class UpdateDialog:
             more = f" ほか {len(waiting) - 8} 台" if len(waiting) > 8 else ""
             text = f"まだ上書きしないでください。止まっていない PC: {names}{more}"
             bg, done = theme.TOOL_BUSY, False
+        elif self.launcher:
+            text = (f"全 PC でランチャーを閉じました ({len(rows)} 台)。ランチャーのフォルダーを"
+                    "上書きしてかまいません。終わったら［更新を終える］を押してください")
+            bg, done = theme.TOOL_RUNNING, True
         else:
             text = (f"全 PC で止まりました ({len(rows)} 台)。ツールのフォルダーを上書きして"
                     "かまいません。終わったら［更新を終える］を押してください")
@@ -1725,8 +1808,10 @@ class UpdateDialog:
     def end(self) -> None:
         if not messagebox.askyesno(
                 "更新を終える",
-                f"「{self.name}」の更新を終えます。\n各 PC で、このツールをまた起動できるように"
-                "なります。\n\nフォルダーの上書きは終わりましたか?", parent=self.top):
+                ("ランチャーの更新を終えます。\n各 PC のランチャーが、10 秒ほどのうちに自動で"
+                 "もう一度起動します。\n\nフォルダーの上書きは終わりましたか?" if self.launcher else
+                 f"「{self.name}」の更新を終えます。\n各 PC で、このツールをまた起動できるように"
+                 "なります。\n\nフォルダーの上書きは終わりましたか?"), parent=self.top):
             return
         try:
             tool_master.end_maintenance(self.path, self.app_id)
