@@ -1631,7 +1631,8 @@ class ToolManager:
         try:
             proc = subprocess.Popen(
                 command,
-                cwd=tool.resolved_work_dir or None,
+                # 共有フォルダーの .bat は、cmd が作業フォルダーにできない (1.8.13)
+                cwd=paths.entry_cwd(tool.start_command, tool.resolved_work_dir or None),
                 # BATの末尾の `pause` で固まらせない。標準入力が
                 # 最初から終わっていれば `pause` はすぐ抜ける
                 stdin=subprocess.DEVNULL,

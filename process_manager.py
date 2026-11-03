@@ -251,7 +251,7 @@ def _recorded_roots(running: RunningTool) -> set[int]:
     for pid in {running.pid, running.launch_pid}:
         if not pid or not _is_alive(pid):
             continue
-        command = _normalize_path(process_command_line(pid))
+        command = _paths.as_unc(_normalize_path(process_command_line(pid)))
         for marker in (running.start_command, running.app_root, running.work_dir):
             needle = _normalize_path(marker)
             if _is_specific_enough(needle) and needle in command:
@@ -718,7 +718,7 @@ def _stop_by_bat(running: RunningTool, *, force: bool,
     try:
         completed = subprocess.run(
             command,
-            cwd=running.work_dir or str(script.parent),
+            cwd=_paths.entry_cwd(script, running.work_dir or str(script.parent)),
             # 最後の pause を飛ばす合図 (コイル包装仕様の stop.bat が読む。ほかは無視する)
             env={**os.environ, "STOP_NOPAUSE": "1"},
             stdin=subprocess.DEVNULL,      # BAT末尾の `pause` で固まらせない
@@ -1056,7 +1056,7 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
     if not command:
         return Verdict(False, "コマンドラインを取得できませんでした")
 
-    haystack = _normalize_path(command)
+    haystack = _paths.as_unc(_normalize_path(command))
     for marker in (running.start_command, running.app_root, running.work_dir):
         needle = _normalize_path(marker)
         if not _is_specific_enough(needle):

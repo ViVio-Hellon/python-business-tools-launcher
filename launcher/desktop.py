@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Union
 
 from .logging_utils import get_logger
+from .paths import as_unc as _as_unc
 from .paths import normalize as _normalize
 
 log = get_logger("desktop")
@@ -601,12 +602,13 @@ def processes_in_folder(folder: str) -> list[int]:
         if pid in (0, 4) or pid in protected:
             continue
         image = process_image(pid)
-        if IS_WINDOWS and _normalize(image).startswith(wanted):
+        # pushd で割り当てたドライブ文字 (Z:\…) から動いていても、共有フォルダーの道で見る
+        if IS_WINDOWS and _as_unc(_normalize(image)).startswith(wanted):
             found.append(pid)
             continue
         if image and not is_script_host(image):
             continue
-        if wanted in _normalize(command_line(pid)) + "/":
+        if wanted in _as_unc(_normalize(command_line(pid))) + "/":
             if not IS_WINDOWS and _is_zombie(pid):
                 continue
             found.append(pid)
