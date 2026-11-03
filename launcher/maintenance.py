@@ -239,21 +239,42 @@ def restart_command() -> list[str]:
     return [sys.executable, str(app_config.APP_ROOT / "launcher.py")]
 
 
+# 番号のファイルを書いた時刻と、プロセスの起動の時刻の差の許し (秒)
+WAITER_REUSE_MARGIN_SEC = 2.0
+
+
 def waiter_running() -> bool:
-    """待ち番が動いているか (番号が使い回されていても取り違えない)。"""
-    from . import app_config
+    """待ち番が動いているか (番号が使い回されていても取り違えない)。
+
+    待ち番が動いたまま PC を終了すると、番号のファイルが残る。再起動のあと、
+    別のプログラムが同じ番号を持つことがある (Windows は番号を使い回す)。
+    取り違えると待ち番を置かずに閉じ、**更新のあとランチャーが起動しない**。
+
+    * ファイルを書いた時刻より後に起動したプロセスは、書いた本人ではない
+    * コマンドラインが読めれば、待ち番の名前が入っているかで決める
+    * どちらも分からなければ「動いていない」とする (もう1つ置いても害は無い:
+      ランチャーは二重には起動しない)
+    """
+    from . import app_config, desktop
 
     import process_manager
 
     pid_file = app_config.local_dir("runtime") / WAITER_PID
     try:
         pid = int(pid_file.read_text(encoding="utf-8").strip())
+        written = pid_file.stat().st_mtime
     except (OSError, ValueError):
         return False
     if not process_manager._is_alive(pid):
         return False
+    started = desktop.process_started_at(pid)
+    if started is not None and started > written + WAITER_REUSE_MARGIN_SEC:
+        log.info("待ち番の番号 %s は別のプロセスでした (番号の使い回し)", pid)
+        return False
     command = process_manager.process_command_line(pid)
-    return not command or WAITER_NAME in command
+    if command:
+        return WAITER_NAME in command
+    return started is not None
 
 
 def start_waiter(master: Path) -> bool:

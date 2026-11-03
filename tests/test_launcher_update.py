@@ -85,6 +85,49 @@ class WaiterTests(UpdateTestCase):
                          maintenance.restart_command())
 
 
+    def _waiter_pid_file(self, pid: int, *, written: float) -> Path:
+        folder = app_config.local_dir("runtime")
+        folder.mkdir(parents=True, exist_ok=True)
+        pid_file = folder / maintenance.WAITER_PID
+        pid_file.write_text(str(pid), encoding="utf-8")
+        os.utime(pid_file, (written, written))
+        return pid_file
+
+    def test_再起動のあと番号を使い回した別のプログラムを待ち番と取り違えない(self) -> None:
+        """待ち番が動いたまま PC を終了すると、番号のファイルが残る。再起動のあと
+        同じ番号を持つ別のプログラム (ファイルより後に起動した) は待ち番ではない。"""
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (other.kill(), other.wait()))
+        time.sleep(0.3)
+        # ファイルは 1 時間前 (再起動の前) に書かれた
+        self._waiter_pid_file(other.pid, written=time.time() - 3600)
+        with mock.patch.object(maintenance, "WAITER_NAME", "python"):
+            # 名前が合っても、起動の時刻がファイルより後なら別のプロセス
+            self.assertFalse(maintenance.waiter_running())
+
+    def test_コマンドラインが読めないときも起動の時刻で決める(self) -> None:
+        import process_manager
+
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (other.kill(), other.wait()))
+        time.sleep(0.3)
+        with mock.patch.object(process_manager, "process_command_line", return_value=""):
+            self._waiter_pid_file(other.pid, written=time.time() - 3600)
+            self.assertFalse(maintenance.waiter_running(), "別のプログラムを待ち番とみなしました")
+            # 番号を書いたのがそのプロセス自身 (書いた時刻より前に起動していた)
+            self._waiter_pid_file(other.pid, written=time.time())
+            self.assertTrue(maintenance.waiter_running())
+
+    def test_番号が使い回されていたら待ち番を置き直す(self) -> None:
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (other.kill(), other.wait()))
+        time.sleep(0.3)
+        self._waiter_pid_file(other.pid, written=time.time() - 3600)
+        with mock.patch.object(maintenance.subprocess, "Popen") as popen:
+            self.assertTrue(maintenance.start_waiter(self.path))
+        popen.assert_called_once()
+
+
 class WatcherTests(UpdateTestCase):
 
     def test_ほかのPCが付けた印なら閉じるよう伝える(self) -> None:
