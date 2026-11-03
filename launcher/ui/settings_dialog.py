@@ -1566,6 +1566,12 @@ class UpdateDialog:
         self.summary = tk.Label(self.top, text="", bg=theme.BG, fg=theme.FG,
                                 font=theme.FONT_BOLD, anchor="w", justify="left")
         self.summary.pack(fill="x", padx=16, pady=(8, 4))
+        # **上書きしてよいかの合図** (全部止まった / まだのところ)。いちばん目立たせる
+        self.verdict = tk.Label(self.top, text="", bg=theme.UTIL_BG, fg=theme.FG,
+                                font=theme.FONT_BOLD, anchor="w", justify="left",
+                                padx=12, pady=8, wraplength=860)
+        self.verdict.pack(fill="x", padx=16, pady=(0, 8))
+        self.all_stopped = False
         self.table = tk.Frame(self.top, bg=theme.UTIL_BG)
         self.table.pack(fill="both", expand=True, padx=16)
         tk.Label(self.top,
@@ -1644,6 +1650,7 @@ class UpdateDialog:
         counts: dict[str, int] = {}
         for row in rows:
             counts[row[2]] = counts.get(row[2], 0) + 1
+        self._show_verdict(rows)
         order = ("止めた", "使っていない", "処理中 (待っています)", "止められない", "返事なし")
         self.summary.configure(text="  ・  ".join(f"{k} {counts[k]}" for k in order
                                                 if counts.get(k)) or "まだ返事がありません")
@@ -1673,6 +1680,33 @@ class UpdateDialog:
                           bd=0, padx=8, font=theme.FONT_SMALL, cursor="hand2").grid(
                     row=line, column=5, sticky="w", padx=(8, 8), pady=1)
         self._job = self.top.after(self.REFRESH_MS, self.refresh)
+
+    DONE_STATES = ("止めた", "使っていない")
+
+    def _show_verdict(self, rows) -> None:
+        """全部止まったか。止まっていなければ、**どの PC か**を名前で出す。"""
+        waiting = [r for r in rows if r[2] not in self.DONE_STATES]
+        if not rows:
+            text, bg = "まだどの PC からも返事がありません (10 秒ほどで届きます)", theme.UTIL_BG
+            done = False
+        elif waiting:
+            names = "、".join(f"{r[0]} ({r[2]})" for r in waiting[:8])
+            more = f" ほか {len(waiting) - 8} 台" if len(waiting) > 8 else ""
+            text = f"まだ上書きしないでください。止まっていない PC: {names}{more}"
+            bg, done = theme.TOOL_BUSY, False
+        else:
+            text = (f"全 PC で止まりました ({len(rows)} 台)。ツールのフォルダーを上書きして"
+                    "かまいません。終わったら［更新を終える］を押してください")
+            bg, done = theme.TOOL_RUNNING, True
+        self.verdict.configure(text=text, bg=bg)
+        if done and not self.all_stopped:
+            # 窓を見ていなくても気づけるように、止まり切ったときに1回だけ鳴らす
+            try:
+                self.top.bell()
+            except tk.TclError:
+                pass
+            trace.event("全 PC で止まった", trace.OK, detail=f"{self.name} ({len(rows)} 台)")
+        self.all_stopped = done
 
     def force(self, pc_name: str, login_id: str) -> None:
         if not messagebox.askyesno(

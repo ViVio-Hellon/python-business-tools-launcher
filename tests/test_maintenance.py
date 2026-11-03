@@ -260,6 +260,13 @@ class ScreenTests(LocalAreaTestCase):
             dialog = holder["dialog"]
             seen["rows"] = dialog.rows()
             seen["summary"] = dialog.summary.cget("text")
+            seen["verdict"] = dialog.verdict.cget("text")
+            # 残りの PC も止まったら「上書きしてかまいません」
+            with mock.patch.object(dialog, "rows", return_value=[
+                    (PC, LOGIN, "止めた", "", "", False),
+                    ("NLM-NGY-250962", "Xfa-Ngyshizai", "使っていない", "", "", False)]):
+                dialog.refresh()
+            seen["done"] = (dialog.verdict.cget("text"), dialog.all_stopped)
             with mock.patch.object(settings_dialog.messagebox, "askyesno", return_value=True):
                 dialog.force(PC, LOGIN)
                 dialog.end()
@@ -282,6 +289,11 @@ class ScreenTests(LocalAreaTestCase):
                           ("NLM-NGY-250962", "返事なし", False)])
         self.assertIn("処理中 (待っています) 1", seen["summary"])
         self.assertIn("返事なし 1", seen["summary"])
+        self.assertIn("まだ上書きしないでください", seen["verdict"])
+        self.assertIn(f"{PC} (処理中 (待っています))", seen["verdict"])
+        self.assertIn("NLM-NGY-250962 (返事なし)", seen["verdict"])
+        self.assertIn("全 PC で止まりました (2 台)", seen["done"][0])
+        self.assertTrue(seen["done"][1])
         self.assertTrue(dialog.ended)
         self.assertEqual(tool_master.under_maintenance(path), {})
 
