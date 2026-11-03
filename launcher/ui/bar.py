@@ -153,6 +153,7 @@ class LauncherBar:
         self._hidden: list[str] = []
         # 管理者が「更新中」にしたツール (アプリID → 表示名)。ボタンに「更新中」と出す
         self._blocked: dict[str, str] = {}
+        self._update_marks: dict = {}
         self._maintenance = maintenance.Watcher(self.manager)
         self._maintenance_queue: queue.Queue = queue.Queue()
         self._maintenance_busy = False
@@ -606,6 +607,7 @@ class LauncherBar:
         if app_id in self._blocked:
             # 更新中。起動しないので、バーも動かさない (manager が理由を出す)
             self.manager.select(app_id)
+            self._offer_end_update(app_id)
             return
         self._engaged = True
         if self._select_mode and app_id in self._names:
@@ -621,6 +623,66 @@ class LauncherBar:
             # manager がそちらを前に出す
             self.progress.reveal(app_id)
         self.manager.select(app_id)
+
+    def _offer_end_update(self, app_id: str) -> None:
+        """「（更新中）」が押された。誰がいつから更新しているかを出し、**管理者なら
+        その場で更新を終えられる** (1.8.16)。［設定］を開かなくてよい。"""
+        mark = self._update_marks.get(app_id)
+        name = self._blocked.get(app_id) or self._names.get(app_id, app_id)
+        if mark is None:
+            return
+        age = mark.age_hours()
+        since = f"{mark.started_text} から" + (f" ({age:.0f} 時間前)" if age and age >= 1 else "")
+        if not messagebox.askyesno(
+                "更新中",
+                f"「{name}」は更新中です。\n更新を始めた人: {mark.started_by}\n{since}\n\n"
+                "更新が終わると、ボタンはもとに戻ります。\n"
+                "────────────\n"
+                "管理者の方へ: 上書きが終わっているのに［更新を終える］を押し忘れた"
+                "ときは、ここで終えられます。終えますか?",
+                icon="info", default="no", parent=self.root):
+            return
+        if not self._ask_admin_password():
+            return
+        text = maintenance.end_tool_update_by_admin(app_id, mark)
+        messagebox.showinfo("更新を終える", text, parent=self.root)
+        self._poll_maintenance_soon()
+
+    def _ask_admin_password(self) -> bool:
+        # simpledialog は使わない (画面の外に出る。launcher/ui/password.py を見る)
+        from launcher import distribution
+
+        from .password import _Prompt
+
+        for _ in range(3):
+            text = _Prompt(self.root, "管理者のパスワード",
+                           "更新を終えるには、管理者パスワードを入力してください").value
+            if text is None:
+                return False
+            if distribution.verify_password(text):
+                return True
+            messagebox.showerror("管理者のパスワード", "パスワードが違います。", parent=self.root)
+        return False
+
+    def _poll_maintenance_soon(self) -> None:
+        """印を外した。次の見回りを待たずに、ボタンをもとに戻す。"""
+        if self._maintenance_busy:
+            return
+        self._maintenance_busy = True
+        self._maintenance_started = time.monotonic()
+        token = object()
+        self._maintenance_token = token
+
+        def work() -> None:
+            try:
+                result = self._maintenance.poll()
+                if result is not None:
+                    self._maintenance_queue.put(result)
+            finally:
+                if self._maintenance_token is token:
+                    self._maintenance_busy = False
+
+        threading.Thread(target=work, name="maintenance-now", daemon=True).start()
 
     def on_stop_tool(self) -> None:
         """［ツール停止］。動いているツールを止める。ランチャーは残る。
@@ -1042,6 +1104,7 @@ class LauncherBar:
         self.root.after(int(maintenance.POLL_SEC * 1000), self._poll_maintenance)
 
     def _apply_maintenance(self, result) -> None:
+        self._update_marks = dict(result.marks)
         if result.blocked != self._blocked:
             self._blocked = dict(result.blocked)
             self._paint_buttons(self.manager.status)

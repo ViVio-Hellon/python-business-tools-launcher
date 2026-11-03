@@ -50,6 +50,8 @@ class PollResult:
     master: Optional[Path] = None
     # 管理者が［強制で閉じる］を押した (待っている理由があっても閉じる。1.8.14)
     force_close: bool = False
+    # この PC のツールのアプリID → その印 (バーが「誰が・いつから」を出す。1.8.16)
+    marks: dict[str, tool_master.Maintenance] = field(default_factory=dict)
 
 
 class Watcher:
@@ -87,6 +89,7 @@ class Watcher:
         marks = _read(path)
         if marks is None:
             return None
+        self._clear_forgotten(path, marks)
         launcher_mark = marks.pop(tool_master.LAUNCHER_MARK, None)
         local = tool_registry.all_tools(include_disabled=True)
         # 印 → この PC のツールのアプリID (アプリIDが違っても、起動ファイルで見つける)
@@ -94,9 +97,10 @@ class Watcher:
         blocked = {target: (mark.name or app_id)
                    for app_id, mark in marks.items() for target in targets[app_id]}
         self.manager.set_blocked(set(blocked))
-        result = PollResult(blocked=blocked, master=path)
-        if launcher_mark is not None and not launcher_mark.set_by_this_pc() \
-                and not launcher_mark_stale(launcher_mark):
+        result = PollResult(blocked=blocked, master=path,
+                            marks={target: mark for app_id, mark in marks.items()
+                                   for target in targets[app_id]})
+        if launcher_mark is not None and not launcher_mark.set_by_this_pc():
             # ランチャー自身の更新。閉じるのはバー (画面) の仕事
             result.close_launcher = launcher_mark
             result.force_close = _take_force(path, tool_master.LAUNCHER_MARK)
@@ -111,6 +115,32 @@ class Watcher:
             self._tried.pop(key, None)
         self._asked &= live
         return result
+
+    def _clear_forgotten(self, path, marks: dict) -> None:
+        """外し忘れた印 (`MARK_MAX_HOURS` より古い) を**マスタから外す** (1.8.16)。
+
+        ［更新を終える］を押し忘れて帰ると、夜のあいだ全 PC でそのツール (または
+        ランチャー) が起動しなかった。手でコマンドを打たなくても直るように、どの PC の
+        ランチャーでも、見つけたら外す。マスタから外すので、**前の版のランチャーも
+        もとに戻る**。外せなくても (読むだけの共有フォルダー)、この PC では無いものとする。
+        """
+        from . import trace
+
+        for app_id, mark in list(marks.items()):
+            if not mark_stale(mark):
+                continue
+            marks.pop(app_id)
+            try:
+                tool_master.end_maintenance(path, app_id, mark.start_command)
+            except tool_master.MasterError as exc:
+                log.warning("外し忘れの「更新中」を外せませんでした: %s (%s)", app_id, exc)
+                continue
+            age = mark.age_hours() or 0.0
+            log.warning("外し忘れの「更新中」を外しました: %s (%s が %s に付けた・%.1f 時間前)",
+                        mark.name or app_id, mark.started_by, mark.started_text, age)
+            trace.event("外し忘れの「更新中」を外した", trace.WARNING,
+                        detail=f"{mark.name or app_id} — {mark.started_by} が "
+                               f"{mark.started_text} に付けた ({age:.1f} 時間前)")
 
     def _heartbeat(self, path) -> None:
         """「この PC で、この版のランチャーが動いている」を書く (1 分に 1 回。1.8.14)。"""
@@ -246,25 +276,45 @@ def launcher_hold() -> Optional[tool_master.Maintenance]:
         log.warning("ランチャー更新中の印を確かめられませんでした", exc_info=True)
         return None
     mark = marks.get(tool_master.LAUNCHER_MARK)
-    if mark is None or mark.set_by_this_pc() or launcher_mark_stale(mark):
+    if mark is None or mark.set_by_this_pc():
+        return None
+    if mark_stale(mark):
+        log.warning("ランチャーの更新の印が %.1f 時間前のままです (%s)。外し忘れとみなして"
+                    "起動します", mark.age_hours() or 0.0, mark.started_by)
         return None
     return mark
 
 
-# ランチャーの更新の印が、これより古ければ「外し忘れ」とみなす (時間。1.8.15)。
-# ランチャーの上書きは数分で終わる。管理者が［更新を終える］を押し忘れて帰ると、
-# 翌朝まで全 PC でランチャーが起動しなかった
-LAUNCHER_MARK_MAX_HOURS = 3.0
+# 「更新中」の印が、これより古ければ「外し忘れ」とみなして外す (時間。1.8.15 / 1.8.16)。
+# ツールやランチャーの上書きは数分で終わる。管理者が［更新を終える］を押し忘れて
+# 帰ると、夜のあいだ全 PC でそのツールが起動しなかった
+MARK_MAX_HOURS = 3.0
+LAUNCHER_MARK_MAX_HOURS = MARK_MAX_HOURS
 
 
-def launcher_mark_stale(mark: tool_master.Maintenance) -> bool:
-    """外し忘れた (古すぎる) ランチャーの更新の印か。古ければ記録に残す。"""
+def mark_stale(mark: tool_master.Maintenance) -> bool:
+    """外し忘れた (古すぎる) 印か。"""
     age = mark.age_hours()
-    if age is None or age < LAUNCHER_MARK_MAX_HOURS:
-        return False
-    log.warning("ランチャーの更新の印が %.1f 時間前のままです (%s)。外し忘れとみなして"
-                "起動します", age, mark.started_by)
-    return True
+    return age is not None and age >= MARK_MAX_HOURS
+
+
+launcher_mark_stale = mark_stale
+
+
+def end_tool_update_by_admin(app_id: str, mark: tool_master.Maintenance) -> str:
+    """バーの「（更新中）」から、管理者がその場で更新を終える (1.8.16)。"""
+    path = tool_master.current_path()
+    if path is None:
+        return "ツール管理マスタの場所が分かりません。"
+    try:
+        tool_master.end_maintenance(path, mark.app_id or app_id, mark.start_command)
+    except tool_master.MasterError as exc:
+        return f"外せませんでした。\n{exc}"
+    from . import trace
+
+    trace.event("更新を終える (バーから)", trace.INFO,
+                detail=f"{mark.name or app_id} — " + " / ".join(tool_master.this_pc()))
+    return f"「{mark.name or app_id}」の更新を終えました。10 秒ほどで、どの PC でも使えます。"
 
 
 def restart_command() -> list[str]:
