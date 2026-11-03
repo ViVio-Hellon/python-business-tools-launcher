@@ -251,10 +251,10 @@ def _recorded_roots(running: RunningTool) -> set[int]:
     for pid in {running.pid, running.launch_pid}:
         if not pid or not _is_alive(pid):
             continue
-        command = _paths.as_unc(_normalize_path(process_command_line(pid)))
+        command = _normalize_path(process_command_line(pid))
         for marker in (running.start_command, running.app_root, running.work_dir):
             needle = _normalize_path(marker)
-            if _is_specific_enough(needle) and needle in command:
+            if _is_specific_enough(needle) and _paths.contains_path(command, needle):
                 roots.add(pid)
                 break
     return roots
@@ -1056,14 +1056,14 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
     if not command:
         return Verdict(False, "コマンドラインを取得できませんでした")
 
-    haystack = _paths.as_unc(_normalize_path(command))
+    haystack = _normalize_path(command)
     for marker in (running.start_command, running.app_root, running.work_dir):
         needle = _normalize_path(marker)
         if not _is_specific_enough(needle):
             # 短すぎる印では照合にならない。`C:\` のような値を許すと
             # **どのプロセスにも一致してしまい、照合が素通りになる**
             continue
-        if needle in haystack:
+        if _paths.contains_path(haystack, needle):
             return Verdict(True, f"コマンドラインが {marker} を含みます")
 
     return Verdict(False, "コマンドラインにこのツールの場所が含まれません")

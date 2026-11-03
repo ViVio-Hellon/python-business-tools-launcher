@@ -8,6 +8,7 @@ Windows は大文字と小文字を区別せず、`\\` と `/` が混ざる。�
 from __future__ import annotations
 
 import os
+import re
 from pathlib import PurePath
 from typing import Iterable, Optional, Union
 
@@ -63,10 +64,14 @@ def entry_command(path: Union[str, PurePath],
     rest = "".join(" " + _quote(a) for a in args)
     if suffix in (".bat", ".cmd"):
         shell = os.environ.get("COMSPEC") or "cmd.exe"
-        if is_unc(path):
-            # その共有フォルダーにドライブ文字があれば、その道で呼ぶ (包みは要らない)
+        wrapper = ""
+        if is_unc(path) and needs_unc_help(path):
+            # `cd /d "%~dp0"` で始まる .bat だけ (共有フォルダーでは動かなかったもの)。
+            # **pushd を使う .bat は 1.8.12 までと同じに呼ぶ** (1.8.13 で全部を
+            # ドライブ文字の道で呼び、日報複合ツールの起動確認が「指定されたパスが
+            # 見つかりません」で動かなくなった。1.8.17)
             path = mapped(path) or path
-        wrapper = unc_wrapper() if is_unc(path) else ""
+            wrapper = unc_wrapper() if is_unc(path) else ""
         if wrapper:
             # 共有フォルダーの .bat は包みを通す (下の UNC_WRAPPER を見る)
             return (f'{_quote(shell)} /d /s /c "{_quote(wrapper, always=True)} '
@@ -182,6 +187,49 @@ def as_unc(text: str) -> str:
     return text
 
 
+_CD_DP0 = re.compile(r'^\s*cd\s+/d\s+"?%~dp0', re.IGNORECASE | re.MULTILINE)
+_PUSHD_DP0 = re.compile(r'^\s*pushd\s+"?%~dp0', re.IGNORECASE | re.MULTILINE)
+_help_cache: dict[tuple[str, float], bool] = {}
+
+
+def needs_unc_help(path: Union[str, PurePath]) -> bool:
+    """共有フォルダーから呼ぶと動かない作りの .bat か (1.8.17)。
+
+    `cd /d "%~dp0"` で自分のフォルダーへ移り、`pushd "%~dp0"` を使っていないもの
+    だけ。読めないもの・`pushd` を使うもの・どちらも無いものは**偽** (呼び方を変えない)。
+    """
+    text = str(path).strip().strip('"')
+    try:
+        stat = os.stat(text)
+        key = (normalize(text), stat.st_mtime)
+        if key in _help_cache:
+            return _help_cache[key]
+        with open(text, "rb") as handle:
+            data = handle.read(64 * 1024)
+    except OSError:
+        return False
+    body = data.decode("cp932", errors="replace")
+    answer = bool(_CD_DP0.search(body)) and not _PUSHD_DP0.search(body)
+    _help_cache[key] = answer
+    return answer
+
+
+def contains_path(haystack: str, needle: str) -> bool:
+    """比べる形 (`normalize`) どうしで、`haystack` が `needle` を含むか。
+
+    **ドライブ文字の道と共有フォルダーの道を同じものとして見る** (両方を
+    `as_unc` でそろえて比べる)。片方だけそろえると、ドライブ文字 (S:\…) で
+    登録したツールが、自分のプロセスを見分けられなくなる (1.8.17)。
+    """
+    if not needle:
+        return False
+    if needle in haystack:
+        return True
+    if not network_drives():
+        return False
+    return as_unc(needle) in as_unc(haystack)
+
+
 def entry_cwd(path: Union[str, PurePath], cwd: Optional[str]) -> Optional[str]:
     r"""起動ファイルを動かすときの作業フォルダー。
 
@@ -194,6 +242,8 @@ def entry_cwd(path: Union[str, PurePath], cwd: Optional[str]) -> Optional[str]:
         return cwd
     if PurePath(str(path).strip().strip('"')).suffix.lower() not in (".bat", ".cmd"):
         return cwd
+    if not needs_unc_help(path):
+        return cwd                            # 1.8.12 までと同じ (1.8.17)
     drive = mapped(cwd)
     if drive:
         return drive

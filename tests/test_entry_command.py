@@ -102,6 +102,10 @@ class SharedFolderTests(unittest.TestCase):
         patcher = mock.patch.object(paths, "unc_wrapper", return_value=WRAPPER)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # この組の試験は「cd /d で始まる .bat」(中身は WrapOnlyCdBatTests で確かめる)
+        helper = mock.patch.object(paths, "needs_unc_help", return_value=True)
+        helper.start()
+        self.addCleanup(helper.stop)
 
     def drives(self, value: dict):
         return mock.patch.object(paths, "network_drives", return_value=value)
@@ -205,3 +209,91 @@ class WrapperFileTests(unittest.TestCase):
             Path(first).write_text("古い", encoding="utf-8")
             paths.unc_wrapper()                 # 中身が違えば書き直す
             self.assertEqual(Path(first).read_bytes(), paths.UNC_WRAPPER.encode("ascii"))
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+class WrapOnlyCdBatTests(unittest.TestCase):
+    """包むのは `cd /d "%~dp0"` の .bat だけ (1.8.17)。
+
+    1.8.13 で共有フォルダーの .bat を全部ドライブ文字の道で呼ぶようにしたら、
+    `pushd "%~dp0"` を使う日報複合ツールの起動確認 (launcher_check.bat) が
+    「指定されたパスが見つかりません」で答えなくなり、もう起動しているのに 91 秒待った。
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.folder = Path(tempfile.mkdtemp())
+        paths._help_cache.clear()
+
+    def copy(self, fixture: str, name: str) -> Path:
+        target = self.folder / name
+        target.write_bytes((FIXTURES / fixture).read_bytes())
+        return target
+
+    def test_日報複合ツールの起動確認は包まない(self) -> None:
+        bat = self.copy("all-tools_launcher_check.bat", "launcher_check.bat")
+        self.assertFalse(paths.needs_unc_help(bat))
+
+    def test_NEON_COIL_ZEROのstartは包む(self) -> None:
+        bat = self.copy("neon-coil-zero_start.bat", "start.bat")
+        self.assertTrue(paths.needs_unc_help(bat))
+
+    def test_読めない_無い_どちらも無いものは包まない(self) -> None:
+        self.assertFalse(paths.needs_unc_help(self.folder / "無い.bat"))
+        plain = self.folder / "plain.bat"
+        plain.write_text("@echo off\r\npython main.py\r\n", encoding="ascii")
+        self.assertFalse(paths.needs_unc_help(plain))
+
+    def test_pushdを使うbatは1_8_12と同じ呼び方(self) -> None:
+        """共有フォルダーでも、包まず・ドライブ文字にも変えず・作業フォルダーもそのまま。"""
+        unc = SHARE + "\\日報複合ツール\\launcher_check.bat"
+        root = paths.normalize("\\\\nlmfangyshrd\\各課共有")
+        with _Windows(), mock.patch.object(paths, "needs_unc_help", return_value=False), \
+                mock.patch.object(paths, "network_drives", return_value={"z:": root}), \
+                mock.patch.object(paths, "unc_wrapper", return_value=WRAPPER) as wrapper:
+            command = paths.entry_command(unc)
+            cwd = paths.entry_cwd(unc, SHARE + "\\日報複合ツール")
+        self.assertEqual(command, 'C:\\Windows\\system32\\cmd.exe /d /s /c '
+                                  f'""{unc}""')
+        self.assertEqual(cwd, SHARE + "\\日報複合ツール")
+        wrapper.assert_not_called()
+
+    def test_中身が変わったら読み直す(self) -> None:
+        import os
+        import time
+
+        bat = self.copy("neon-coil-zero_start.bat", "start.bat")
+        self.assertTrue(paths.needs_unc_help(bat))
+        bat.write_text('@echo off\r\npushd "%~dp0"\r\n', encoding="ascii")
+        later = time.time() + 5
+        os.utime(bat, (later, later))
+        self.assertFalse(paths.needs_unc_help(bat))
+
+
+class SamePathTwoNamesTests(unittest.TestCase):
+    """ドライブ文字の道と共有フォルダーの道を同じものとして見る (1.8.17)。"""
+
+    def setUp(self) -> None:
+        root = paths.normalize("\\\\nlmfangyshrd\\各課共有")
+        patcher = mock.patch.object(paths, "network_drives", return_value={"s:": root})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_ドライブ文字で登録したツールが自分のプロセスを見分ける(self) -> None:
+        """1.8.13 では見る側だけ共有フォルダーの道にそろえ、S:\\… で登録したツールが外れた。"""
+        command = paths.normalize('python "S:\\tools\\nippou\\main.py"')
+        self.assertTrue(paths.contains_path(command, paths.normalize("S:\\tools\\nippou")))
+
+    def test_共有フォルダーで登録したツールがドライブ文字のプロセスを見分ける(self) -> None:
+        command = paths.normalize('python "S:\\tools\\nippou\\main.py"')
+        self.assertTrue(paths.contains_path(
+            command, paths.normalize("\\\\nlmfangyshrd\\各課共有\\tools\\nippou")))
+
+    def test_別のフォルダーは見分けない(self) -> None:
+        command = paths.normalize('python "S:\\tools\\other\\main.py"')
+        self.assertFalse(paths.contains_path(command, paths.normalize("S:\\tools\\nippou")))
+        self.assertFalse(paths.contains_path(
+            command, paths.normalize("\\\\nlmfangyshrd\\各課共有\\tools\\nippou")))
