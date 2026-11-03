@@ -491,6 +491,11 @@ class SettingsDialog:
                  bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD, anchor="w").pack(fill="x")
         line = tk.Frame(box, bg=theme.BG)
         line.pack(fill="x", pady=(4, 0))
+        if self.master_var.get().strip() != self._master_before.strip():
+            # 場所を変えたまま保存していない。各 PC はまだ前の場所を見ている
+            tk.Label(line, text="ツール管理マスタの場所を変えました。保存してから使えます",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left")
+            return
         if mark is None:
             self._action_button(line, "更新のため全 PC で止める",
                                 lambda r=row: self.begin_update(r)).pack(side="left")
@@ -500,7 +505,7 @@ class SettingsDialog:
         else:
             self._action_button(line, "更新の状況を見る",
                                 lambda r=row: self.open_update(r)).pack(side="left")
-            tk.Label(line, text=f"更新中 ({mark.started_at} から・{mark.started_by})",
+            tk.Label(line, text=f"更新中 ({mark.started_text} から・{mark.started_by})",
                      bg=theme.BG, fg=theme.STATE_COLORS["starting"],
                      font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
 
@@ -517,7 +522,8 @@ class SettingsDialog:
             return
         path = self._master_path()
         try:
-            tool_master.begin_maintenance(path, row.tool.app_id, name)
+            tool_master.begin_maintenance(path, row.tool.app_id, name,
+                                          start_command=row.path_var.get())
         except MasterError as exc:
             messagebox.showerror("ツールの更新", f"ツール管理マスタに書けませんでした。\n{exc}",
                                  parent=self.top)
@@ -1633,7 +1639,7 @@ class UpdateDialog:
             self.state_label.configure(text="更新中ではありません (印は外れています)")
         else:
             self.state_label.configure(
-                text=f"全 PC に止めるよう頼んでいます ({mark.started_at} から・{mark.started_by})"
+                text=f"全 PC に止めるよう頼んでいます ({mark.started_text} から・{mark.started_by})"
                      "。3 秒ごとに読み直します")
         counts: dict[str, int] = {}
         for row in rows:

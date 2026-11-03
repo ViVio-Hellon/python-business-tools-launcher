@@ -125,6 +125,70 @@ class WatcherTests(ManagerTestCase):
         self.assertEqual(reports[0].state, tool_master.STOPPED)
         self.assertIn("強制終了", reports[0].message)
 
+    # --- 精査で見つけた穴 (1.8.8) -------------------------------------------
+    def test_共有フォルダーに書けなくても止める(self) -> None:
+        tool = self.register("nlm.nippou", "日報")
+        self.start(tool)
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")
+        broken = tool_master.MasterError("読み取り専用です")
+        with mock.patch.object(tool_master, "take_force_request", side_effect=broken), \
+                mock.patch.object(tool_master, "report", side_effect=broken):
+            result = self.watcher.poll()
+        self.assertIsNotNone(result)
+        self.assertNotIn("nlm.nippou", self.manager.running, "書けないので止めずに終わりました")
+
+    def test_PCによってアプリIDが違っても起動ファイルで見つけて止める(self) -> None:
+        tool = self.register("app.nippou-local", "日報")
+        self.start(tool)
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報",
+                                      start_command=r"C:\\無い\\start.bat;" + tool.start_command)
+        result = self.watcher.poll()
+        self.assertIn("app.nippou-local", result.blocked)
+        self.assertNotIn("app.nippou-local", self.manager.running)
+        self.assertEqual(self.state("nlm.nippou"), tool_master.STOPPED)
+
+    def test_印を付け直したらまた返事を書く(self) -> None:
+        self.register("nlm.nippou", "日報")
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")
+        self.watcher.poll()
+        tool_master.end_maintenance(self.path, "nlm.nippou")
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")   # 同じ秒でも別の印
+        self.assertEqual(self.state("nlm.nippou"), "")
+        self.watcher.poll()
+        self.assertEqual(self.state("nlm.nippou"), tool_master.NOT_RUNNING)
+
+    def test_利用者が止めている最中なら待つ(self) -> None:
+        tool = self.register("nlm.nippou", "日報")
+        self.start(tool)
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")
+        with mock.patch.object(self.manager, "is_busy", return_value=True), \
+                mock.patch.object(self.manager, "_stop_blocking") as stop:
+            self.watcher.poll()
+            stop.assert_not_called()
+        self.assertEqual(self.state("nlm.nippou"), "", "「止められない」と誤って返しました")
+
+    def test_止められなければ頼まれるまで止め直さない(self) -> None:
+        tool = self.register("nlm.nippou", "日報")
+        self.start(tool)
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")
+        with mock.patch.object(self.manager, "_stop_blocking", return_value=False) as stop:
+            self.watcher.poll()
+            self.assertEqual(self.state("nlm.nippou"), tool_master.FAILED)
+            for key in self.watcher._tried:
+                self.watcher._tried[key] -= maintenance.RETRY_SEC + 1
+            self.watcher.poll()
+            self.assertEqual(stop.call_count, 1, "止められないツールを止め直しました")
+            tool_master.request_force(self.path, "nlm.nippou", LOGIN, PC)
+            self.watcher.poll()
+            self.assertEqual(stop.call_args.kwargs, {"force": True})
+
+    def test_マスタから消したツールの印は外す(self) -> None:
+        number = tool_master.save_tool(self.path, tool_master.MasterTool(
+            0, name="日報", start_command=r"C:\\t\\start.bat", app_id="nlm.nippou"))
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")
+        tool_master.write_catalog(self.path, [], deleted_tools=[number], known_tools=[number])
+        self.assertEqual(tool_master.under_maintenance(self.path), {})
+
     def test_マスタを使っていなければ何もしない(self) -> None:
         tool_registry.clear_pc_setting(tool_registry.TOOL_MASTER_KEY)
         self.assertIsNone(self.watcher.poll())
@@ -162,6 +226,11 @@ class ScreenTests(LocalAreaTestCase):
         notes = [w for w in bar.root.winfo_children() if isinstance(w, tk.Toplevel)
                  and w.title() == "ツールの更新"]
         self.assertEqual(len(notes), 1)
+        # 更新中のツールを押しても、起動もしないしバーも動かさない
+        with mock.patch.object(bar.manager, "select") as select:
+            bar.on_select("nlm.nippou")
+        select.assert_called_once_with("nlm.nippou")
+        self.assertFalse(bar._engaged, "起動しないのにバーを動かしました")
         bar._apply_maintenance(maintenance.PollResult(blocked={}))
         self.assertEqual(bar.buttons["nlm.nippou"].cget("text"), "日報")
 

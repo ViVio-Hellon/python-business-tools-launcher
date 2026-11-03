@@ -110,11 +110,12 @@ CREATE TABLE IF NOT EXISTS pcs (
     updated_by TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS maintenance (
-    app_id     TEXT PRIMARY KEY,
-    name       TEXT NOT NULL DEFAULT '',
-    started_at TEXT NOT NULL DEFAULT '',
-    started_by TEXT NOT NULL DEFAULT '',
-    note       TEXT NOT NULL DEFAULT ''
+    app_id        TEXT PRIMARY KEY,
+    name          TEXT NOT NULL DEFAULT '',
+    started_at    TEXT NOT NULL DEFAULT '',
+    started_by    TEXT NOT NULL DEFAULT '',
+    note          TEXT NOT NULL DEFAULT '',
+    start_command TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS pc_reports (
     app_id     TEXT NOT NULL,
@@ -406,6 +407,10 @@ def ensure(path: Path) -> bool:
         for name, kind in _TOOL_COLUMNS_V2:
             if name not in columns:
                 conn.execute(f"ALTER TABLE tools ADD COLUMN {name} {kind}")
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(maintenance)")}
+        if "start_command" not in columns:
+            conn.execute("ALTER TABLE maintenance ADD COLUMN start_command "
+                         "TEXT NOT NULL DEFAULT ''")
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                      (str(SCHEMA_VERSION),))
         now = _now()
@@ -692,6 +697,12 @@ def write_catalog(path: Path, tools: list[MasterTool], *,
         numbers = [_write_tool(conn, tool, order_no=position * 10)
                    for position, tool in enumerate(tools, start=1)]
         for tool_no in deleted_tools:
+            # 更新中の印も外す (残ると、そのアプリIDのツールが全 PC で起動できない)
+            gone = conn.execute("SELECT app_id FROM tools WHERE tool_no = ?",
+                                (tool_no,)).fetchone()
+            if gone is not None and gone[0]:
+                for table in ("maintenance", "pc_reports", "force_requests"):
+                    conn.execute(f"DELETE FROM {table} WHERE app_id = ?", (gone[0],))
             conn.execute("DELETE FROM pc_tools WHERE tool_no = ?", (tool_no,))
             conn.execute("DELETE FROM tools WHERE tool_no = ?", (tool_no,))
         for pc_no in deleted_pcs:
@@ -760,9 +771,17 @@ REPORT_LABELS = {STOPPED: "止めた", NOT_RUNNING: "使っていない", BUSY: 
 class Maintenance:
     app_id: str
     name: str = ""
+    # 印を付けた時刻。**マイクロ秒まで** (同じ秒に付け直しても別の印と分かる)
     started_at: str = ""
     started_by: str = ""
     note: str = ""
+    # マスタに書いた起動ファイル (`;` 区切り)。**PC によってアプリIDが違っても**
+    # (1.7.14 のマスタから並べたツール)、起動ファイルでこの PC のツールを見つける
+    start_command: str = ""
+
+    @property
+    def started_text(self) -> str:
+        return self.started_at[:19]
 
 
 @dataclass(frozen=True)
@@ -779,15 +798,18 @@ class PcReport:
         return REPORT_LABELS.get(self.state, self.state or "?")
 
 
-def begin_maintenance(path: Path, app_id: str, name: str = "", note: str = "") -> None:
+def begin_maintenance(path: Path, app_id: str, name: str = "", note: str = "",
+                      start_command: str = "") -> None:
     """更新中の印を付ける (前の返事・強制終了の依頼は消す)。"""
     ensure(path)
     login, pc_name = this_pc()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.time() * 1e6) % 1000000:06d}"
     with _open(path) as conn:
         conn.execute("""INSERT OR REPLACE INTO maintenance(app_id, name, started_at,
-                                                            started_by, note)
-                        VALUES(?, ?, ?, ?, ?)""",
-                     (app_id, name, _now(), f"{login} / {pc_name}", note))
+                                                            started_by, note, start_command)
+                        VALUES(?, ?, ?, ?, ?, ?)""",
+                     (app_id, name, stamp, f"{login} / {pc_name}", note,
+                      start_command.strip()))
         conn.execute("DELETE FROM pc_reports WHERE app_id = ?", (app_id,))
         conn.execute("DELETE FROM force_requests WHERE app_id = ?", (app_id,))
     trace.event("更新のため全 PC で止める", trace.INFO, detail=f"{name or app_id} ({path})")
@@ -814,9 +836,23 @@ def under_maintenance(path: Path) -> dict[str, Maintenance]:
         if "no such table" in str(exc):
             return {}
         raise
-    return {r["app_id"]: Maintenance(app_id=r["app_id"], name=r["name"],
-                                     started_at=r["started_at"], started_by=r["started_by"],
-                                     note=r["note"]) for r in rows}
+    return {r["app_id"]: Maintenance(
+        app_id=r["app_id"], name=r["name"], started_at=r["started_at"],
+        started_by=r["started_by"], note=r["note"],
+        start_command=r["start_command"] if "start_command" in r.keys() else "")
+        for r in rows}
+
+
+def my_report(path: Path, app_id: str) -> Optional[PcReport]:
+    """この PC が前に書き返した返事 (無ければ None)。"""
+    login, pc_name = this_pc()
+    with _open(path) as conn:
+        r = conn.execute("""SELECT * FROM pc_reports WHERE app_id = ? AND login_id = ?
+                              AND pc_name = ?""", (app_id, login, pc_name)).fetchone()
+    if r is None:
+        return None
+    return PcReport(app_id=r["app_id"], login_id=r["login_id"], pc_name=r["pc_name"],
+                    state=r["state"], message=r["message"], updated_at=r["updated_at"])
 
 
 def report(path: Path, app_id: str, state: str, message: str = "") -> None:

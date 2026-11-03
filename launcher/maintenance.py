@@ -21,8 +21,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import fileprobe, tool_master
+from . import fileprobe, tool_master, tool_registry
 from .logging_utils import get_logger
+from .paths import normalize
 
 log = get_logger("maintenance")
 
@@ -41,13 +42,14 @@ class PollResult:
 
 
 class Watcher:
-    """更新中の印を見て、この PC のツールを止める。`poll` は別のスレッドから呼ぶ。"""
+    """更新中の印を見て、この PC のツールを止める。`poll` は別のスレッドから呼ぶ。
+
+    **返事を書いたかはマスタで確かめる** (覚えておくのではなく)。管理者が印を
+    付け直しても (前の返事は消える)、そのつど書き返す。
+    """
 
     def __init__(self, manager) -> None:
         self.manager = manager
-        self._lock = threading.Lock()
-        # (アプリID, 印を付けた時刻) → 最後に書き返した状態。同じなら書かない
-        self._reported: dict[tuple[str, str], str] = {}
         # (アプリID, 印を付けた時刻) → 最後に止めようとした時刻
         self._tried: dict[tuple[str, str], float] = {}
         # 利用者に「終了してください」と知らせたもの (印ごとに1回)
@@ -71,64 +73,121 @@ class Watcher:
         marks = _read(path)
         if marks is None:
             return None
-        result = PollResult(blocked={a: (m.name or a) for a, m in marks.items()})
-        self.manager.set_blocked(set(marks))
+        local = tool_registry.all_tools(include_disabled=True)
+        # 印 → この PC のツールのアプリID (アプリIDが違っても、起動ファイルで見つける)
+        targets = {app_id: _local_ids(mark, local) for app_id, mark in marks.items()}
+        blocked = {target: (mark.name or app_id)
+                   for app_id, mark in marks.items() for target in targets[app_id]}
+        self.manager.set_blocked(set(blocked))
+        result = PollResult(blocked=blocked)
         for app_id, mark in marks.items():
-            self._handle(path, mark, result)
+            try:
+                self._handle(path, mark, targets[app_id], result)
+            except Exception:                 # noqa: BLE001 - ほかの印は続ける
+                log.warning("更新のための停止で失敗しました: %s", app_id, exc_info=True)
         # 終わった印の覚えを片付ける
         live = {(a, m.started_at) for a, m in marks.items()}
-        with self._lock:
-            for store in (self._reported, self._tried):
-                for key in [k for k in store if k not in live]:
-                    store.pop(key, None)
-            self._asked &= live
+        for key in [k for k in self._tried if k not in live]:
+            self._tried.pop(key, None)
+        self._asked &= live
         return result
 
-    def _handle(self, path, mark: tool_master.Maintenance, result: PollResult) -> None:
+    def _handle(self, path, mark: tool_master.Maintenance, local_ids: set[str],
+                result: PollResult) -> None:
         manager = self.manager
-        app_id = mark.app_id
-        key = (app_id, mark.started_at)
-        name = mark.name or app_id
-        if app_id in manager.starting_ids:
-            manager.stop(app_id)              # 起動をやめる (動き出す前に)
-        running = app_id in manager.running
+        key = (mark.app_id, mark.started_at)
+        name = mark.name or mark.app_id
+        for app_id in local_ids & set(manager.starting_ids):
+            manager.stop(app_id)              # 起動の途中ならやめる (動き出す前に)
+        running = [a for a in local_ids if a in manager.running]
+        previous = _my_report(path, mark.app_id)
         if not running:
-            state = (tool_master.STOPPED if self._reported.get(key) in
-                     (tool_master.STOPPED, tool_master.BUSY, tool_master.FAILED)
-                     else tool_master.NOT_RUNNING)
-            self._report(path, key, state)
+            stopped_before = previous is not None and previous.state in (
+                tool_master.STOPPED, tool_master.BUSY, tool_master.FAILED)
+            self._report(path, mark.app_id, previous,
+                         tool_master.STOPPED if stopped_before else tool_master.NOT_RUNNING,
+                         previous.message if stopped_before and previous.state ==
+                         tool_master.STOPPED else "")
             return
-        force = tool_master.take_force_request(path, app_id)
+        if any(manager.is_busy(a) for a in running):
+            return                            # 利用者が止めている最中。次に見たとき
+        force = _take_force(path, mark.app_id)
         now = time.monotonic()
         last = self._tried.get(key)
-        if not force and last is not None and now - last < RETRY_SEC:
-            return                            # 処理中。少し置いてから止め直す
+        if not force and last is not None:
+            if previous is not None and previous.state == tool_master.FAILED:
+                return                        # 止められなかった。強制終了を頼まれるまで待つ
+            if now - last < RETRY_SEC:
+                return                        # 処理中。少し置いてから止め直す
         self._tried[key] = now
-        log.info("更新のため止めます: %s%s", app_id, " (強制終了を頼まれた)" if force else "")
-        if manager._stop_blocking(app_id, force=force):
-            self._report(path, key, tool_master.STOPPED,
-                         "管理者に頼まれて強制終了した" if force else "")
-            return
-        detail = (manager.status.detail or "").strip().splitlines()
-        message = detail[0] if detail else ""
-        if manager.stop_refused(app_id):
-            self._report(path, key, tool_master.BUSY, message, force=True)
+        busy_message = ""
+        failed_message = ""
+        for app_id in running:
+            log.info("更新のため止めます: %s%s", app_id,
+                     " (強制終了を頼まれた)" if force else "")
+            if manager._stop_blocking(app_id, force=force):
+                continue
+            status = manager.status
+            lines = (status.detail or "").strip().splitlines() \
+                if status.app_id == app_id else []
+            if manager.stop_refused(app_id):
+                busy_message = lines[0] if lines else "実行中の処理があります"
+            else:
+                failed_message = lines[0] if lines else "止められませんでした"
+        if failed_message:
+            self._report(path, mark.app_id, previous, tool_master.FAILED, failed_message)
+        elif busy_message:
+            self._report(path, mark.app_id, previous, tool_master.BUSY, busy_message)
             if key not in self._asked:
                 self._asked.add(key)
-                result.ask_user.append((app_id, name))
+                result.ask_user.append((running[0], name))
         else:
-            self._report(path, key, tool_master.FAILED, message, force=True)
+            self._report(path, mark.app_id, previous, tool_master.STOPPED,
+                         "管理者に頼まれて強制終了した" if force else "")
+            manager.notify(f"管理者が{name}を更新するため、{name}を終了しました。\n"
+                           "更新が終わるまで、このツールは起動できません。")
 
-    def _report(self, path, key: tuple[str, str], state: str, message: str = "", *,
-                force: bool = False) -> None:
-        """書き返す。前と同じ状態なら書かない (共有のマスタに何度も書かない)。"""
-        if not force and self._reported.get(key) == state:
+    def _report(self, path, app_id: str, previous, state: str, message: str = "") -> None:
+        """書き返す。**マスタの返事と同じなら書かない** (共有のマスタに何度も書かない)。
+
+        書けなくても (読み取り専用の共有フォルダー・ほかの PC が書いている最中)、
+        止めることは続ける。次に見たときに書き直す。
+        """
+        if previous is not None and previous.state == state and \
+                previous.message == message[:300]:
             return
         try:
-            tool_master.report(path, key[0], state, message)
-            self._reported[key] = state
+            tool_master.report(path, app_id, state, message)
         except tool_master.MasterError as exc:
             log.warning("更新の返事を書けませんでした: %s", exc)
+
+
+def _local_ids(mark: tool_master.Maintenance, local) -> set[str]:
+    """印のツールにあたる、この PC のツールのアプリID。"""
+    ids = {mark.app_id}
+    if mark.start_command.strip():
+        starts = {normalize(c) for c in
+                  tool_master.MasterTool(0, start_command=mark.start_command).candidates()}
+        ids |= {t.app_id for t in local
+                if t.start_command and normalize(t.start_command) in starts}
+    return ids
+
+
+def _my_report(path, app_id: str):
+    try:
+        return tool_master.my_report(path, app_id)
+    except tool_master.MasterError as exc:
+        log.info("前の返事を読めません: %s", exc)
+        return None
+
+
+def _take_force(path, app_id: str) -> bool:
+    """強制終了の依頼を受け取る。**書けなくても止めることは続ける** (依頼は無いものとする)。"""
+    try:
+        return tool_master.take_force_request(path, app_id)
+    except tool_master.MasterError as exc:
+        log.warning("強制終了の依頼を確かめられません: %s", exc)
+        return False
 
 
 def _read(path) -> Optional[dict[str, tool_master.Maintenance]]:

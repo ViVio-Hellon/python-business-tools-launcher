@@ -409,6 +409,8 @@ class LauncherBar:
             label = self._names.get(app_id, app_id)
             if app_id in running:
                 label = f"● {label}（動作中）"
+            elif app_id in self._blocked:
+                label = f"{label}（更新中）"
             elif not self._configured.get(app_id):
                 label = f"{label}（未設定）"
             self.overflow_menu.add_command(
@@ -594,6 +596,10 @@ class LauncherBar:
         **ほかのツールは止めない。** 動いていなければ起こし、動いて
         いれば画面を前に出す。
         """
+        if app_id in self._blocked:
+            # 更新中。起動しないので、バーも動かさない (manager が理由を出す)
+            self.manager.select(app_id)
+            return
         self._engaged = True
         if self._select_mode and app_id in self._names:
             self.selected_var.set(app_id)
