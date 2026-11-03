@@ -219,6 +219,8 @@ class ToolManager:
         # 止めようとして断られたツール (実行中の処理・保存の確認)。
         # 画面が［強制終了］を出すのに使う
         self._refused: set[str] = set()
+        # 管理者が「更新中」にしたツール (起動しない。1.8.8)
+        self._blocked: set[str] = set()
         # 窓は出ているのに、中の Web サーバーが答えないアプリ。
         # 障害記録を1回だけ書くための印
         self._unhealthy: set[str] = set()
@@ -436,6 +438,16 @@ class ToolManager:
     # --------------------------------------------------------------
     # ボタンが押された
     # --------------------------------------------------------------
+    def set_blocked(self, app_ids: set[str]) -> None:
+        """管理者が「更新中」にしたツール。起動しない (`launcher.maintenance`)。"""
+        with self._lock:
+            self._blocked = set(app_ids)
+
+    @property
+    def blocked_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._blocked)
+
     def select(self, app_id: str) -> None:
         """ツールのボタンが押されたときの入口。すぐ戻る (処理は別スレッド)。
 
@@ -446,6 +458,13 @@ class ToolManager:
         if tool is None:
             self._set(State.ERROR, "登録されていないツールです",
                       detail=f"アプリID: {app_id}")
+            return
+        if app_id in self.blocked_ids:
+            # **更新中のツールは起動しない** (上書きの途中のファイルで動かさない)
+            self._set(self._settled_state(), f"{tool.display_name}は更新中です", tool,
+                      detail=f"管理者が{tool.display_name}を更新しています。"
+                             "更新が終わるまで使えません。\n"
+                             "終わると、ボタンがもとに戻ります。")
             return
         self._focus = app_id
         op = trace.operation("ボタン", tool)

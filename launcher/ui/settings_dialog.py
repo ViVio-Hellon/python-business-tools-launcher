@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import os
+import time
 import tkinter as tk
 from dataclasses import replace
 from pathlib import Path
@@ -382,6 +383,8 @@ class SettingsDialog:
                               "から読み取ります。",
             bg=theme.BG, fg=theme.MUTED, font=theme.FONT, justify="left", anchor="nw")
         # マスタを使うとき: そのツールを出す PC
+        # 更新のため全 PC で止める (1.8.8)
+        self.detail_maint = tk.Frame(self.detail, bg=theme.BG)
         self.detail_pcs = tk.Label(self.detail, text="", bg=theme.BG, fg=theme.MUTED,
                                    font=theme.FONT_SMALL, anchor="w", justify="left",
                                    wraplength=560)
@@ -443,6 +446,7 @@ class SettingsDialog:
                 other.box.pack_forget()
         self.detail_empty.pack_forget()
         self.detail_pcs.pack_forget()
+        self.detail_maint.pack_forget()
         if row is None:
             self.detail_empty.pack(fill="both", expand=True, pady=(4, 0))
             return
@@ -450,6 +454,81 @@ class SettingsDialog:
         if self.shared:
             self.detail_pcs.configure(text=self._pcs_text(row))
             self.detail_pcs.pack(fill="x", pady=(10, 0))
+            self._build_maintenance_box(row)
+
+    # --------------------------------------------------------------
+    # 更新のため全 PC で止める (1.8.8)
+    # --------------------------------------------------------------
+    MARKS_CACHE_SEC = 3.0
+
+    def _marks(self, *, fresh: bool = False) -> dict:
+        """更新中のツール。**数秒は覚えておく** (一覧を描き直すたびに共有フォルダーを読まない)。"""
+        path = self._master_path()
+        if path is None or not self.shared:
+            return {}
+        cached = getattr(self, "_marks_cache", None)
+        now = time.monotonic()
+        if not fresh and cached and cached[0] == path and now - cached[1] < self.MARKS_CACHE_SEC:
+            return cached[2]
+        try:
+            marks = tool_master.under_maintenance(path)
+        except MasterError as exc:
+            log.warning("更新中の印を読めません: %s", exc)
+            marks = {}
+        self._marks_cache = (path, now, marks)
+        return marks
+
+    def _build_maintenance_box(self, row: "_ToolRow") -> None:
+        box = self.detail_maint
+        for child in box.winfo_children():
+            child.destroy()
+        if row.is_new or not row.master_no:
+            return                            # まだマスタに無い (保存してから)
+        box.pack(fill="x", pady=(14, 0))
+        app_id = row.tool.app_id
+        mark = self._marks(fresh=True).get(app_id)
+        tk.Label(box, text="ツールの更新 (共有サーバーのフォルダーを上書きするとき)",
+                 bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD, anchor="w").pack(fill="x")
+        line = tk.Frame(box, bg=theme.BG)
+        line.pack(fill="x", pady=(4, 0))
+        if mark is None:
+            self._action_button(line, "更新のため全 PC で止める",
+                                lambda r=row: self.begin_update(r)).pack(side="left")
+            tk.Label(line, text="各 PC のランチャーがこのツールを止め、返事を書きます",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL).pack(
+                side="left", padx=(10, 0))
+        else:
+            self._action_button(line, "更新の状況を見る",
+                                lambda r=row: self.open_update(r)).pack(side="left")
+            tk.Label(line, text=f"更新中 ({mark.started_at} から・{mark.started_by})",
+                     bg=theme.BG, fg=theme.STATE_COLORS["starting"],
+                     font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
+
+    def begin_update(self, row: "_ToolRow") -> None:
+        """［更新のため全 PC で止める］。マスタに印を付け、状況の窓を開く。"""
+        name = row.label()
+        if not messagebox.askyesno(
+                "ツールの更新",
+                f"全 PC で「{name}」を止めます。\n\n"
+                "・各 PC のランチャーが、10 秒ほどのうちにこのツールを止めます\n"
+                "・処理中の PC では止めずに、利用者に終了を頼みます\n"
+                "・更新を終えるまで、どの PC でもこのツールは起動しません\n\n"
+                "よろしいですか?", parent=self.top):
+            return
+        path = self._master_path()
+        try:
+            tool_master.begin_maintenance(path, row.tool.app_id, name)
+        except MasterError as exc:
+            messagebox.showerror("ツールの更新", f"ツール管理マスタに書けませんでした。\n{exc}",
+                                 parent=self.top)
+            return
+        self.open_update(row)
+
+    def open_update(self, row: "_ToolRow") -> None:
+        UpdateDialog(self.top, self._master_path(), row.tool.app_id, row.label(),
+                     master_no=row.master_no)
+        self._build_maintenance_box(row)
+        self._refresh_list()
 
     def _pcs_text(self, row: "_ToolRow") -> str:
         names = [pc.title() for pc in self.pc_rows if not pc.deleted and pc.has(row)]
@@ -472,12 +551,15 @@ class SettingsDialog:
             return
         for child in self.list_inner.winfo_children():
             child.destroy()
+        marks = self._marks() if self.shared else {}
         for row in self.rows:
             current = row is self.selected
             bg = theme.TOOL_ACTIVE if current else theme.UTIL_BG
             item = tk.Frame(self.list_inner, bg=bg, cursor="hand2")
             item.pack(fill="x", pady=(0, 1))
             status, color = row.status()
+            if row.tool.app_id in marks and not row.marked_for_delete():
+                status, color = "更新中", theme.STATE_COLORS["starting"]
             top = tk.Frame(item, bg=bg)
             top.pack(fill="x", padx=10, pady=(6, 0))
             name = tk.Label(top, text=row.label(), bg=bg,
@@ -1449,6 +1531,177 @@ class SettingsDialog:
         return changes
 
     def cancel(self) -> None:
+        self.top.destroy()
+
+
+class UpdateDialog:
+    """「〇〇の更新」— 全 PC の返事を一覧し、PC ごとに強制終了を頼む (1.8.8)。
+
+    3 秒ごとに読み直す。閉じても印はそのまま (［更新を終える］で外す)。
+    """
+
+    REFRESH_MS = 3000
+
+    def __init__(self, parent: tk.Misc, path: Path, app_id: str, name: str, *,
+                 master_no: int = 0) -> None:
+        self.path, self.app_id, self.name, self.master_no = path, app_id, name, master_no
+        self.ended = False
+        self._job = None
+        self.parent = parent
+        self.top = tk.Toplevel(parent)
+        self.top.title(f"{name} の更新")
+        self.top.configure(bg=theme.BG)
+        self.top.transient(parent)
+        tk.Label(self.top, text=f"「{name}」の更新", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_TOOL, anchor="w").pack(fill="x", padx=16, pady=(14, 2))
+        self.state_label = tk.Label(self.top, text="", bg=theme.BG, fg=theme.MUTED,
+                                    font=theme.FONT_SMALL, anchor="w", justify="left")
+        self.state_label.pack(fill="x", padx=16)
+        self.summary = tk.Label(self.top, text="", bg=theme.BG, fg=theme.FG,
+                                font=theme.FONT_BOLD, anchor="w", justify="left")
+        self.summary.pack(fill="x", padx=16, pady=(8, 4))
+        self.table = tk.Frame(self.top, bg=theme.UTIL_BG)
+        self.table.pack(fill="both", expand=True, padx=16)
+        tk.Label(self.top,
+                 text="全部が「止めた」か「使っていない」になったら、ツールのフォルダーを上書きして"
+                      "ください。\n「返事なし」は、ランチャーを起動していない・電源が切れている・"
+                      "共有フォルダーにつながっていない PC です (その PC では、起きたときに止めます)。",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w",
+                 justify="left").pack(fill="x", padx=16, pady=(8, 0))
+        buttons = tk.Frame(self.top, bg=theme.BG)
+        buttons.pack(fill="x", padx=16, pady=(10, 14))
+        tk.Button(buttons, text="閉じる", command=self.close, bg=theme.BUTTON_BG,
+                  fg=theme.MUTED, relief="flat", bd=0, padx=16, pady=6, font=theme.FONT,
+                  cursor="hand2").pack(side="right")
+        tk.Button(buttons, text="更新を終える", command=self.end, bg=theme.BUTTON_CURRENT,
+                  fg=theme.FG, relief="flat", bd=0, padx=18, pady=6, font=theme.FONT_BOLD,
+                  cursor="hand2").pack(side="right", padx=(0, 8))
+        tk.Button(buttons, text="読み直す", command=self.refresh, bg=theme.BUTTON_BG,
+                  fg=theme.FG, relief="flat", bd=0, padx=14, pady=6, font=theme.FONT_SMALL,
+                  cursor="hand2").pack(side="left")
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh()
+        self.top.update_idletasks()
+        # 設定画面の少し内側。**画面からはみ出さない**ように寄せる
+        width, height = self.top.winfo_reqwidth(), self.top.winfo_reqheight()
+        x = min(parent.winfo_rootx() + 60, self.top.winfo_screenwidth() - width - 10)
+        y = min(parent.winfo_rooty() + 60, self.top.winfo_screenheight() - height - 60)
+        self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.top.grab_set()
+        self.top.wait_window()
+        # 設定画面へ入力を戻す
+        try:
+            parent.grab_set()
+        except tk.TclError:
+            pass
+
+    def rows(self) -> list[tuple[str, str, str, str, str, bool]]:
+        """(PC名, ログインID, 状態, ひとこと, 時刻, 強制終了できるか) の一覧。返事の無い PC も。"""
+        found = tool_master.reports(self.path, self.app_id)
+        listed = [(r.pc_name, r.login_id, r.label, r.message, r.updated_at,
+                   r.state in (tool_master.BUSY, tool_master.FAILED)) for r in found]
+        seen = {(r.pc_name.casefold(), r.login_id.casefold()) for r in found}
+        seen_pc = {r.pc_name.casefold() for r in found}
+        try:
+            master = tool_master.read(self.path)
+        except MasterError:
+            master = None
+        if master is not None and self.master_no:
+            for pc in master.pcs:
+                if not pc.enabled or self.master_no not in pc.tool_nos or not pc.pc_name:
+                    continue
+                key = (pc.pc_name.casefold(), pc.login_id.casefold())
+                if key in seen or (not pc.login_id and pc.pc_name.casefold() in seen_pc):
+                    continue
+                listed.append((pc.pc_name, pc.login_id or "(どれでも)", "返事なし",
+                               pc.note, "", False))
+        return listed
+
+    def refresh(self) -> None:
+        self._job = None
+        if not self.top.winfo_exists():
+            return
+        try:
+            mark = tool_master.under_maintenance(self.path).get(self.app_id)
+            rows = self.rows()
+        except MasterError as exc:
+            self.state_label.configure(text=f"ツール管理マスタを読めません: {exc}",
+                                       fg=theme.STATE_COLORS["error"])
+            self._job = self.top.after(self.REFRESH_MS, self.refresh)
+            return
+        if mark is None:
+            self.state_label.configure(text="更新中ではありません (印は外れています)")
+        else:
+            self.state_label.configure(
+                text=f"全 PC に止めるよう頼んでいます ({mark.started_at} から・{mark.started_by})"
+                     "。3 秒ごとに読み直します")
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[row[2]] = counts.get(row[2], 0) + 1
+        order = ("止めた", "使っていない", "処理中 (待っています)", "止められない", "返事なし")
+        self.summary.configure(text="  ・  ".join(f"{k} {counts[k]}" for k in order
+                                                if counts.get(k)) or "まだ返事がありません")
+        for child in self.table.winfo_children():
+            child.destroy()
+        for column, title in enumerate(("PC名", "ログインID", "状態", "ひとこと", "時刻", "")):
+            tk.Label(self.table, text=title, bg=theme.UTIL_BG, fg=theme.MUTED,
+                     font=theme.FONT_SMALL, anchor="w").grid(row=0, column=column, sticky="w",
+                                                             padx=(8, 4), pady=(6, 2))
+        colors = {"止めた": theme.STATE_COLORS["running"],
+                  "使っていない": theme.MUTED,
+                  "処理中 (待っています)": theme.STATE_COLORS["starting"],
+                  "止められない": theme.STATE_COLORS["error"],
+                  "返事なし": theme.MUTED}
+        for line, (pc, login, label, message, at, can_force) in enumerate(rows, start=1):
+            for column, (text, color) in enumerate(((pc, theme.FG), (login, theme.FG),
+                                                    (label, colors.get(label, theme.FG)),
+                                                    (message[:40], theme.MUTED),
+                                                    (at[11:] if at else "", theme.MUTED))):
+                tk.Label(self.table, text=text, bg=theme.UTIL_BG, fg=color,
+                         font=theme.FONT_SMALL, anchor="w").grid(row=line, column=column,
+                                                                 sticky="w", padx=(8, 4))
+            if can_force:
+                tk.Button(self.table, text="強制終了",
+                          command=lambda p=pc, lg=login: self.force(p, lg),
+                          bg=theme.BUTTON_BG, fg=theme.STATE_COLORS["error"], relief="flat",
+                          bd=0, padx=8, font=theme.FONT_SMALL, cursor="hand2").grid(
+                    row=line, column=5, sticky="w", padx=(8, 8), pady=1)
+        self._job = self.top.after(self.REFRESH_MS, self.refresh)
+
+    def force(self, pc_name: str, login_id: str) -> None:
+        if not messagebox.askyesno(
+                "強制終了",
+                f"{pc_name} ({login_id}) の「{self.name}」を強制終了します。\n"
+                "その PC で保存していない内容や、途中の処理は失われます。\n\nよろしいですか?",
+                icon="warning", default="no", parent=self.top):
+            return
+        try:
+            tool_master.request_force(self.path, self.app_id, login_id, pc_name)
+        except MasterError as exc:
+            messagebox.showerror("強制終了", f"頼めませんでした。\n{exc}", parent=self.top)
+            return
+        self.refresh()
+
+    def end(self) -> None:
+        if not messagebox.askyesno(
+                "更新を終える",
+                f"「{self.name}」の更新を終えます。\n各 PC で、このツールをまた起動できるように"
+                "なります。\n\nフォルダーの上書きは終わりましたか?", parent=self.top):
+            return
+        try:
+            tool_master.end_maintenance(self.path, self.app_id)
+        except MasterError as exc:
+            messagebox.showerror("更新を終える", f"書けませんでした。\n{exc}", parent=self.top)
+            return
+        self.ended = True
+        self.close()
+
+    def close(self) -> None:
+        if self._job is not None:
+            try:
+                self.top.after_cancel(self._job)
+            except tk.TclError:
+                pass
         self.top.destroy()
 
 

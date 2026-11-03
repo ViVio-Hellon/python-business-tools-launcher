@@ -64,7 +64,8 @@ FILE_NAME = "launcher_ツール管理マスタ.sqlite3"
 FILE_SUFFIXES = (".sqlite3", ".sqlite", ".db")
 # 2: ツールにアプリID・起動引数・ポート・停止方法・画面を足した (1.8.0)。
 # 全 PC で同じツールの一覧を使うため (［設定］の［ツール］がそのままマスタ)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# 3: 更新のため全 PC で止める (maintenance・pc_reports・force_requests。1.8.8)
 
 # 読むのを待つ上限 (秒)。共有フォルダーが遅くても、ランチャーの起動を止めない
 READ_TIMEOUT_SEC = 8.0
@@ -107,6 +108,30 @@ CREATE TABLE IF NOT EXISTS pcs (
     note       TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS maintenance (
+    app_id     TEXT PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    started_by TEXT NOT NULL DEFAULT '',
+    note       TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS pc_reports (
+    app_id     TEXT NOT NULL,
+    login_id   TEXT NOT NULL DEFAULT '',
+    pc_name    TEXT NOT NULL DEFAULT '',
+    state      TEXT NOT NULL DEFAULT '',
+    message    TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (app_id, login_id, pc_name)
+);
+CREATE TABLE IF NOT EXISTS force_requests (
+    app_id       TEXT NOT NULL,
+    login_id     TEXT NOT NULL DEFAULT '',
+    pc_name      TEXT NOT NULL DEFAULT '',
+    requested_at TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (app_id, login_id, pc_name)
 );
 CREATE TABLE IF NOT EXISTS pc_tools (
     pc_no   INTEGER NOT NULL REFERENCES pcs(pc_no) ON DELETE CASCADE,
@@ -713,6 +738,127 @@ def _check_duplicates(pcs: Iterable[MasterPc]) -> None:
             where = f"管理番号 {first.pc_no}" if first.pc_no else "新しい行"
             raise ValueError(f"同じログインID・PC名の行が2つあります: {who} ({where} と重なります)")
         seen[key] = pc
+
+
+# ------------------------------------------------------------------
+# 更新のため全 PC で止める (1.8.8)
+# ------------------------------------------------------------------
+# 共有サーバーのツールを上書きするには、全 PC でそのツールを止めておく必要がある
+# (動いていると Windows がファイルを掴んでいて、一部だけ上書きに失敗する)。
+# 管理者が「更新中」の印を付けると、各 PC のランチャーが自分でそのツールを止め、
+# どうなったかを書き返す。処理中で止まらない PC は、利用者に知らせて待つ。
+# 管理者は PC ごとに強制終了を頼める。
+STOPPED = "stopped"          # 止めた
+NOT_RUNNING = "not_running"  # 使っていなかった
+BUSY = "busy"                # 処理中なので止まらない (利用者に知らせて待っている)
+FAILED = "failed"            # 止められなかった
+REPORT_LABELS = {STOPPED: "止めた", NOT_RUNNING: "使っていない", BUSY: "処理中 (待っています)",
+                 FAILED: "止められない"}
+
+
+@dataclass(frozen=True)
+class Maintenance:
+    app_id: str
+    name: str = ""
+    started_at: str = ""
+    started_by: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class PcReport:
+    app_id: str
+    login_id: str
+    pc_name: str
+    state: str
+    message: str = ""
+    updated_at: str = ""
+
+    @property
+    def label(self) -> str:
+        return REPORT_LABELS.get(self.state, self.state or "?")
+
+
+def begin_maintenance(path: Path, app_id: str, name: str = "", note: str = "") -> None:
+    """更新中の印を付ける (前の返事・強制終了の依頼は消す)。"""
+    ensure(path)
+    login, pc_name = this_pc()
+    with _open(path) as conn:
+        conn.execute("""INSERT OR REPLACE INTO maintenance(app_id, name, started_at,
+                                                            started_by, note)
+                        VALUES(?, ?, ?, ?, ?)""",
+                     (app_id, name, _now(), f"{login} / {pc_name}", note))
+        conn.execute("DELETE FROM pc_reports WHERE app_id = ?", (app_id,))
+        conn.execute("DELETE FROM force_requests WHERE app_id = ?", (app_id,))
+    trace.event("更新のため全 PC で止める", trace.INFO, detail=f"{name or app_id} ({path})")
+
+
+def end_maintenance(path: Path, app_id: str) -> None:
+    """更新中の印を外す (返事・依頼も片付ける)。"""
+    ensure(path)
+    with _open(path) as conn:
+        conn.execute("DELETE FROM maintenance WHERE app_id = ?", (app_id,))
+        conn.execute("DELETE FROM pc_reports WHERE app_id = ?", (app_id,))
+        conn.execute("DELETE FROM force_requests WHERE app_id = ?", (app_id,))
+    trace.event("更新を終える", trace.INFO, detail=f"{app_id} ({path})")
+
+
+def under_maintenance(path: Path) -> dict[str, Maintenance]:
+    """更新中のツール (アプリID → 印)。**読むだけ** (前の版のマスタなら空)。"""
+    if not path.is_file():
+        return {}
+    try:
+        with _open(path) as conn:
+            rows = conn.execute("SELECT * FROM maintenance").fetchall()
+    except MasterError as exc:
+        if "no such table" in str(exc):
+            return {}
+        raise
+    return {r["app_id"]: Maintenance(app_id=r["app_id"], name=r["name"],
+                                     started_at=r["started_at"], started_by=r["started_by"],
+                                     note=r["note"]) for r in rows}
+
+
+def report(path: Path, app_id: str, state: str, message: str = "") -> None:
+    """この PC で、そのツールがどうなったかを書き返す。"""
+    login, pc_name = this_pc()
+    with _open(path) as conn:
+        conn.execute("""INSERT OR REPLACE INTO pc_reports(app_id, login_id, pc_name, state,
+                                                           message, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?)""",
+                     (app_id, login, pc_name, state, message[:300], _now()))
+
+
+def reports(path: Path, app_id: str) -> list[PcReport]:
+    with _open(path) as conn:
+        rows = conn.execute("SELECT * FROM pc_reports WHERE app_id = ? "
+                            "ORDER BY pc_name, login_id", (app_id,)).fetchall()
+    return [PcReport(app_id=r["app_id"], login_id=r["login_id"], pc_name=r["pc_name"],
+                     state=r["state"], message=r["message"], updated_at=r["updated_at"])
+            for r in rows]
+
+
+def request_force(path: Path, app_id: str, login_id: str, pc_name: str) -> None:
+    """その PC に、ツールの強制終了を頼む (その PC のランチャーが次に見たとき止める)。"""
+    who = " / ".join(this_pc())
+    with _open(path) as conn:
+        conn.execute("""INSERT OR REPLACE INTO force_requests(app_id, login_id, pc_name,
+                                                               requested_at, requested_by)
+                        VALUES(?, ?, ?, ?, ?)""", (app_id, login_id, pc_name, _now(), who))
+    trace.event("強制終了を頼んだ", trace.WARNING, detail=f"{app_id}: {login_id} / {pc_name}")
+
+
+def take_force_request(path: Path, app_id: str) -> bool:
+    """この PC への強制終了の依頼があれば、受け取って (消して) 真。"""
+    login, pc_name = this_pc()
+    with _open(path) as conn:
+        found = conn.execute("""SELECT 1 FROM force_requests WHERE app_id = ?
+                                  AND login_id = ? AND pc_name = ?""",
+                             (app_id, login, pc_name)).fetchone()
+        if found:
+            conn.execute("""DELETE FROM force_requests WHERE app_id = ?
+                              AND login_id = ? AND pc_name = ?""", (app_id, login, pc_name))
+    return bool(found)
 
 
 def _now() -> str:

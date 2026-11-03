@@ -22,7 +22,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox
 from typing import Optional
 
-from .. import app_config, fileprobe, logging_utils, tool_registry, trace
+from .. import app_config, fileprobe, logging_utils, maintenance, tool_registry, trace
 from ..logging_utils import get_logger
 from . import geometry, password, theme
 from .geometry import POSITION_KEY
@@ -42,6 +42,8 @@ GC_MS = 10_000
 # 画面側のループが状態を取りに行く間隔 (ミリ秒)。
 # 起動中の経過表示がなめらかに見える程度でよい
 DRAIN_MS = 120
+# 起動してから、はじめて「更新中」の印を見に行くまで (ミリ秒)
+MAINTENANCE_FIRST_MS = 3000
 
 # 自分で動かしたあと、「動かしている最中」の印を外すまで (ミリ秒)。
 # `geometry()` の通知は少し遅れて届くので、余韻をもって戻す
@@ -120,6 +122,8 @@ class LauncherBar:
         self._render(self.manager.status)
         self.root.after(DRAIN_MS, self._drain)
         self.root.after(self._poll_interval_ms(), self._poll_health)
+        # 管理者の「更新のため全 PC で止める」を見張る (1.8.8)
+        self.root.after(MAINTENANCE_FIRST_MS, self._poll_maintenance)
 
     # --------------------------------------------------------------
     # 組み立て
@@ -146,6 +150,11 @@ class LauncherBar:
                                      activebackground=theme.BUTTON_ACTIVE,
                                      activeforeground=theme.FG, bd=0)
         self._hidden: list[str] = []
+        # 管理者が「更新中」にしたツール (アプリID → 表示名)。ボタンに「更新中」と出す
+        self._blocked: dict[str, str] = {}
+        self._maintenance = maintenance.Watcher(self.manager)
+        self._maintenance_queue: queue.Queue = queue.Queue()
+        self._maintenance_busy = False
         # ツールが多いときの「選ぶ ▼」と［開く］(1.8.4)。少ないときは作らない
         self._select_mode = False
         self.selector: Optional[tk.Menubutton] = None
@@ -287,6 +296,8 @@ class LauncherBar:
 
     def _selector_label(self, app_id: str, status) -> str:
         name = self._names.get(app_id, app_id)
+        if app_id in self._blocked and app_id not in set(status.running_ids):
+            return f"{name}（更新中）"
         if app_id in set(status.starting_ids) | set(status.stopping_ids):
             return f"… {name}"
         if app_id in set(status.running_ids):
@@ -854,6 +865,11 @@ class LauncherBar:
             pass
         if status is not None:
             self._render(status)
+        try:
+            while True:
+                self._apply_maintenance(self._maintenance_queue.get_nowait())
+        except queue.Empty:
+            pass
         self.root.after(DRAIN_MS, self._drain)
 
     def _render(self, status) -> None:
@@ -938,7 +954,11 @@ class LauncherBar:
             self._apply_overflow()
         for app_id, button in self.buttons.items():
             name = self._names.get(app_id, app_id)
-            if app_id in busy:
+            if app_id in self._blocked and app_id not in running | busy:
+                # 管理者が更新している。押しても起動しない
+                button.configure(text=f"{name}（更新中）", bg=theme.UTIL_BG,
+                                 fg=theme.MUTED, activebackground=theme.UTIL_BG)
+            elif app_id in busy:
                 button.configure(text=f"… {name}", bg=theme.TOOL_BUSY,
                                  fg=theme.FG, activebackground=theme.TOOL_BUSY)
             elif app_id in running:
@@ -975,6 +995,58 @@ class LauncherBar:
             threading.Thread(target=self._poll_worker, name="poll",
                              daemon=True).start()
         self.root.after(self._poll_interval_ms(), self._poll_health)
+
+    # --------------------------------------------------------------
+    # 更新のため全 PC で止める (1.8.8)
+    # --------------------------------------------------------------
+    def _poll_maintenance(self) -> None:
+        """管理者の「更新中」の印を見る。**画面のスレッドでは回さない** (共有フォルダー)。"""
+        if not self._maintenance_busy:
+            self._maintenance_busy = True
+
+            def work() -> None:
+                try:
+                    result = self._maintenance.poll()
+                    if result is not None:
+                        self._maintenance_queue.put(result)
+                finally:
+                    self._maintenance_busy = False
+
+            threading.Thread(target=work, name="maintenance", daemon=True).start()
+        self.root.after(int(maintenance.POLL_SEC * 1000), self._poll_maintenance)
+
+    def _apply_maintenance(self, result) -> None:
+        if result.blocked != self._blocked:
+            self._blocked = dict(result.blocked)
+            self._paint_buttons(self.manager.status)
+        for app_id, name in result.ask_user:
+            self._ask_to_close(name)
+
+    def _ask_to_close(self, name: str) -> None:
+        """処理中で止まらなかった。**利用者に終了を頼む** (作業中のデータを失わない)。
+
+        閉じなくても困らない窓にする (ランチャーは1分ごとに終了を頼み直す)。
+        """
+        top = tk.Toplevel(self.root)
+        top.title("ツールの更新")
+        top.configure(bg=theme.BG)
+        top.attributes("-topmost", True)
+        tk.Label(top, text=f"管理者が「{name}」を更新します", bg=theme.BG, fg=theme.FG,
+                 font=theme.FONT_TOOL, anchor="w").pack(fill="x", padx=18, pady=(16, 6))
+        tk.Label(top, text=f"作業中の内容を保存してから、{name} を終了してください。\n"
+                           f"いまは処理の途中のため、ランチャーからは止めていません。\n"
+                           "終了すれば、ほかに何もしなくて大丈夫です。\n"
+                           "(更新が終わるまで、このツールは起動できません)",
+                 bg=theme.BG, fg=theme.FG, font=theme.FONT, justify="left",
+                 anchor="w").pack(fill="x", padx=18)
+        tk.Button(top, text="わかった", command=top.destroy, bg=theme.BUTTON_CURRENT,
+                  fg=theme.FG, relief="flat", bd=0, padx=22, pady=6, font=theme.FONT_BOLD,
+                  cursor="hand2").pack(anchor="e", padx=18, pady=(12, 14))
+        top.update_idletasks()
+        x = (top.winfo_screenwidth() - top.winfo_reqwidth()) // 2
+        y = (top.winfo_screenheight() - top.winfo_reqheight()) // 3
+        top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        trace.event("更新のため終了を頼んだ", trace.INFO, detail=name)
 
     def _poll_worker(self) -> None:
         try:
