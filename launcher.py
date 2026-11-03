@@ -253,7 +253,7 @@ def start() -> int:
         result = boot.run()
 
     if not result.started and getattr(result, "held", False):
-        _show_message("ランチャーを更新しています", result.reason)
+        _show_held(result.reason)
         return 0
     if not result.started:
         _show_message("すでに起動しています",
@@ -321,6 +321,51 @@ def _show_message(title: str, body: str) -> bool:
         return True
     except Exception:                         # noqa: BLE001 - 伝え方で落ちない
         return False
+
+
+def _show_held(reason: str) -> None:
+    """「更新しています」。**管理者なら、ここで「更新中」を外せる** (1.8.15)。
+
+    管理者が［更新を終える］を押し忘れて帰ると、全 PC でランチャーが起動しなく
+    なった。印を付けた PC に行かなくても、どの PC からでも外せるようにする。
+    """
+    title = f"{app_config.display_name()} - ランチャーを更新しています"
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, simpledialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            answer = messagebox.askyesno(
+                title,
+                f"{reason}\n\n"
+                "────────────\n"
+                "管理者の方へ: 更新が終わっているのにこの知らせが出るときは、"
+                "［更新を終える］の押し忘れです。\n"
+                "管理者のパスワードで、この PC から「更新中」を外せます。外しますか?",
+                icon="info", default="no", parent=root)
+            if not answer:
+                return
+            from launcher import distribution, maintenance
+
+            for _ in range(3):
+                text = simpledialog.askstring(title, "管理者のパスワード", show="*",
+                                              parent=root)
+                if text is None:
+                    return
+                if distribution.verify_password(text):
+                    messagebox.showinfo(title, maintenance.end_launcher_update_by_admin(),
+                                        parent=root)
+                    return
+                messagebox.showerror(title, "パスワードが違います。", parent=root)
+        finally:
+            root.destroy()
+            del root
+            import gc
+            gc.collect()
+    except Exception:                         # noqa: BLE001 - 伝え方で落ちない
+        _show_message("ランチャーを更新しています", reason)
 
 
 def report_failure(error: StartupError, *, incident: str = "") -> None:

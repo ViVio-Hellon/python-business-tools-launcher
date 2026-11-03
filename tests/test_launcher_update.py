@@ -157,6 +157,46 @@ class WatcherTests(UpdateTestCase):
         self.assertFalse(boot._held_for_update(boot.BootResult(started=True)))
 
 
+class ForgottenMarkTests(UpdateTestCase):
+    """［更新を終える］を押し忘れて帰ると、全 PC で起動しなくなった (1.8.15)。"""
+
+    def age_mark(self, hours: float) -> None:
+        import sqlite3
+
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - hours * 3600))
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE maintenance SET started_at = ? WHERE app_id = ?",
+                         (stamp + ".000000", tool_master.LAUNCHER_MARK))
+
+    def test_古い印では起動を止めない(self) -> None:
+        self.mark_by_admin()
+        self.assertIsNotNone(maintenance.launcher_hold())
+        self.age_mark(maintenance.LAUNCHER_MARK_MAX_HOURS + 0.5)
+        self.assertIsNone(maintenance.launcher_hold())
+
+    def test_古い印では動いているランチャーも閉じない(self) -> None:
+        self.mark_by_admin()
+        self.age_mark(maintenance.LAUNCHER_MARK_MAX_HOURS + 0.5)
+        result = maintenance.Watcher(mock.Mock())._poll()
+        self.assertIsNone(result.close_launcher)
+
+    def test_起動できないPCから管理者が外せる(self) -> None:
+        self.mark_by_admin()
+        with mock.patch.object(maintenance, "waiter_running", return_value=True):
+            text = maintenance.end_launcher_update_by_admin()
+        self.assertIn("自動でランチャーが起動します", text)
+        self.assertNotIn(tool_master.LAUNCHER_MARK, tool_master.under_maintenance(self.path))
+
+    def test_待ち番がいなければその場で起動する(self) -> None:
+        self.mark_by_admin()
+        with mock.patch.object(maintenance, "waiter_running", return_value=False), \
+                mock.patch.object(maintenance.subprocess, "Popen") as popen:
+            text = maintenance.end_launcher_update_by_admin()
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], maintenance.restart_command())
+        self.assertIn("起動します", text)
+
+
 @unittest.skipUnless(have_tkinter(), "tkinter が要る (画面の部品を読む)")
 class AdminListTests(UpdateTestCase):
     """管理者の「ランチャーの更新」の一覧 (1.8.14: 「返事なし」ばかりで使えなかった)。"""

@@ -371,6 +371,54 @@ class SettingsDialog:
             tk.Label(line, text=f"ランチャーを更新中 ({mark.started_text} から・{mark.started_by})",
                      bg=theme.BG, fg=theme.STATE_COLORS["starting"],
                      font=theme.FONT_SMALL).pack(side="left", padx=(10, 0))
+        self._build_marks_list(box)
+
+    def _build_marks_list(self, box: tk.Frame) -> None:
+        """いま「更新中」のツールの一覧 (1.8.15)。
+
+        ツールの印は時間では外れない。［更新を終える］を押し忘れた・ツールを消した・
+        アプリIDが変わったなどで残った印も、**ここで必ず見えて、外せる**ようにする。
+        """
+        marks = {k: m for k, m in self._marks(fresh=True).items()
+                 if k != tool_master.LAUNCHER_MARK}
+        tk.Label(box, text="更新中のツール", bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD,
+                 anchor="w").pack(fill="x", pady=(14, 0))
+        if not marks:
+            tk.Label(box, text="ありません (どの PC でも、全部のツールを起動できます)",
+                     bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                     anchor="w").pack(fill="x", pady=(4, 0))
+            return
+        for app_id, mark in sorted(marks.items(), key=lambda kv: kv[1].started_at):
+            line = tk.Frame(box, bg=theme.BG)
+            line.pack(fill="x", pady=(4, 0))
+            age = mark.age_hours()
+            old = f"・{age:.0f} 時間前" if age is not None and age >= 1 else ""
+            tk.Label(line, text=f"{mark.name or app_id}  ({mark.started_text} から{old}・"
+                                f"{mark.started_by})",
+                     bg=theme.BG, fg=theme.STATE_COLORS["starting"],
+                     font=theme.FONT_SMALL).pack(side="left")
+            self._action_button(line, "更新を終える",
+                                lambda a=app_id, m=mark: self.end_mark(a, m)).pack(
+                side="left", padx=(10, 0))
+        tk.Label(box, text="更新中のツールは、どの PC でも起動しません。上書きが終わっていれば"
+                           "［更新を終える］を押してください",
+                 bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w").pack(
+            fill="x", pady=(4, 0))
+
+    def end_mark(self, app_id: str, mark) -> None:
+        name = mark.name or app_id
+        if not messagebox.askyesno(
+                "更新を終える", f"「{name}」の更新を終えます。\n各 PC で、このツールをまた起動"
+                               "できるようになります。\n\nフォルダーの上書きは終わりましたか?",
+                parent=self.top):
+            return
+        try:
+            tool_master.end_maintenance(self._master_path(), app_id, mark.start_command)
+        except MasterError as exc:
+            messagebox.showerror("更新を終える", f"「更新中」を外せませんでした。\n{exc}",
+                                 parent=self.top)
+        self._build_launcher_update_box()
+        self._refresh_list()
 
     def begin_launcher_update(self) -> None:
         if not messagebox.askyesno(
@@ -540,6 +588,20 @@ class SettingsDialog:
         self._marks_cache = (path, now, marks)
         return marks
 
+    def _mark_of(self, row: "_ToolRow", *, fresh: bool = False):
+        """そのツールの更新中の印 (アプリID, 印)。無ければ (アプリID, None)。
+
+        **各 PC のランチャーと同じ見つけ方** (アプリIDか起動ファイルの道)。ツールを
+        上書きしてアプリIDが変わっても、残っている印を見落とさない (1.8.15)。
+        """
+        found = tool_master.marks_for(self._marks(fresh=fresh), row.tool.app_id,
+                                      row.path_var.get())
+        if row.tool.app_id in found:
+            return row.tool.app_id, found[row.tool.app_id]
+        for key, mark in found.items():
+            return key, mark
+        return row.tool.app_id, None
+
     def _build_maintenance_box(self, row: "_ToolRow") -> None:
         box = self.detail_maint
         for child in box.winfo_children():
@@ -547,8 +609,7 @@ class SettingsDialog:
         if row.is_new or not row.master_no:
             return                            # まだマスタに無い (保存してから)
         box.pack(fill="x", pady=(14, 0))
-        app_id = row.tool.app_id
-        mark = self._marks(fresh=True).get(app_id)
+        _app_id, mark = self._mark_of(row, fresh=True)
         tk.Label(box, text="ツールの更新 (共有サーバーのフォルダーを上書きするとき)",
                  bg=theme.BG, fg=theme.FG, font=theme.FONT_BOLD, anchor="w").pack(fill="x")
         line = tk.Frame(box, bg=theme.BG)
@@ -593,8 +654,10 @@ class SettingsDialog:
         self.open_update(row)
 
     def open_update(self, row: "_ToolRow") -> None:
-        UpdateDialog(self.top, self._master_path(), row.tool.app_id, row.label(),
-                     master_no=row.master_no)
+        # 印のアプリID (上書きでアプリIDが変わっていれば、印を付けたときのもの)
+        app_id, _mark = self._mark_of(row, fresh=True)
+        UpdateDialog(self.top, self._master_path(), app_id, row.label(),
+                     master_no=row.master_no, start_command=row.path_var.get())
         self._build_maintenance_box(row)
         self._refresh_list()
 
@@ -626,7 +689,8 @@ class SettingsDialog:
             item = tk.Frame(self.list_inner, bg=bg, cursor="hand2")
             item.pack(fill="x", pady=(0, 1))
             status, color = row.status()
-            if row.tool.app_id in marks and not row.marked_for_delete():
+            if not row.marked_for_delete() and tool_master.marks_for(
+                    marks, row.tool.app_id, row.path_var.get()):
                 status, color = "更新中", theme.STATE_COLORS["starting"]
             top = tk.Frame(item, bg=bg)
             top.pack(fill="x", padx=10, pady=(6, 0))
@@ -1614,8 +1678,11 @@ class UpdateDialog:
     REFRESH_MS = 3000
 
     def __init__(self, parent: tk.Misc, path: Path, app_id: str, name: str, *,
-                 master_no: int = 0, launcher: bool = False) -> None:
+                 master_no: int = 0, launcher: bool = False,
+                 start_command: str = "") -> None:
         self.path, self.app_id, self.name, self.master_no = path, app_id, name, master_no
+        # 起動ファイルの道。［更新を終える］で、アプリIDの違う同じツールの印も外す (1.8.15)
+        self.start_command = start_command
         # ランチャー自身の更新 (1.8.11)。返事は「閉じた」、待つのは PC の行の全部
         self.launcher = launcher
         self.ended = False
@@ -1929,10 +1996,16 @@ class UpdateDialog:
                  "なります。\n\nフォルダーの上書きは終わりましたか?"), parent=self.top):
             return
         try:
-            tool_master.end_maintenance(self.path, self.app_id)
+            removed = tool_master.end_maintenance(self.path, self.app_id, self.start_command)
         except MasterError as exc:
-            messagebox.showerror("更新を終える", f"書けませんでした。\n{exc}", parent=self.top)
+            messagebox.showerror("更新を終える",
+                                 f"「更新中」を外せませんでした。各 PC ではまだ起動できません。\n{exc}",
+                                 parent=self.top)
             return
+        if not removed:
+            messagebox.showwarning("更新を終える",
+                                   "外す「更新中」の印がありませんでした (もう外れています)。",
+                                   parent=self.top)
         self.ended = True
         self.close()
 

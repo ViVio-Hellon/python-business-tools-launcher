@@ -95,7 +95,8 @@ class Watcher:
                    for app_id, mark in marks.items() for target in targets[app_id]}
         self.manager.set_blocked(set(blocked))
         result = PollResult(blocked=blocked, master=path)
-        if launcher_mark is not None and not launcher_mark.set_by_this_pc():
+        if launcher_mark is not None and not launcher_mark.set_by_this_pc() \
+                and not launcher_mark_stale(launcher_mark):
             # ランチャー自身の更新。閉じるのはバー (画面) の仕事
             result.close_launcher = launcher_mark
             result.force_close = _take_force(path, tool_master.LAUNCHER_MARK)
@@ -245,9 +246,25 @@ def launcher_hold() -> Optional[tool_master.Maintenance]:
         log.warning("ランチャー更新中の印を確かめられませんでした", exc_info=True)
         return None
     mark = marks.get(tool_master.LAUNCHER_MARK)
-    if mark is None or mark.set_by_this_pc():
+    if mark is None or mark.set_by_this_pc() or launcher_mark_stale(mark):
         return None
     return mark
+
+
+# ランチャーの更新の印が、これより古ければ「外し忘れ」とみなす (時間。1.8.15)。
+# ランチャーの上書きは数分で終わる。管理者が［更新を終える］を押し忘れて帰ると、
+# 翌朝まで全 PC でランチャーが起動しなかった
+LAUNCHER_MARK_MAX_HOURS = 3.0
+
+
+def launcher_mark_stale(mark: tool_master.Maintenance) -> bool:
+    """外し忘れた (古すぎる) ランチャーの更新の印か。古ければ記録に残す。"""
+    age = mark.age_hours()
+    if age is None or age < LAUNCHER_MARK_MAX_HOURS:
+        return False
+    log.warning("ランチャーの更新の印が %.1f 時間前のままです (%s)。外し忘れとみなして"
+                "起動します", age, mark.started_by)
+    return True
 
 
 def restart_command() -> list[str]:
@@ -380,3 +397,31 @@ def _read(path) -> Optional[dict[str, tool_master.Maintenance]]:
             log.info("更新中の印を読めません: %s", box["error"])
         return None
     return box["marks"]
+
+
+def end_launcher_update_by_admin() -> str:
+    """利用者の PC で、管理者が「更新中」を外す (起動できないときの逃げ道。1.8.15)。
+
+    外したら、その PC の待ち番が 10 秒ほどで起動する。待ち番が動いていなければ、
+    ここで起動する。返すのは利用者に見せる文。
+    """
+    path = tool_master.current_path()
+    if path is None:
+        return "ツール管理マスタの場所が分かりません。"
+    try:
+        tool_master.end_maintenance(path, tool_master.LAUNCHER_MARK)
+    except tool_master.MasterError as exc:
+        return f"外せませんでした。\n{exc}"
+    from . import trace
+
+    trace.event("ランチャーの更新を外した (起動できない PC から)", trace.WARNING,
+                detail=" / ".join(tool_master.this_pc()))
+    if waiter_running():
+        return "「更新中」を外しました。10 秒ほどで、自動でランチャーが起動します。"
+    try:
+        command = restart_command()
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    except OSError as exc:
+        return f"「更新中」を外しました。ランチャーをもう一度起動してください。\n({exc})"
+    return "「更新中」を外しました。ランチャーを起動します。"

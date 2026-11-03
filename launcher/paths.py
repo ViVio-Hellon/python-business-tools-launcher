@@ -109,7 +109,7 @@ _drive_cache: tuple[float, dict[str, str]] = (0.0, {})
 
 
 def is_unc(path: str) -> bool:
-    """`\\サーバー\共有\…` (または `//サーバー/…`) か。`\\?\` などの特別な形は除く。"""
+    r"""`\\サーバー\共有\…` (または `//サーバー/…`) か。`\\?\` などの特別な形は除く。"""
     text = (path or "").strip().strip('"').replace("/", "\\")
     return text.startswith("\\\\") and not text.startswith(("\\\\?\\", "\\\\.\\"))
 
@@ -183,7 +183,7 @@ def as_unc(text: str) -> str:
 
 
 def entry_cwd(path: Union[str, PurePath], cwd: Optional[str]) -> Optional[str]:
-    """起動ファイルを動かすときの作業フォルダー。
+    r"""起動ファイルを動かすときの作業フォルダー。
 
     cmd は共有フォルダーを作業フォルダーにできない (「UNC パスはサポートされません」と
     出して C:\Windows で動く。その文が stop.bat の答えの 1 行目に混ざる)。.bat の

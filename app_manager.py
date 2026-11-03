@@ -464,7 +464,9 @@ class ToolManager:
             self._set(self._settled_state(), f"{tool.display_name}は更新中です", tool,
                       detail=f"管理者が{tool.display_name}を更新しています。"
                              "更新が終わるまで使えません。\n"
-                             "終わると、ボタンがもとに戻ります。")
+                             "終わると、ボタンがもとに戻ります。\n"
+                             "長く続くときは、管理者に［設定］→「記録・配布」の"
+                             "「更新中のツール」で［更新を終える］を押してもらってください。")
             return
         self._focus = app_id
         op = trace.operation("ボタン", tool)

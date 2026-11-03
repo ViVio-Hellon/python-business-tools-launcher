@@ -252,7 +252,7 @@ def _held_for_update(result: BootResult) -> bool:
     result.started = False
     result.held = True
     result.reason = (f"管理者がランチャーを更新しています ({mark.started_text} から)。\n"
-                     "更新が終わると、自動で起動します。")
+                     f"更新が終わると、自動で起動します。\n(更新を始めた人: {mark.started_by})")
     log.info("ランチャーの更新中なので起動しません: %s", mark.started_by)
     trace.event("ランチャー起動", trace.CANCELLED, cause="ランチャーの更新中",
                 detail=mark.started_by)

@@ -794,6 +794,14 @@ class Maintenance:
     def started_text(self) -> str:
         return self.started_at[:19]
 
+    def age_hours(self, now: Optional[float] = None) -> Optional[float]:
+        """印を付けてから何時間たったか。読めなければ None。"""
+        try:
+            started = time.mktime(time.strptime(self.started_at[:19], "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, OverflowError):
+            return None
+        return ((time.time() if now is None else now) - started) / 3600
+
     def set_by_this_pc(self) -> bool:
         """この PC (このログインID) が付けた印か。"""
         return self.started_by == " / ".join(this_pc())
@@ -830,14 +838,54 @@ def begin_maintenance(path: Path, app_id: str, name: str = "", note: str = "",
     trace.event("更新のため全 PC で止める", trace.INFO, detail=f"{name or app_id} ({path})")
 
 
-def end_maintenance(path: Path, app_id: str) -> None:
-    """更新中の印を外す (返事・依頼も片付ける)。"""
-    ensure(path)
+def end_maintenance(path: Path, app_id: str, start_command: str = "") -> int:
+    """更新中の印を外す (返事・依頼も片付ける)。外した印の数を返す。
+
+    **そのツールの印を全部外す**: アプリIDが同じもの、または起動ファイルの道が
+    同じもの (`marks_for`)。各 PC のランチャーは起動ファイルの道でも印を見つけて
+    止めるので、ツールを上書きしてアプリIDが変わったあとも、アプリIDだけで外すと
+    印が残り、全 PC でそのツールが「更新中」のまま起動しなくなった (1.8.15)。
+    """
+    if not path.is_file():
+        raise MasterError(f"ツール管理マスタがありません: {path}")
+    targets = {app_id} | set(marks_for(under_maintenance(path), app_id, start_command))
     with _open(path) as conn:
-        conn.execute("DELETE FROM maintenance WHERE app_id = ?", (app_id,))
-        conn.execute("DELETE FROM pc_reports WHERE app_id = ?", (app_id,))
-        conn.execute("DELETE FROM force_requests WHERE app_id = ?", (app_id,))
-    trace.event("更新を終える", trace.INFO, detail=f"{app_id} ({path})")
+        removed = 0
+        for target in targets:
+            removed += conn.execute("DELETE FROM maintenance WHERE app_id = ?",
+                                    (target,)).rowcount
+            conn.execute("DELETE FROM pc_reports WHERE app_id = ?", (target,))
+            conn.execute("DELETE FROM force_requests WHERE app_id = ?", (target,))
+    left = marks_for(under_maintenance(path), app_id, start_command)
+    if left:
+        raise MasterError("更新中の印が外れませんでした: " + "、".join(left))
+    trace.event("更新を終える", trace.INFO if removed else trace.WARNING,
+                detail=f"{'、'.join(sorted(targets))} ({path})"
+                       + ("" if removed else " — 外す印がありませんでした"))
+    return removed
+
+
+def marks_for(marks: dict, app_id: str, start_command: str = "") -> dict:
+    """`marks` (アプリID → 印) のうち、そのツールの印。
+
+    アプリIDが同じもの、または**起動ファイルの道**が同じもの。各 PC のランチャーが
+    止めるときの見つけ方 (`maintenance._local_ids`) と同じにする。
+    """
+    found = {}
+    starts = {normalize(c) for c in MasterTool(0, start_command=start_command).candidates()} \
+        if start_command.strip() else set()
+    for key, mark in marks.items():
+        if key == app_id:
+            found[key] = mark
+            continue
+        if key == LAUNCHER_MARK:
+            continue
+        if starts and mark.start_command.strip():
+            theirs = {normalize(c) for c in
+                      MasterTool(0, start_command=mark.start_command).candidates()}
+            if theirs & starts:
+                found[key] = mark
+    return found
 
 
 def under_maintenance(path: Path) -> dict[str, Maintenance]:

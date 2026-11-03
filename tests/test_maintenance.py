@@ -147,6 +147,38 @@ class WatcherTests(ManagerTestCase):
         self.assertNotIn("app.nippou-local", self.manager.running)
         self.assertEqual(self.state("nlm.nippou"), tool_master.STOPPED)
 
+    def test_上書きでアプリIDが変わっても更新を終えれば起動できる(self) -> None:
+        """現場で、［更新を終える］を押したのに全 PC で「更新中」のまま起動できなかった。
+
+        印は印を付けたときのアプリID (nlm.nippou)。上書きで新しい版の app.json が入り、
+        アプリIDが変わる (app.nippou-v2)。各 PC は起動ファイルの道で印を見つけて止め
+        続けるのに、［更新を終える］は新しいアプリIDだけで外していた (何も外れない)。
+        """
+        tool = self.register("app.nippou-v2", "日報")
+        tool_master.begin_maintenance(self.path, "nlm.nippou", "日報",
+                                      start_command=tool.start_command)
+        self.assertIn("app.nippou-v2", self.watcher.poll().blocked)
+        # 前の作り: 新しいアプリIDで外すと、何も外れないのにエラーにならなかった
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DELETE FROM maintenance WHERE app_id = 'app.nippou-v2'")
+        self.assertIn("app.nippou-v2", self.watcher.poll().blocked, "前の作りの再現")
+        # いまの作り: 起動ファイルの道で同じツールの印を全部外す
+        removed = tool_master.end_maintenance(self.path, "app.nippou-v2", tool.start_command)
+        self.assertEqual(removed, 1)
+        self.assertEqual(tool_master.under_maintenance(self.path), {})
+        self.assertNotIn("app.nippou-v2", self.watcher.poll().blocked)
+
+    def test_外す印が無ければ0を返す(self) -> None:
+        self.assertEqual(tool_master.end_maintenance(self.path, "nlm.none"), 0)
+
+    def test_別のツールの印は外さない(self) -> None:
+        tool_master.begin_maintenance(self.path, "a", "A", start_command=r"C:\T\a\start.bat")
+        tool_master.begin_maintenance(self.path, "b", "B", start_command=r"C:\T\b\start.bat")
+        tool_master.begin_maintenance(self.path, tool_master.LAUNCHER_MARK, "ランチャー")
+        tool_master.end_maintenance(self.path, "x", r"C:\T\a\start.bat")
+        self.assertEqual(sorted(tool_master.under_maintenance(self.path)),
+                         sorted(["b", tool_master.LAUNCHER_MARK]))
+
     def test_印を付け直したらまた返事を書く(self) -> None:
         self.register("nlm.nippou", "日報")
         tool_master.begin_maintenance(self.path, "nlm.nippou", "日報")
@@ -300,3 +332,22 @@ class ScreenTests(LocalAreaTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SettingsLookupTests(unittest.TestCase):
+    """［設定］の「更新中」の見つけ方を、各 PC のランチャーと同じにする (1.8.15)。"""
+
+    @unittest.skipUnless(__import__("_isolation").have_tkinter(), "tkinter が要る")
+    def test_アプリIDが変わっても起動ファイルの道で印を見つける(self) -> None:
+        from launcher.ui.settings_dialog import SettingsDialog
+
+        mark = tool_master.Maintenance("nlm.nippou", "日報", "2026-11-03 15:02:00.000000",
+                                       "Xfa-Admin / PC-A", "", r"C:\T\nippou\start.bat")
+        dialog = SettingsDialog.__new__(SettingsDialog)
+        dialog._marks = lambda fresh=False: {"nlm.nippou": mark}
+        row = mock.Mock()
+        row.tool.app_id = "app.nippou-v2"
+        row.path_var.get.return_value = r"c:/t/nippou/start.bat"
+        self.assertEqual(dialog._mark_of(row), ("nlm.nippou", mark))
+        row.path_var.get.return_value = r"C:\T\other\start.bat"
+        self.assertEqual(dialog._mark_of(row), ("app.nippou-v2", None))
