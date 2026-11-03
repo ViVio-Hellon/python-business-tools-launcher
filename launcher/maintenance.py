@@ -48,6 +48,8 @@ class PollResult:
     # ランチャー自身の更新の印 (この PC で閉じる)。印を付けた PC では None
     close_launcher: Optional[tool_master.Maintenance] = None
     master: Optional[Path] = None
+    # 管理者が［強制で閉じる］を押した (待っている理由があっても閉じる。1.8.14)
+    force_close: bool = False
 
 
 class Watcher:
@@ -63,6 +65,8 @@ class Watcher:
         self._tried: dict[tuple[str, str], float] = {}
         # 利用者に「終了してください」と知らせたもの (印ごとに1回)
         self._asked: set[tuple[str, str]] = set()
+        # 最後に「動いている」を書いた時刻 (monotonic)。0 はまだ
+        self._beat_at = 0.0
 
     def poll(self) -> Optional[PollResult]:
         """1回見る。マスタを使っていない・届かないときは None (何もしない)。"""
@@ -79,6 +83,7 @@ class Watcher:
         found = fileprobe.probe(path)
         if not found.found:
             return None
+        self._heartbeat(path)
         marks = _read(path)
         if marks is None:
             return None
@@ -93,6 +98,7 @@ class Watcher:
         if launcher_mark is not None and not launcher_mark.set_by_this_pc():
             # ランチャー自身の更新。閉じるのはバー (画面) の仕事
             result.close_launcher = launcher_mark
+            result.force_close = _take_force(path, tool_master.LAUNCHER_MARK)
         for app_id, mark in marks.items():
             try:
                 self._handle(path, mark, targets[app_id], result)
@@ -104,6 +110,19 @@ class Watcher:
             self._tried.pop(key, None)
         self._asked &= live
         return result
+
+    def _heartbeat(self, path) -> None:
+        """「この PC で、この版のランチャーが動いている」を書く (1 分に 1 回。1.8.14)。"""
+        now = time.monotonic()
+        if self._beat_at and now - self._beat_at < HEARTBEAT_SEC:
+            return
+        self._beat_at = now
+        from . import __version__
+
+        try:
+            tool_master.heartbeat(path, __version__)
+        except tool_master.MasterError as exc:
+            log.info("動いていることを書けませんでした: %s", exc)
 
     def _handle(self, path, mark: tool_master.Maintenance, local_ids: set[str],
                 result: PollResult) -> None:
@@ -208,6 +227,8 @@ def _take_force(path, app_id: str) -> bool:
 # ------------------------------------------------------------------
 WAITER_NAME = "restart_waiter.py"
 WAITER_PID = "restart_waiter.pid"
+# 「動いている」を書く間 (秒)。管理者の窓は、これの数倍より古ければ「見えない」とする
+HEARTBEAT_SEC = 60.0
 
 
 def launcher_hold() -> Optional[tool_master.Maintenance]:
@@ -317,12 +338,28 @@ def _pythonw() -> str:
     return str(exe)
 
 
-def report_closed(master: Path) -> None:
+def report_closed(master: Path, *, tries: int = 3, pause: float = 1.0) -> bool:
+    """「閉じた」を書く。**書けなければ書き直す** (共有フォルダーが混んでいると
+    1 回目は失敗することがある。書けないまま閉じると、管理者には「返事なし」に見える)。"""
+    for attempt in range(tries):
+        try:
+            tool_master.report(master, tool_master.LAUNCHER_MARK, tool_master.CLOSED,
+                               "更新が終わると自動で起動します")
+            return True
+        except tool_master.MasterError as exc:
+            log.warning("ランチャーを閉じたことを書き返せませんでした (%d 回目): %s",
+                        attempt + 1, exc)
+            if attempt + 1 < tries:
+                time.sleep(pause)
+    return False
+
+
+def report_waiting(master: Path, reason: str) -> None:
+    """閉じるのを待っていること (と、その理由) を書く。"""
     try:
-        tool_master.report(master, tool_master.LAUNCHER_MARK, tool_master.CLOSED,
-                           "更新が終わると自動で起動します")
+        tool_master.report(master, tool_master.LAUNCHER_MARK, tool_master.WAITING, reason)
     except tool_master.MasterError as exc:
-        log.warning("ランチャーを閉じたことを書き返せませんでした: %s", exc)
+        log.info("閉じるのを待っていることを書けませんでした: %s", exc)
 
 
 def _read(path) -> Optional[dict[str, tool_master.Maintenance]]:

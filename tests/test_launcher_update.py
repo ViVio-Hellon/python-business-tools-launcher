@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _isolation import LocalAreaTestCase, have_tk, release_tk  # noqa: E402
+from _isolation import LocalAreaTestCase, have_tk, have_tkinter, release_tk  # noqa: E402
 
 from launcher import app_config, maintenance, restart_waiter, tool_master, tool_registry  # noqa: E402
 
@@ -157,6 +157,119 @@ class WatcherTests(UpdateTestCase):
         self.assertFalse(boot._held_for_update(boot.BootResult(started=True)))
 
 
+@unittest.skipUnless(have_tkinter(), "tkinter が要る (画面の部品を読む)")
+class AdminListTests(UpdateTestCase):
+    """管理者の「ランチャーの更新」の一覧 (1.8.14: 「返事なし」ばかりで使えなかった)。"""
+
+    def rows(self):
+        from launcher.ui.settings_dialog import UpdateDialog
+
+        dialog = UpdateDialog.__new__(UpdateDialog)
+        dialog.path, dialog.app_id, dialog.launcher = self.path, tool_master.LAUNCHER_MARK, True
+        dialog.master_no = 0
+        with mock.patch.object(tool_master, "this_pc", return_value=ADMIN):
+            rows = dialog.rows()
+        return dialog, {r[0]: r for r in rows}
+
+    def as_pc(self, login: str, pc: str):
+        return mock.patch.object(tool_master, "this_pc", return_value=(login, pc))
+
+    def test_動いていることと版を書く(self) -> None:
+        watcher = maintenance.Watcher(mock.Mock())
+        watcher._poll()
+        from launcher import __version__
+
+        seen = tool_master.launchers_seen(self.path)
+        self.assertEqual([(s.pc_name, s.version) for s in seen], [(PC, __version__)])
+        with mock.patch.object(tool_master, "heartbeat") as beat:
+            watcher._poll()                     # 1 分に 1 回
+        beat.assert_not_called()
+
+    def test_前の版のマスタにも書ける(self) -> None:
+        import sqlite3
+
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DROP TABLE launchers")
+        self.assertEqual(tool_master.launchers_seen(self.path), [])
+        tool_master.heartbeat(self.path, "1.8.14")
+        self.assertEqual(len(tool_master.launchers_seen(self.path)), 1)
+
+    def test_前の版の返事は古い版として数える(self) -> None:
+        """1.8.8〜1.8.10 はランチャーの印をツールの印と取り違え「使っていない」と書く。"""
+        tool_master.save_pc(self.path, tool_master.MasterPc(0, login_id="a", pc_name="PC-OLD"))
+        self.mark_by_admin()
+        with self.as_pc("a", "PC-OLD"):
+            tool_master.report(self.path, tool_master.LAUNCHER_MARK, tool_master.NOT_RUNNING)
+        dialog, rows = self.rows()
+        self.assertEqual(rows["PC-OLD"][2], dialog.OLD_VERSION)
+        self.assertFalse(dialog._launcher_done(rows["PC-OLD"]))
+
+    def test_ログインIDが違ってもPC名で照らし合わせる(self) -> None:
+        tool_master.save_pc(self.path, tool_master.MasterPc(0, login_id="登録した人",
+                                                            pc_name="PC-B"))
+        self.mark_by_admin()
+        with self.as_pc("いまの人", "pc-b"):
+            tool_master.report(self.path, tool_master.LAUNCHER_MARK, tool_master.CLOSED)
+        dialog, rows = self.rows()
+        self.assertEqual(list(rows), ["PC-B"])
+        self.assertEqual(rows["PC-B"][2], "閉じた")
+
+    def test_返事なしに版と最後に見えた時刻を添える(self) -> None:
+        for name in ("PC-NEW", "PC-GONE", "PC-NONE"):
+            tool_master.save_pc(self.path, tool_master.MasterPc(0, login_id="", pc_name=name))
+        self.mark_by_admin()
+        with self.as_pc("a", "PC-NEW"):
+            tool_master.heartbeat(self.path, "1.8.14")
+        with self.as_pc("b", "PC-GONE"):
+            tool_master.heartbeat(self.path, "1.8.14")
+        import sqlite3
+
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE launchers SET seen_at = '2026-11-01 08:00:00' "
+                         "WHERE pc_name = 'PC-GONE'")
+        dialog, rows = self.rows()
+        self.assertEqual(rows["PC-NEW"][2], "返事なし")
+        self.assertIn("版 1.8.14 が動いています", rows["PC-NEW"][3])
+        self.assertFalse(dialog._launcher_done(rows["PC-NEW"]))
+        self.assertEqual(rows["PC-GONE"][2], "動いていない")
+        self.assertTrue(dialog._launcher_done(rows["PC-GONE"]))
+        self.assertIn("1.8.14 より前の版か、起動していない", rows["PC-NONE"][3])
+
+    def test_マスタに行の無いPCも動いていれば並べる(self) -> None:
+        self.mark_by_admin()
+        with self.as_pc("x", "PC-NOROW"):
+            tool_master.heartbeat(self.path, "1.8.14")
+        with self.as_pc(*ADMIN):
+            tool_master.heartbeat(self.path, "1.8.14")      # 印を付けた PC は並べない
+        _dialog, rows = self.rows()
+        self.assertEqual(list(rows), ["PC-NOROW"])
+
+    def test_待っているPCは強制で閉じられる(self) -> None:
+        self.mark_by_admin()
+        with self.as_pc("a", "PC-W"):
+            maintenance.report_waiting(self.path, "「設定」の窓を開いている")
+        _dialog, rows = self.rows()
+        self.assertEqual(rows["PC-W"][2], "閉じるのを待っている")
+        self.assertTrue(rows["PC-W"][5])
+        with mock.patch.object(tool_master, "this_pc", return_value=ADMIN):
+            tool_master.request_force(self.path, tool_master.LAUNCHER_MARK, "a", "PC-W")
+        with self.as_pc("a", "PC-W"):
+            result = maintenance.Watcher(mock.Mock())._poll()
+        self.assertTrue(result.force_close)
+
+    def test_閉じたの書き込みは失敗したら書き直す(self) -> None:
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(1)
+            if len(calls) < 3:
+                raise tool_master.MasterError("database is locked")
+
+        with mock.patch.object(tool_master, "report", side_effect=flaky):
+            self.assertTrue(maintenance.report_closed(self.path, pause=0))
+        self.assertEqual(len(calls), 3)
+
+
 @unittest.skipUnless(have_tk(), "tkinter と画面が要る")
 class ScreenTests(UpdateTestCase):
 
@@ -184,6 +297,7 @@ class ScreenTests(UpdateTestCase):
         waiter.assert_called_once_with(self.path)
         notes = [w.title() for w in bar.root.winfo_children() if isinstance(w, tk.Toplevel)]
         self.assertIn("ランチャーの更新", notes)
+        bar._closed_report.join(10)           # 「閉じた」は別のスレッドで書く
         self.assertEqual(tool_master.reports(self.path, tool_master.LAUNCHER_MARK)[0].state,
                          tool_master.CLOSED)
         self.assertEqual(after.call_args.args[1], bar._finish_close_for_update)
@@ -201,6 +315,46 @@ class ScreenTests(UpdateTestCase):
             bar._apply_maintenance(maintenance.PollResult(close_launcher=mark, master=self.path))
         waiter.assert_not_called()
         self.assertFalse(bar._closing_for_update)
+
+    def test_待っているあいだも理由を返事し強制なら閉じる(self) -> None:
+        """黙って待つと、管理者には「返事なし」に見える (1.8.14)。"""
+        import threading
+
+        self.mark_by_admin()
+        bar = self.make_bar()
+        mark = tool_master.under_maintenance(self.path)[tool_master.LAUNCHER_MARK]
+        with mock.patch.object(type(bar.manager), "starting_ids", ["nlm.nippou"]), \
+                mock.patch.object(maintenance, "start_waiter", return_value=True) as waiter:
+            bar._apply_maintenance(maintenance.PollResult(close_launcher=mark, master=self.path))
+            for thread in threading.enumerate():
+                if thread.name == "report-waiting":
+                    thread.join(10)
+            report = tool_master.reports(self.path, tool_master.LAUNCHER_MARK)[0]
+            self.assertEqual(report.state, tool_master.WAITING)
+            self.assertIn("起動の途中", report.message)
+            waiter.assert_not_called()
+            # 管理者が［強制で閉じる］を押した
+            with mock.patch.object(bar.root, "after"):
+                bar._apply_maintenance(maintenance.PollResult(
+                    close_launcher=mark, master=self.path, force_close=True))
+        waiter.assert_called_once()
+        self.assertTrue(bar._closing_for_update)
+        bar._closed_report.join(10)
+        self.assertEqual(tool_master.reports(self.path, tool_master.LAUNCHER_MARK)[0].state,
+                         tool_master.CLOSED)
+
+    def test_見回りが固まったら次を始める(self) -> None:
+        bar = self.make_bar()
+        bar._maintenance_busy = True
+        bar._maintenance_started = time.monotonic() - bar.MAINTENANCE_STUCK_SEC - 1
+        started = []
+        with mock.patch.object(bar._maintenance, "poll", side_effect=lambda: started.append(1)), \
+                mock.patch.object(bar.root, "after"):
+            bar._poll_maintenance()
+        deadline = time.monotonic() + 5
+        while not started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(started, [1])
 
     def test_管理者の一覧はこのPC以外の行を待つ(self) -> None:
         import tkinter as tk

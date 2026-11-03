@@ -1642,10 +1642,13 @@ class UpdateDialog:
         self.table = tk.Frame(self.top, bg=theme.UTIL_BG)
         self.table.pack(fill="both", expand=True, padx=16)
         tk.Label(self.top,
-                 text=("全部が「閉じた」になったら、ランチャーのフォルダーを上書きしてください。\n"
-                       "「返事なし」は、ランチャーを起動していない・電源が切れている・共有フォルダーに"
-                       "つながっていない PC です (閉じる必要はありません。次に起動したとき新しい版に"
-                       "なります)。" if launcher else
+                 text=("全部が「閉じた」か「動いていない」になったら、ランチャーのフォルダーを"
+                       "上書きしてください。\n"
+                       "「閉じるのを待っている」は、その PC で［設定］を開いている・ツールの起動の途中"
+                       "などです。待てないときは［強制で閉じる］。\n"
+                       "「古い版 (閉じません)」と、記録なしの「返事なし」は、1.8.14 より前のランチャーが"
+                       "動いている PC です。その PC で［終了］で閉じてください (次からは自動で閉じます)。"
+                       if launcher else
                        "全部が「止めた」か「使っていない」になったら、ツールのフォルダーを上書きして"
                        "ください。\n「返事なし」は、ランチャーを起動していない・電源が切れている・"
                        "共有フォルダーにつながっていない PC です (その PC では、起きたときに止めます)。"),
@@ -1678,8 +1681,17 @@ class UpdateDialog:
         except tk.TclError:
             pass
 
+    # ランチャーの更新の窓で使う状態の名前 (1.8.14)
+    OLD_VERSION = "古い版 (閉じません)"
+    NO_REPLY = "返事なし"
+    GONE = "動いていない"
+    # 「動いている」がこれより古ければ、いまは動いていないとみなす (秒)
+    SEEN_FRESH_SEC = 5 * 60
+
     def rows(self) -> list[tuple[str, str, str, str, str, bool]]:
         """(PC名, ログインID, 状態, ひとこと, 時刻, 強制終了できるか) の一覧。返事の無い PC も。"""
+        if self.launcher:
+            return self._launcher_rows()
         found = tool_master.reports(self.path, self.app_id)
         listed = [(r.pc_name, r.login_id, r.label, r.message, r.updated_at,
                    r.state in (tool_master.BUSY, tool_master.FAILED)) for r in found]
@@ -1706,6 +1718,83 @@ class UpdateDialog:
                                pc.note, "", False))
         return listed
 
+    def _launcher_rows(self) -> list[tuple[str, str, str, str, str, bool]]:
+        """ランチャーの更新 (1.8.11 / 1.8.14 で見直し)。
+
+        * PC は**名前だけ**で照らし合わせる (マスタの行のログインIDと、いまサインイン
+          している人が違っても、同じ PC)
+        * 「閉じた」「閉じるのを待っている」以外の返事は、前の版 (1.8.8〜1.8.10) が
+          ツールの印と取り違えて書いたもの。**その PC は閉じない**
+        * 返事の無い PC には、そのランチャーが最後に書いた「動いている」の版と時刻を
+          添える。1.8.14 より前の版は書かないので「記録なし」
+        * マスタに行の無い PC でも、最近「動いている」を書いていれば並べる
+        """
+        login, here = tool_master.this_pc()
+        mine = here.casefold()
+        replies: dict[str, tool_master.PcReport] = {}
+        for report in tool_master.reports(self.path, self.app_id):
+            if report.pc_name.casefold() != mine:
+                replies.setdefault(report.pc_name.casefold(), report)
+        seen: dict[str, tool_master.LauncherSeen] = {}
+        try:
+            for item in tool_master.launchers_seen(self.path):
+                seen.setdefault(item.pc_name.casefold(), item)
+        except MasterError:
+            pass
+        try:
+            master = tool_master.read(self.path)
+        except MasterError:
+            master = None
+        names: dict[str, tuple[str, str, str]] = {}      # 名前 → (PC名, ログインID, 備考)
+        if master is not None:
+            for pc in master.pcs:
+                if pc.enabled and pc.pc_name and pc.pc_name.casefold() != mine:
+                    names.setdefault(pc.pc_name.casefold(),
+                                     (pc.pc_name, pc.login_id or "(どれでも)", pc.note))
+        for key, report in replies.items():
+            names.setdefault(key, (report.pc_name, report.login_id, ""))
+        for key, item in seen.items():
+            age = item.age_seconds()
+            if key != mine and age is not None and age < self.SEEN_FRESH_SEC:
+                names.setdefault(key, (item.pc_name, item.login_id, ""))
+
+        listed = []
+        for key, (pc_name, login_id, note) in names.items():
+            report = replies.get(key)
+            item = seen.get(key)
+            version = f"版 {item.version}" if item is not None else ""
+            if report is not None and report.state in (tool_master.CLOSED,
+                                                       tool_master.WAITING):
+                listed.append((pc_name, report.login_id or login_id, report.label,
+                               report.message, report.updated_at,
+                               report.state == tool_master.WAITING))
+            elif report is not None:
+                listed.append((pc_name, report.login_id or login_id, self.OLD_VERSION,
+                               "その PC でランチャーを［終了］で閉じてください",
+                               report.updated_at, False))
+            elif item is not None:
+                age = item.age_seconds()
+                fresh = age is not None and age < self.SEEN_FRESH_SEC
+                listed.append((pc_name, item.login_id or login_id,
+                               self.NO_REPLY if fresh else self.GONE,
+                               (f"{version} が動いています。少し待つか、その PC で確かめて"
+                                "ください" if fresh else
+                                f"閉じる必要はありません ({version}・最後に見えたのは"
+                                f" {item.seen_at[5:16]})"),
+                               "", False))
+            else:
+                listed.append((pc_name, login_id, self.NO_REPLY,
+                               "動いている記録なし (1.8.14 より前の版か、起動していない)"
+                               + (f"・{note}" if note else ""), "", False))
+        listed.sort(key=lambda r: r[0].casefold())
+        return listed
+
+    def _launcher_done(self, row) -> bool:
+        """閉じたとみなせる PC (上書きしてよい)。「閉じた」と、最近動いていない PC。"""
+        if row[2] == tool_master.REPORT_LABELS[tool_master.CLOSED]:
+            return True
+        return row[2] == self.GONE
+
     def refresh(self) -> None:
         self._job = None
         if not self.top.winfo_exists():
@@ -1722,14 +1811,15 @@ class UpdateDialog:
             self.state_label.configure(text="更新中ではありません (印は外れています)")
         else:
             self.state_label.configure(
-                text=f"全 PC に止めるよう頼んでいます ({mark.started_text} から・{mark.started_by})"
+                text=f"全 PC に{'閉じる' if self.launcher else '止める'}よう頼んでいます "
+                     f"({mark.started_text} から・{mark.started_by})"
                      "。3 秒ごとに読み直します")
         counts: dict[str, int] = {}
         for row in rows:
             counts[row[2]] = counts.get(row[2], 0) + 1
         self._show_verdict(rows)
-        order = ("閉じた", "止めた", "使っていない", "処理中 (待っています)", "止められない",
-                 "返事なし")
+        order = ("閉じた", self.GONE, "閉じるのを待っている", "止めた", "使っていない",
+                 "処理中 (待っています)", "止められない", self.OLD_VERSION, "返事なし")
         self.summary.configure(text="  ・  ".join(f"{k} {counts[k]}" for k in order
                                                 if counts.get(k)) or "まだ返事がありません")
         for child in self.table.winfo_children():
@@ -1743,17 +1833,21 @@ class UpdateDialog:
                   "使っていない": theme.MUTED,
                   "処理中 (待っています)": theme.STATE_COLORS["starting"],
                   "止められない": theme.STATE_COLORS["error"],
+                  "閉じるのを待っている": theme.STATE_COLORS["starting"],
+                  self.OLD_VERSION: theme.STATE_COLORS["error"],
+                  self.GONE: theme.MUTED,
                   "返事なし": theme.MUTED}
         for line, (pc, login, label, message, at, can_force) in enumerate(rows, start=1):
             for column, (text, color) in enumerate(((pc, theme.FG), (login, theme.FG),
                                                     (label, colors.get(label, theme.FG)),
-                                                    (message[:40], theme.MUTED),
+                                                    (message[:60 if self.launcher else 40],
+                                                     theme.MUTED),
                                                     (at[11:] if at else "", theme.MUTED))):
                 tk.Label(self.table, text=text, bg=theme.UTIL_BG, fg=color,
                          font=theme.FONT_SMALL, anchor="w").grid(row=line, column=column,
                                                                  sticky="w", padx=(8, 4))
             if can_force:
-                tk.Button(self.table, text="強制終了",
+                tk.Button(self.table, text="強制で閉じる" if self.launcher else "強制終了",
                           command=lambda p=pc, lg=login: self.force(p, lg),
                           bg=theme.BUTTON_BG, fg=theme.STATE_COLORS["error"], relief="flat",
                           bd=0, padx=8, font=theme.FONT_SMALL, cursor="hand2").grid(
@@ -1764,14 +1858,19 @@ class UpdateDialog:
 
     def _show_verdict(self, rows) -> None:
         """全部止まったか。止まっていなければ、**どの PC か**を名前で出す。"""
-        waiting = [r for r in rows if r[2] not in self.DONE_STATES]
+        if self.launcher:
+            waiting = [r for r in rows if not self._launcher_done(r)]
+        else:
+            waiting = [r for r in rows if r[2] not in self.DONE_STATES]
         if not rows:
             text, bg = "まだどの PC からも返事がありません (10 秒ほどで届きます)", theme.UTIL_BG
             done = False
         elif waiting:
             names = "、".join(f"{r[0]} ({r[2]})" for r in waiting[:8])
             more = f" ほか {len(waiting) - 8} 台" if len(waiting) > 8 else ""
-            text = f"まだ上書きしないでください。止まっていない PC: {names}{more}"
+            text = (f"まだ上書きしないでください。閉じていない PC: {names}{more}"
+                    if self.launcher else
+                    f"まだ上書きしないでください。止まっていない PC: {names}{more}")
             bg, done = theme.TOOL_BUSY, False
         elif self.launcher:
             text = (f"全 PC でランチャーを閉じました ({len(rows)} 台)。ランチャーのフォルダーを"
@@ -1792,6 +1891,22 @@ class UpdateDialog:
         self.all_stopped = done
 
     def force(self, pc_name: str, login_id: str) -> None:
+        if self.launcher:
+            if not messagebox.askyesno(
+                    "強制で閉じる",
+                    f"{pc_name} のランチャーを、待たずに閉じます。\n"
+                    "その PC で開いている［設定］の入力中の内容は失われます。"
+                    "ツールは止めません。\n\nよろしいですか?",
+                    icon="warning", default="no", parent=self.top):
+                return
+            try:
+                tool_master.request_force(self.path, self.app_id, login_id, pc_name)
+            except MasterError as exc:
+                messagebox.showerror("強制で閉じる", f"頼めませんでした。\n{exc}",
+                                     parent=self.top)
+                return
+            self.refresh()
+            return
         if not messagebox.askyesno(
                 "強制終了",
                 f"{pc_name} ({login_id}) の「{self.name}」を強制終了します。\n"

@@ -17,6 +17,7 @@ from __future__ import annotations
 import gc
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox
@@ -158,6 +159,9 @@ class LauncherBar:
         # ランチャー自身の更新で閉じる最中か・閉じられなかった印 (同じ印で何度も試さない)
         self._closing_for_update = False
         self._update_failed: set[str] = set()
+        self._update_waiting: tuple[str, str] = ("", "")
+        self._maintenance_started = 0.0
+        self._maintenance_token: object = None
         # ツールが多いときの「選ぶ ▼」と［開く］(1.8.4)。少ないときは作らない
         self._select_mode = False
         self.selector: Optional[tk.Menubutton] = None
@@ -1008,10 +1012,22 @@ class LauncherBar:
     # --------------------------------------------------------------
     # 更新のため全 PC で止める (1.8.8)
     # --------------------------------------------------------------
+    # 見回りがこれより長く戻らなければ (共有フォルダーで固まった)、次を始める (1.8.14)
+    MAINTENANCE_STUCK_SEC = 120.0
+
     def _poll_maintenance(self) -> None:
         """管理者の「更新中」の印を見る。**画面のスレッドでは回さない** (共有フォルダー)。"""
+        now = time.monotonic()
+        if self._maintenance_busy and now - self._maintenance_started > \
+                self.MAINTENANCE_STUCK_SEC:
+            log.warning("更新中の印の見回りが %.0f 秒戻りません。次を始めます",
+                        now - self._maintenance_started)
+            self._maintenance_busy = False
         if not self._maintenance_busy:
             self._maintenance_busy = True
+            self._maintenance_started = now
+            token = object()
+            self._maintenance_token = token
 
             def work() -> None:
                 try:
@@ -1019,7 +1035,8 @@ class LauncherBar:
                     if result is not None:
                         self._maintenance_queue.put(result)
                 finally:
-                    self._maintenance_busy = False
+                    if self._maintenance_token is token:
+                        self._maintenance_busy = False
 
             threading.Thread(target=work, name="maintenance", daemon=True).start()
         self.root.after(int(maintenance.POLL_SEC * 1000), self._poll_maintenance)
@@ -1031,11 +1048,12 @@ class LauncherBar:
         for app_id, name in result.ask_user:
             self._ask_to_close(name)
         if result.close_launcher is not None:
-            self._close_for_update(result.close_launcher, result.master)
+            self._close_for_update(result.close_launcher, result.master,
+                                   force=result.force_close)
 
     UPDATE_CLOSE_DELAY_MS = 5000
 
-    def _close_for_update(self, mark, master) -> None:
+    def _close_for_update(self, mark, master, *, force: bool = False) -> None:
         """ランチャー自身の更新 (1.8.11)。**ツールは止めずに**ランチャーだけ閉じる。
 
         閉じる前に、その PC の中に「待ち番」を置く。管理者が更新を終えると、
@@ -1044,11 +1062,18 @@ class LauncherBar:
         """
         if self._closing_for_update or mark.started_at in self._update_failed:
             return
-        busy = self.manager.starting_ids or any(
-            self.manager.is_busy(a) for a in self.manager.running)
-        if busy or self._modal_window():
-            log.info("ランチャーの更新: 途中の操作があるので、終わってから閉じます")
+        reason = "" if force else self._why_not_close_now()
+        if reason:
+            log.info("ランチャーの更新: %s。終わってから閉じます", reason)
+            # **待っていることを管理者に見せる** (黙って待つと「返事なし」に見える)
+            key = (mark.started_at, reason)
+            if self._update_waiting != key:
+                self._update_waiting = key
+                threading.Thread(target=maintenance.report_waiting, args=(master, reason),
+                                 name="report-waiting", daemon=True).start()
             return
+        if force:
+            log.warning("ランチャーの更新: 管理者に頼まれたので、待たずに閉じます")
         if not maintenance.start_waiter(master):
             self._update_failed.add(mark.started_at)
             self.manager.notify(
@@ -1056,7 +1081,11 @@ class LauncherBar:
                 "できませんでした。\nランチャーを［終了］で閉じ、更新が終わってから起動してください。")
             return
         self._closing_for_update = True
-        maintenance.report_closed(master)
+        # 「閉じた」は別のスレッドで書く (書けなければ書き直す。閉じるのはそのあと)
+        self._closed_report = threading.Thread(target=maintenance.report_closed, args=(master,),
+                                               name="report-closed", daemon=True)
+        self._closed_report.start()
+        self._close_deadline = time.monotonic() + self.UPDATE_REPORT_WAIT_SEC
         trace.event("ランチャーの更新のため閉じる", trace.INFO,
                     detail=f"{mark.started_by} が {mark.started_text} に更新を始めた")
         top = tk.Toplevel(self.root)
@@ -1076,7 +1105,32 @@ class LauncherBar:
         top.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.root.after(self.UPDATE_CLOSE_DELAY_MS, self._finish_close_for_update)
 
+    def _why_not_close_now(self) -> str:
+        """今は閉じられない理由 (利用者の操作の途中)。閉じてよければ空。"""
+        starting = [self._names.get(a, a) for a in self.manager.starting_ids]
+        if starting:
+            return f"ツールの起動の途中 ({'、'.join(starting)})"
+        stopping = [self._names.get(a, a) for a in self.manager.running
+                    if self.manager.is_busy(a)]
+        if stopping:
+            return f"ツールの停止の途中 ({'、'.join(stopping)})"
+        modal = self._modal_window()
+        if modal:
+            try:
+                title = self.root.nametowidget(modal).winfo_toplevel().title()
+            except (KeyError, tk.TclError):
+                title = ""
+            return f"「{title or '設定'}」の窓を開いている"
+        return ""
+
+    UPDATE_REPORT_WAIT_SEC = 15.0
+
     def _finish_close_for_update(self) -> None:
+        report = getattr(self, "_closed_report", None)
+        if report is not None and report.is_alive() and \
+                time.monotonic() < getattr(self, "_close_deadline", 0.0):
+            self.root.after(500, self._finish_close_for_update)   # 「閉じた」を書き終えるまで
+            return
         log.info("ランチャーの更新のため閉じます (ツールは動かしたまま)")
         trace.event("ランチャー終了", trace.INFO, cause="ランチャーの更新 (ツールは動かしたまま)")
         try:
