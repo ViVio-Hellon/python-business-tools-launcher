@@ -34,7 +34,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from .. import (app_config, distribution, fileprobe, tool_entries,
+from .. import (app_config, distribution, fileprobe, presence, tool_entries,
                tool_master, tool_registry, trace)
 from ..logging_utils import get_logger
 from ..tool_master import Master, MasterError, MasterPc, MasterTool
@@ -1752,7 +1752,7 @@ class UpdateDialog:
     OLD_VERSION = "古い版 (閉じません)"
     NO_REPLY = "返事なし"
     GONE = "動いていない"
-    # 「動いている」がこれより古ければ、いまは動いていないとみなす (秒)
+    # 「動いている」が、いちばん新しいものよりこれだけ古ければ、動いていないとみなす (秒)
     SEEN_FRESH_SEC = 5 * 60
 
     def rows(self) -> list[tuple[str, str, str, str, str, bool]]:
@@ -1802,12 +1802,11 @@ class UpdateDialog:
         for report in tool_master.reports(self.path, self.app_id):
             if report.pc_name.casefold() != mine:
                 replies.setdefault(report.pc_name.casefold(), report)
-        seen: dict[str, tool_master.LauncherSeen] = {}
-        try:
-            for item in tool_master.launchers_seen(self.path):
-                seen.setdefault(item.pc_name.casefold(), item)
-        except MasterError:
-            pass
+        # 各 PC の「動いている」(マスタの隣のファイル)。新しさは共有サーバーの時計で比べる
+        found, now = presence.read(self.path)
+        seen: dict[str, presence.Seen] = {}
+        for item in sorted(found, key=lambda i: i.written_at, reverse=True):
+            seen.setdefault(item.pc_name.casefold(), item)
         try:
             master = tool_master.read(self.path)
         except MasterError:
@@ -1821,8 +1820,7 @@ class UpdateDialog:
         for key, report in replies.items():
             names.setdefault(key, (report.pc_name, report.login_id, ""))
         for key, item in seen.items():
-            age = item.age_seconds()
-            if key != mine and age is not None and age < self.SEEN_FRESH_SEC:
+            if key != mine and now is not None and item.behind(now) < self.SEEN_FRESH_SEC:
                 names.setdefault(key, (item.pc_name, item.login_id, ""))
 
         listed = []
@@ -1840,14 +1838,14 @@ class UpdateDialog:
                                "その PC でランチャーを［終了］で閉じてください",
                                report.updated_at, False))
             elif item is not None:
-                age = item.age_seconds()
-                fresh = age is not None and age < self.SEEN_FRESH_SEC
+                fresh = now is not None and item.behind(now) < self.SEEN_FRESH_SEC
+                last = time.strftime("%m-%d %H:%M", time.localtime(item.written_at))
                 listed.append((pc_name, item.login_id or login_id,
                                self.NO_REPLY if fresh else self.GONE,
                                (f"{version} が動いています。少し待つか、その PC で確かめて"
                                 "ください" if fresh else
                                 f"閉じる必要はありません ({version}・最後に見えたのは"
-                                f" {item.seen_at[5:16]})"),
+                                f" {last})"),
                                "", False))
             else:
                 listed.append((pc_name, login_id, self.NO_REPLY,

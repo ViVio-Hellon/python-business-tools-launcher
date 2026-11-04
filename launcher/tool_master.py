@@ -134,13 +134,6 @@ CREATE TABLE IF NOT EXISTS force_requests (
     requested_by TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (app_id, login_id, pc_name)
 );
-CREATE TABLE IF NOT EXISTS launchers (
-    login_id TEXT NOT NULL DEFAULT '',
-    pc_name  TEXT NOT NULL DEFAULT '',
-    version  TEXT NOT NULL DEFAULT '',
-    seen_at  TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (login_id, pc_name)
-);
 CREATE TABLE IF NOT EXISTS pc_tools (
     pc_no   INTEGER NOT NULL REFERENCES pcs(pc_no) ON DELETE CASCADE,
     tool_no INTEGER NOT NULL REFERENCES tools(tool_no) ON DELETE CASCADE,
@@ -926,55 +919,6 @@ def report(path: Path, app_id: str, state: str, message: str = "") -> None:
                                                            message, updated_at)
                         VALUES(?, ?, ?, ?, ?, ?)""",
                      (app_id, login, pc_name, state, message[:300], _now()))
-
-
-# ------------------------------------------------------------------
-# どの PC で、どの版のランチャーが動いているか (1.8.14)
-# ------------------------------------------------------------------
-# ランチャーは起動しっぱなしなので、共有フォルダーの版を新しくしても、各 PC では
-# **起動したときの版**が動き続ける。管理者の「ランチャーの更新」の窓で「返事なし」
-# の PC が、古い版で動いているのか、起動していないのかを見分けるために書く。
-_LAUNCHERS_TABLE = """CREATE TABLE IF NOT EXISTS launchers (
-    login_id TEXT NOT NULL DEFAULT '', pc_name TEXT NOT NULL DEFAULT '',
-    version TEXT NOT NULL DEFAULT '', seen_at TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (login_id, pc_name))"""
-
-
-@dataclass(frozen=True)
-class LauncherSeen:
-    login_id: str
-    pc_name: str
-    version: str
-    seen_at: str
-
-    def age_seconds(self, now: Optional[float] = None) -> Optional[float]:
-        try:
-            seen = time.mktime(time.strptime(self.seen_at, "%Y-%m-%d %H:%M:%S"))
-        except (ValueError, OverflowError):
-            return None
-        return (time.time() if now is None else now) - seen
-
-
-def heartbeat(path: Path, version: str) -> None:
-    """この PC のランチャーが動いていることと、その版を書く。"""
-    login, pc_name = this_pc()
-    with _open(path) as conn:
-        conn.execute(_LAUNCHERS_TABLE)       # 前の版が作ったマスタには表が無い
-        conn.execute("""INSERT OR REPLACE INTO launchers(login_id, pc_name, version, seen_at)
-                        VALUES(?, ?, ?, ?)""", (login, pc_name, version, _now()))
-
-
-def launchers_seen(path: Path) -> list[LauncherSeen]:
-    """ランチャーが書いた「動いている」の一覧 (新しい順)。表が無ければ空。"""
-    try:
-        with _open(path) as conn:
-            rows = conn.execute("SELECT * FROM launchers ORDER BY seen_at DESC").fetchall()
-    except MasterError as exc:
-        if "no such table" in str(exc):
-            return []
-        raise
-    return [LauncherSeen(r["login_id"], r["pc_name"], r["version"], r["seen_at"])
-            for r in rows]
 
 
 def reports(path: Path, app_id: str) -> list[PcReport]:

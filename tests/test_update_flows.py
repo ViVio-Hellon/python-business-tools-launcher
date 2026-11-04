@@ -161,16 +161,21 @@ class ToolUpdateFlowTests(FlowTestCase):
         self.admin_press_end(dialog)
         self.assertEqual(self.user_poll().blocked, {})
 
+    def later(self, hours: float):
+        """この PC のランチャーが、印を見続けて `hours` 時間たった (時計は動かさない)。"""
+        now = time.monotonic() + hours * 3600
+        return mock.patch.object(maintenance.time, "monotonic", return_value=now)
+
     def test_押し忘れても3時間で外れ_前の版のPCも戻る(self) -> None:
         tool = self.register("nlm.nippou", "日報看板")
         with self.as_admin():
             tool_master.begin_maintenance(self.path, "nlm.nippou", "日報看板",
                                           start_command=tool.start_command)
         self.assertIn("nlm.nippou", self.user_poll().blocked)
-        self.age("nlm.nippou", maintenance.MARK_MAX_HOURS - 0.5)
-        self.assertIn("nlm.nippou", self.user_poll().blocked, "まだ外さない")
-        self.age("nlm.nippou", maintenance.MARK_MAX_HOURS + 0.5)
-        self.assertEqual(self.user_poll().blocked, {})
+        with self.later(maintenance.MARK_MAX_HOURS - 0.5):
+            self.assertIn("nlm.nippou", self.user_poll().blocked, "まだ外さない")
+        with self.later(maintenance.MARK_MAX_HOURS + 0.5):
+            self.assertEqual(self.user_poll().blocked, {})
         # マスタから外れている = 印を読むだけの前の版のランチャーも、もとに戻る
         self.assertEqual(tool_master.under_maintenance(self.path), {})
         self.start(tool)
@@ -183,9 +188,14 @@ class LauncherMarkFlowTests(FlowTestCase):
         with self.as_admin():
             tool_master.begin_maintenance(self.path, tool_master.LAUNCHER_MARK, "ランチャー")
         self.assertIsNotNone(maintenance.launcher_hold())
-        self.age(tool_master.LAUNCHER_MARK, maintenance.MARK_MAX_HOURS + 0.5)
+        # 夜のあいだ押し忘れ、朝に起動した (時計の上で 12 時間より前)
+        self.age(tool_master.LAUNCHER_MARK, maintenance.MARK_WALL_HOURS + 0.5)
         self.assertIsNone(maintenance.launcher_hold(), "古い印で起動を止めました")
-        self.assertIsNone(self.user_poll().close_launcher)
+        self.assertIsNone(self.user_poll().close_launcher,
+                          "朝に起動したランチャーが、古い印ですぐ閉じました")
+        later = time.monotonic() + maintenance.MARK_SEEN_MIN_SEC + 1
+        with mock.patch.object(maintenance.time, "monotonic", return_value=later):
+            self.assertIsNone(self.user_poll().close_launcher)
         self.assertEqual(tool_master.under_maintenance(self.path), {})
 
 

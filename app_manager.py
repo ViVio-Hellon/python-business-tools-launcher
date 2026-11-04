@@ -1633,8 +1633,7 @@ class ToolManager:
         try:
             proc = subprocess.Popen(
                 command,
-                # 共有フォルダーの .bat は、cmd が作業フォルダーにできない (1.8.13)
-                cwd=paths.entry_cwd(tool.start_command, tool.resolved_work_dir or None),
+                cwd=tool.resolved_work_dir or None,
                 # BATの末尾の `pause` で固まらせない。標準入力が
                 # 最初から終わっていれば `pause` はすぐ抜ける
                 stdin=subprocess.DEVNULL,
@@ -1766,6 +1765,12 @@ class ToolManager:
                 hints.append(f"起動引数「{tool.start_args}」を受け付けないツールでは"
                              "ないか (設定画面で空にして試す)")
             hints.append(f"{entry} をダブルクリックして、出るエラーを読む")
+            problem = paths.unc_bat_problem(tool.start_command)
+            if problem:
+                # 共有フォルダーから動かない書き方の start.bat (1.8.18)
+                whys.append(problem)
+                hints.insert(0, problem)
+                lines.append(problem)
         elif other:
             cause = f"ポート {tool.port} で別のアプリ ({other}) が応答している"
             whys.append(f"ポート {tool.port} では、別のアプリ (アプリID {other}) が"
@@ -1849,6 +1854,11 @@ class ToolManager:
         if error:
             whys.append(f"アプリの出力にエラーが出ている: {error}")
         hints = [f"{entry} をダブルクリックして、出るメッセージを読む"]
+        problem = paths.unc_bat_problem(tool.start_command)
+        if problem:
+            # 共有フォルダーから動かない書き方の start.bat (1.8.18)。いちばん先に出す
+            whys.append(problem)
+            hints.insert(0, problem)
         value = (code or 0) & 0xFFFFFFFF
         if value == 0xC0000135 or desktop.looks_like_tauri(tool.start_command):
             hints.append("Microsoft Edge WebView2 ランタイムが入っているか "
@@ -1869,6 +1879,8 @@ class ToolManager:
         trace.event("起動失敗", trace.FAILED, tool=tool, op=op, cause=cause,
                     detail=error, elapsed=elapsed, incident=path)
         lines = [f"{entry} が窓を出す前に終了しました (戻り値 {exit_text})。"]
+        if problem:
+            lines.append(problem)
         if error:
             lines.append(f"出力のエラー: {error}")
         lines.append(_records_note(path))

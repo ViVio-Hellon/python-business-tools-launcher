@@ -262,7 +262,7 @@ def _run(path: str, folder: str, timeout: float,
         with tempfile.TemporaryFile() as out:
             proc = subprocess.Popen(
                 # 道はいつも " で囲む (全角の空白のあるフォルダー名。1.8.6)
-                paths.entry_command(path, args), cwd=paths.entry_cwd(path, folder or None),
+                paths.entry_command(path, args), cwd=folder or None,
                 stdin=subprocess.DEVNULL,      # `pause` で固まらせない
                 stdout=out, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
             try:

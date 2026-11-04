@@ -69,6 +69,9 @@ class Watcher:
         self._asked: set[tuple[str, str]] = set()
         # 最後に「動いている」を書いた時刻 (monotonic)。0 はまだ
         self._beat_at = 0.0
+        # (アプリID, 印を付けた時刻) → この PC が初めてその印を見た時刻 (monotonic)。
+        # 外し忘れは**この PC が見続けた長さ**で決める (PC の時計を使わない。1.8.18)
+        self._first_seen: dict[tuple[str, str], float] = {}
 
     def poll(self) -> Optional[PollResult]:
         """1回見る。マスタを使っていない・届かないときは None (何もしない)。"""
@@ -100,7 +103,10 @@ class Watcher:
         result = PollResult(blocked=blocked, master=path,
                             marks={target: mark for app_id, mark in marks.items()
                                    for target in targets[app_id]})
-        if launcher_mark is not None and not launcher_mark.set_by_this_pc():
+        if launcher_mark is not None and not launcher_mark.set_by_this_pc() \
+                and not wall_old(launcher_mark):
+            # 時計の上で 12 時間より前の印では閉じない (起動も止めていない。閉じると、
+            # 朝に起動した PC が次々に閉じて、外し忘れを見続ける PC がいなくなる)
             # ランチャー自身の更新。閉じるのはバー (画面) の仕事
             result.close_launcher = launcher_mark
             result.force_close = _take_force(path, tool_master.LAUNCHER_MARK)
@@ -126,8 +132,13 @@ class Watcher:
         """
         from . import trace
 
+        now = time.monotonic()
+        live = set()
         for app_id, mark in list(marks.items()):
-            if not mark_stale(mark):
+            key = (app_id, mark.started_at)
+            live.add(key)
+            first = self._first_seen.setdefault(key, now)
+            if not mark_forgotten(mark, now - first):
                 continue
             marks.pop(app_id)
             try:
@@ -140,7 +151,10 @@ class Watcher:
                         mark.name or app_id, mark.started_by, mark.started_text, age)
             trace.event("外し忘れの「更新中」を外した", trace.WARNING,
                         detail=f"{mark.name or app_id} — {mark.started_by} が "
-                               f"{mark.started_text} に付けた ({age:.1f} 時間前)")
+                               f"{mark.started_text} に付けた ({age:.1f} 時間前・"
+                               f"この PC で {(now - first) / 3600:.1f} 時間見た)")
+        for key in [k for k in self._first_seen if k not in live]:
+            self._first_seen.pop(key, None)
 
     def _heartbeat(self, path) -> None:
         """「この PC で、この版のランチャーが動いている」を書く (1 分に 1 回。1.8.14)。"""
@@ -148,11 +162,11 @@ class Watcher:
         if self._beat_at and now - self._beat_at < HEARTBEAT_SEC:
             return
         self._beat_at = now
-        from . import __version__
+        from . import __version__, presence
 
         try:
-            tool_master.heartbeat(path, __version__)
-        except tool_master.MasterError as exc:
+            presence.write(path, *tool_master.this_pc(), __version__)
+        except OSError as exc:
             log.info("動いていることを書けませんでした: %s", exc)
 
     def _handle(self, path, mark: tool_master.Maintenance, local_ids: set[str],
@@ -278,27 +292,40 @@ def launcher_hold() -> Optional[tool_master.Maintenance]:
     mark = marks.get(tool_master.LAUNCHER_MARK)
     if mark is None or mark.set_by_this_pc():
         return None
-    if mark_stale(mark):
+    if wall_old(mark):
         log.warning("ランチャーの更新の印が %.1f 時間前のままです (%s)。外し忘れとみなして"
                     "起動します", mark.age_hours() or 0.0, mark.started_by)
         return None
     return mark
 
 
-# 「更新中」の印が、これより古ければ「外し忘れ」とみなして外す (時間。1.8.15 / 1.8.16)。
-# ツールやランチャーの上書きは数分で終わる。管理者が［更新を終える］を押し忘れて
-# 帰ると、夜のあいだ全 PC でそのツールが起動しなかった
-MARK_MAX_HOURS = 3.0
-LAUNCHER_MARK_MAX_HOURS = MARK_MAX_HOURS
-
-
-def mark_stale(mark: tool_master.Maintenance) -> bool:
-    """外し忘れた (古すぎる) 印か。"""
+def wall_old(mark: tool_master.Maintenance) -> bool:
+    """時計の上で `MARK_WALL_HOURS` より前の印か (時計のずれではありえない長さ)。"""
     age = mark.age_hours()
-    return age is not None and age >= MARK_MAX_HOURS
+    return age is not None and age >= MARK_WALL_HOURS
 
 
-launcher_mark_stale = mark_stale
+# 「更新中」の外し忘れ (1.8.15 / 1.8.16 / 1.8.18)。ツールやランチャーの上書きは数分で
+# 終わる。管理者が［更新を終える］を押し忘れて帰ると、夜のあいだ全 PC でそのツールが
+# 起動しなかった。
+#
+# **PC の時計は使わない** (1.8.18)。1.8.16 は「印を付けた PC の時計の時刻」と
+# 「この PC の時計」を比べたので、時計が 3 時間ずれた PC が 1 台あれば、付けた
+# ばかりの印を数秒で外し、上書きの途中でツールが起動した。いまは:
+#
+# * この PC が**自分で見続けた長さ** (monotonic) が `MARK_MAX_HOURS` 以上
+# * または、時計の上で `MARK_WALL_HOURS` 以上前 (ずれではありえない長さ) で、
+#   この PC が `MARK_SEEN_MIN_SEC` 以上見続けた (付けた直後に外さない)
+MARK_MAX_HOURS = 3.0
+MARK_WALL_HOURS = 12.0
+MARK_SEEN_MIN_SEC = 5 * 60.0
+
+
+def mark_forgotten(mark: tool_master.Maintenance, watched_sec: float) -> bool:
+    """外し忘れた印か。`watched_sec` はこの PC がその印を見続けた秒数。"""
+    if watched_sec >= MARK_MAX_HOURS * 3600:
+        return True
+    return wall_old(mark) and watched_sec >= MARK_SEEN_MIN_SEC
 
 
 def end_tool_update_by_admin(app_id: str, mark: tool_master.Maintenance) -> str:

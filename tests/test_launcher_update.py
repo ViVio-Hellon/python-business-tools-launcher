@@ -158,7 +158,11 @@ class WatcherTests(UpdateTestCase):
 
 
 class ForgottenMarkTests(UpdateTestCase):
-    """［更新を終える］を押し忘れて帰ると、全 PC で起動しなくなった (1.8.15)。"""
+    """［更新を終える］を押し忘れて帰ると、全 PC で起動しなくなった (1.8.15)。
+
+    **PC の時計は使わない** (1.8.18)。時計の上で 12 時間より前の印だけ、起動を
+    止めない。動いているランチャーは、自分で見続けた長さで決める。
+    """
 
     def age_mark(self, hours: float) -> None:
         import sqlite3
@@ -168,17 +172,22 @@ class ForgottenMarkTests(UpdateTestCase):
             conn.execute("UPDATE maintenance SET started_at = ? WHERE app_id = ?",
                          (stamp + ".000000", tool_master.LAUNCHER_MARK))
 
-    def test_古い印では起動を止めない(self) -> None:
+    def test_12時間より前の印では起動を止めない(self) -> None:
         self.mark_by_admin()
         self.assertIsNotNone(maintenance.launcher_hold())
-        self.age_mark(maintenance.LAUNCHER_MARK_MAX_HOURS + 0.5)
+        self.age_mark(maintenance.MARK_MAX_HOURS + 0.5)
+        self.assertIsNotNone(maintenance.launcher_hold(), "時計のずれでありうる長さ")
+        self.age_mark(maintenance.MARK_WALL_HOURS + 0.5)
         self.assertIsNone(maintenance.launcher_hold())
 
-    def test_古い印では動いているランチャーも閉じない(self) -> None:
+    def test_時計が3時間ずれたPCでも付けたばかりの印を外さない(self) -> None:
+        """1.8.16 では、時計の進んだ PC が付けたばかりの印を数秒で外していた。"""
         self.mark_by_admin()
-        self.age_mark(maintenance.LAUNCHER_MARK_MAX_HOURS + 0.5)
-        result = maintenance.Watcher(mock.Mock())._poll()
-        self.assertIsNone(result.close_launcher)
+        later = time.time() + 4 * 3600           # この PC の時計が 4 時間進んでいる
+        with mock.patch.object(time, "time", return_value=later):
+            result = maintenance.Watcher(mock.Mock())._poll()
+        self.assertIsNotNone(result.close_launcher)
+        self.assertIn(tool_master.LAUNCHER_MARK, tool_master.under_maintenance(self.path))
 
     def test_起動できないPCから管理者が外せる(self) -> None:
         self.mark_by_admin()
@@ -214,25 +223,26 @@ class AdminListTests(UpdateTestCase):
     def as_pc(self, login: str, pc: str):
         return mock.patch.object(tool_master, "this_pc", return_value=(login, pc))
 
-    def test_動いていることと版を書く(self) -> None:
+    def beat(self, login: str, pc: str, *, minutes_ago: float = 0.0) -> None:
+        from launcher import presence
+
+        target = presence.write(self.path, login, pc, "1.8.18")
+        when = time.time() - minutes_ago * 60
+        os.utime(target, (when, when))
+
+    def test_動いていることと版をマスタの外に書く(self) -> None:
+        """1.8.14 はマスタ (SQLite) に 1 分ごとに書いていた。マスタには書かない。"""
+        from launcher import __version__, presence
+
+        before = self.path.stat().st_mtime_ns
         watcher = maintenance.Watcher(mock.Mock())
         watcher._poll()
-        from launcher import __version__
-
-        seen = tool_master.launchers_seen(self.path)
+        seen, _now = presence.read(self.path)
         self.assertEqual([(s.pc_name, s.version) for s in seen], [(PC, __version__)])
-        with mock.patch.object(tool_master, "heartbeat") as beat:
+        self.assertEqual(self.path.stat().st_mtime_ns, before, "マスタに書きました")
+        with mock.patch.object(presence, "write") as write:
             watcher._poll()                     # 1 分に 1 回
-        beat.assert_not_called()
-
-    def test_前の版のマスタにも書ける(self) -> None:
-        import sqlite3
-
-        with sqlite3.connect(self.path) as conn:
-            conn.execute("DROP TABLE launchers")
-        self.assertEqual(tool_master.launchers_seen(self.path), [])
-        tool_master.heartbeat(self.path, "1.8.14")
-        self.assertEqual(len(tool_master.launchers_seen(self.path)), 1)
+        write.assert_not_called()
 
     def test_前の版の返事は古い版として数える(self) -> None:
         """1.8.8〜1.8.10 はランチャーの印をツールの印と取り違え「使っていない」と書く。"""
@@ -255,32 +265,34 @@ class AdminListTests(UpdateTestCase):
         self.assertEqual(rows["PC-B"][2], "閉じた")
 
     def test_返事なしに版と最後に見えた時刻を添える(self) -> None:
+        """「動いていない」は共有サーバーの時刻 (ファイルの更新時刻) どうしで比べる。"""
         for name in ("PC-NEW", "PC-GONE", "PC-NONE"):
             tool_master.save_pc(self.path, tool_master.MasterPc(0, login_id="", pc_name=name))
         self.mark_by_admin()
-        with self.as_pc("a", "PC-NEW"):
-            tool_master.heartbeat(self.path, "1.8.14")
-        with self.as_pc("b", "PC-GONE"):
-            tool_master.heartbeat(self.path, "1.8.14")
-        import sqlite3
-
-        with sqlite3.connect(self.path) as conn:
-            conn.execute("UPDATE launchers SET seen_at = '2026-11-01 08:00:00' "
-                         "WHERE pc_name = 'PC-GONE'")
+        self.beat(*ADMIN)                       # 管理者のランチャーも書く (いまの目安)
+        self.beat("a", "PC-NEW", minutes_ago=1)
+        self.beat("b", "PC-GONE", minutes_ago=60)
         dialog, rows = self.rows()
         self.assertEqual(rows["PC-NEW"][2], "返事なし")
-        self.assertIn("版 1.8.14 が動いています", rows["PC-NEW"][3])
+        self.assertIn("版 1.8.18 が動いています", rows["PC-NEW"][3])
         self.assertFalse(dialog._launcher_done(rows["PC-NEW"]))
         self.assertEqual(rows["PC-GONE"][2], "動いていない")
         self.assertTrue(dialog._launcher_done(rows["PC-GONE"]))
         self.assertIn("1.8.14 より前の版か、起動していない", rows["PC-NONE"][3])
 
+    def test_管理者のPCの時計がずれていても動いているPCを取り違えない(self) -> None:
+        tool_master.save_pc(self.path, tool_master.MasterPc(0, login_id="", pc_name="PC-NEW"))
+        self.mark_by_admin()
+        self.beat(*ADMIN)
+        self.beat("a", "PC-NEW", minutes_ago=1)
+        with mock.patch.object(time, "time", return_value=time.time() + 3 * 3600):
+            dialog, rows = self.rows()
+        self.assertEqual(rows["PC-NEW"][2], "返事なし", "時計のずれで「動いていない」にしました")
+
     def test_マスタに行の無いPCも動いていれば並べる(self) -> None:
         self.mark_by_admin()
-        with self.as_pc("x", "PC-NOROW"):
-            tool_master.heartbeat(self.path, "1.8.14")
-        with self.as_pc(*ADMIN):
-            tool_master.heartbeat(self.path, "1.8.14")      # 印を付けた PC は並べない
+        self.beat("x", "PC-NOROW")
+        self.beat(*ADMIN)                       # 印を付けた PC は並べない
         _dialog, rows = self.rows()
         self.assertEqual(list(rows), ["PC-NOROW"])
 

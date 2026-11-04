@@ -676,7 +676,7 @@ class LauncherBar:
         def work() -> None:
             try:
                 result = self._maintenance.poll()
-                if result is not None:
+                if result is not None and self._maintenance_token is token:
                     self._maintenance_queue.put(result)
             finally:
                 if self._maintenance_token is token:
@@ -1094,7 +1094,8 @@ class LauncherBar:
             def work() -> None:
                 try:
                     result = self._maintenance.poll()
-                    if result is not None:
+                    # 固まって遅れて戻った見回りの結果は捨てる (あとの見回りのほうが新しい)
+                    if result is not None and self._maintenance_token is token:
                         self._maintenance_queue.put(result)
                 finally:
                     if self._maintenance_token is token:

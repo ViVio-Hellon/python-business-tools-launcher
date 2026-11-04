@@ -254,7 +254,7 @@ def _recorded_roots(running: RunningTool) -> set[int]:
         command = _normalize_path(process_command_line(pid))
         for marker in (running.start_command, running.app_root, running.work_dir):
             needle = _normalize_path(marker)
-            if _is_specific_enough(needle) and _paths.contains_path(command, needle):
+            if _is_specific_enough(needle) and needle in command:
                 roots.add(pid)
                 break
     return roots
@@ -718,7 +718,7 @@ def _stop_by_bat(running: RunningTool, *, force: bool,
     try:
         completed = subprocess.run(
             command,
-            cwd=_paths.entry_cwd(script, running.work_dir or str(script.parent)),
+            cwd=running.work_dir or str(script.parent),
             # 最後の pause を飛ばす合図 (コイル包装仕様の stop.bat が読む。ほかは無視する)
             env={**os.environ, "STOP_NOPAUSE": "1"},
             stdin=subprocess.DEVNULL,      # BAT末尾の `pause` で固まらせない
@@ -1063,7 +1063,7 @@ def verify_process(pid: int, running: RunningTool) -> Verdict:
             # 短すぎる印では照合にならない。`C:\` のような値を許すと
             # **どのプロセスにも一致してしまい、照合が素通りになる**
             continue
-        if _paths.contains_path(haystack, needle):
+        if needle in haystack:
             return Verdict(True, f"コマンドラインが {marker} を含みます")
 
     return Verdict(False, "コマンドラインにこのツールの場所が含まれません")
